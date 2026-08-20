@@ -1,0 +1,84 @@
+# JavaScript
+node_modules/
+.bun/
+*.tsbuildinfo
+
+# Rust
+target/
+
+# Tests and analysis
+.superpowers/
+coverage/
+.coverage/
+test-results/
+playwright-report/
+fuzz/artifacts/
+fuzz/corpus/generated/
+benchmarks/results/local/
+
+# Local development material (not published)
+AGENTS.md
+PRODUCT.md
+CONTRIBUTING.md
+.githooks/
+.mimosa/
+docs/plans/
+docs/specs/
+docs/superpowers/
+docs/benchmarks/
+docs/architecture/
+docs/security/
+docs/releases/
+docs/guides/code-intelligence.md
+docs/guides/expert-configuration.md
+docs/guides/goals-and-consultation.md
+docs/guides/managed-browser.md
+docs/guides/supported-languages.md
+docs/commands/automatic-operations.md
+docs/commands/history.md
+docs/commands/memory.md
+tests/
+**/test/
+**/tests/
+crates/*/examples/
+scripts/**/*.test.ts
+scripts/local/
+scripts/ci/desktop-certification.ts
+scripts/ci/repeat-critical-suite.ts
+scripts/ci/test-packed-native.ts
+scripts/ci/test-packed-plugin.ts
+.github/opencode-desktop-assets.json
+.github/workflows/compatibility-audit.yml
+
+# Runtime state
+.opencode-cycle/
+*.db-shm
+*.db-wal
+*.log
+
+# Secrets and signing material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Packaging
+dist/
+artifacts/
+packages/opencode-cycle/LICENSE
+packages/opencode-cycle/NOTICE
+*.map
+*.tgz
+*.zip

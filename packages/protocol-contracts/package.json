@@ -1,0 +1,19 @@
+{
+  "name": "@opencode-cycle/protocol-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "FSL-1.1-MIT",
+  "exports": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@opencode-cycle/native-darwin-arm64",
+  "version": "1.0.0",
+  "description": "Cycle for OpenCode control plane for macOS Apple Silicon",
+  "license": "FSL-1.1-MIT",
+  "author": "Gianluca Iannotta",
+  "repository": "https://github.com/jannotix/opencode-cycle-plugin",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "exports": "./bin/workflowd",
+  "files": ["bin", "LICENSE", "NOTICE"],
+  "publishConfig": { "access": "public" }
+}

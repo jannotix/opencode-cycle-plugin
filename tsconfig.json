@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/protocol-contracts"
+    },
+    {
+      "path": "./packages/opencode-cycle"
+    }
+  ]
+}

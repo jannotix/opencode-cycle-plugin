@@ -1,0 +1,31 @@
+[package]
+name = "workflowd"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cap-std.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+workflow-core = { path = "../workflow-core" }
+workflow-code-intel = { path = "../workflow-code-intel" }
+workflow-ipc = { path = "../workflow-ipc" }
+workflow-ledger = { path = "../workflow-ledger" }
+workflow-memory = { path = "../workflow-memory" }
+workflow-store = { path = "../workflow-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

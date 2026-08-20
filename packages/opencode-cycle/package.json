@@ -1,0 +1,37 @@
+{
+  "name": "opencode-cycle",
+  "version": "1.0.0",
+  "description": "Cycle for OpenCode: independent, evidence-gated software delivery",
+  "type": "module",
+  "license": "FSL-1.1-MIT",
+  "author": "Gianluca Iannotta",
+  "repository": "https://github.com/jannotix/opencode-cycle-plugin",
+  "exports": {
+    ".": "./dist/index.js",
+    "./capabilities": "./dist/capabilities.js",
+    "./client": "./dist/client.js",
+    "./commands": "./dist/commands.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "prepack": "bun run build && bun ../../scripts/packaging/prepare-plugin-package.ts",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.16",
+    "@opencode-ai/sdk": "1.18.16",
+    "puppeteer-core": "25.6.0"
+  },
+  "optionalDependencies": {
+    "@opencode-cycle/native-darwin-arm64": "1.0.0",
+    "@opencode-cycle/native-darwin-x64": "1.0.0",
+    "@opencode-cycle/native-linux-x64": "1.0.0",
+    "@opencode-cycle/native-win32-x64": "1.0.0"
+  },
+  "publishConfig": { "access": "public", "provenance": true }
+}

@@ -1,0 +1,615 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProtocolEnvelope",
+  "type": "object",
+  "properties": {
+    "payload": {
+      "$ref": "#/$defs/ProtocolPayload"
+    },
+    "version": {
+      "type": "integer",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "payload"
+  ],
+  "$defs": {
+    "ArbiterDecision": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "rejected"
+      ]
+    },
+    "ArbiterVerdict": {
+      "type": "object",
+      "properties": {
+        "candidate_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "decision": {
+          "$ref": "#/$defs/ArbiterDecision"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "repair_target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepairTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequirementDecision"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "candidate_digest",
+        "requirements",
+        "findings"
+      ]
+    },
+    "ArchitecturePlan": {
+      "type": "object",
+      "properties": {
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "integration_checks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Requirement"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlannedTask"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "assumptions",
+        "integration_checks",
+        "request_digest",
+        "requirements",
+        "risks",
+        "tasks"
+      ]
+    },
+    "CandidateFile": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "executable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/CandidateFileKind"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind"
+      ]
+    },
+    "CandidateFileKind": {
+      "type": "string",
+      "enum": [
+        "added",
+        "deleted",
+        "generated",
+        "modified"
+      ]
+    },
+    "CandidateManifest": {
+      "type": "object",
+      "properties": {
+        "base_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "configuration_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "delivery_payload_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "dependency_state_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "diff_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "environment_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CandidateFile"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "files",
+        "diff_digest",
+        "dependency_state_digest",
+        "configuration_digest",
+        "environment_digest",
+        "evidence_ids"
+      ]
+    },
+    "EvidenceKind": {
+      "type": "string",
+      "enum": [
+        "command",
+        "test",
+        "build",
+        "lint",
+        "database",
+        "browser",
+        "security",
+        "inspection",
+        "package"
+      ]
+    },
+    "EvidenceRecord": {
+      "type": "object",
+      "properties": {
+        "candidate_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "invocation": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "output_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "skip_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "$ref": "#/$defs/EvidenceStatus"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "tool_version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "candidate_digest",
+        "kind",
+        "invocation",
+        "tool",
+        "tool_version",
+        "started_at",
+        "finished_at",
+        "output_digest",
+        "status"
+      ]
+    },
+    "EvidenceStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "skipped"
+      ]
+    },
+    "Finding": {
+      "type": "object",
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "uniqueItems": true
+        },
+        "severity": {
+          "$ref": "#/$defs/FindingSeverity"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "summary",
+        "evidence_ids"
+      ]
+    },
+    "FindingSeverity": {
+      "type": "string",
+      "enum": [
+        "critical",
+        "high",
+        "medium",
+        "low",
+        "info"
+      ]
+    },
+    "PlannedTask": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "requirement_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "verification_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "acceptance_criteria",
+        "dependencies",
+        "id",
+        "objective",
+        "requirement_ids",
+        "title",
+        "verification_commands",
+        "write_scopes"
+      ]
+    },
+    "ProtocolPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/RequestRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "request"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ArchitecturePlan"
+            },
+            "type": {
+              "type": "string",
+              "const": "architecture"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/CandidateManifest"
+            },
+            "type": {
+              "type": "string",
+              "const": "candidate"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/EvidenceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "evidence"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ArbiterVerdict"
+            },
+            "type": {
+              "type": "string",
+              "const": "verdict"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data"
+          ]
+        }
+      ]
+    },
+    "RepairTarget": {
+      "type": "string",
+      "enum": [
+        "execution",
+        "architecture"
+      ]
+    },
+    "RequestAmendment": {
+      "type": "object",
+      "properties": {
+        "received_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "text",
+        "received_at"
+      ]
+    },
+    "RequestRecord": {
+      "type": "object",
+      "properties": {
+        "amendments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequestAmendment"
+          }
+        },
+        "attachment_hashes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "original_text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "original_text",
+        "attachment_hashes",
+        "amendments"
+      ]
+    },
+    "Requirement": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "acceptance_criteria",
+        "id",
+        "statement"
+      ]
+    },
+    "RequirementDecision": {
+      "type": "object",
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "uniqueItems": true
+        },
+        "requirement_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/RequirementStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "status",
+        "evidence_ids"
+      ]
+    },
+    "RequirementStatus": {
+      "type": "string",
+      "enum": [
+        "satisfied",
+        "unsatisfied"
+      ]
+    }
+  }
+}

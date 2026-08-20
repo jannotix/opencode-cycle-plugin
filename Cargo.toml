@@ -1,0 +1,44 @@
+[workspace]
+members = ["crates/workflow-code-intel", "crates/workflow-core", "crates/workflow-ipc", "crates/workflow-ledger", "crates/workflow-memory", "crates/workflow-store", "crates/workflowd"]
+resolver = "3"
+
+[workspace.package]
+version = "1.0.0"
+authors = ["Gianluca Iannotta"]
+edition = "2024"
+rust-version = "1.97"
+license = "FSL-1.1-MIT"
+repository = "https://github.com/jannotix/opencode-cycle-plugin"
+
+[workspace.dependencies]
+cap-std = "4.0.2"
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+ignore = "0.4.33"
+notify = "8.2.0"
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+shlex = "2.0.1"
+sha2 = "0.11.0"
+sysinfo = "0.39.6"
+tempfile = "3.27.0"
+time = { version = "0.3.55", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tree-sitter = "0.26.12"
+uuid = { version = "1.24.0", features = ["serde", "v7"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,43 @@
+{
+  "name": "opencode-cycle-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "audit": "bun audit --audit-level=high && cargo audit",
+    "build": "bun run build:typescript && cargo build --workspace",
+    "build:typescript": "tsc -b",
+    "check": "bun run check:identity && bun run check:contracts && bun run check:commands && bun run licenses && bun run typecheck && cargo fmt --check && cargo clippy --workspace --all-features -- -D warnings",
+    "check:commands": "bun scripts/ci/check-command-reference.ts",
+    "check:identity": "bun scripts/ci/check-product-identity.ts",
+    "check:contracts": "bun scripts/ci/check-generated-contracts.ts",
+    "generate:commands": "bun scripts/ci/generate-command-reference.ts",
+    "generate:contracts": "bun scripts/ci/generate-contracts.ts",
+    "licenses": "bun scripts/ci/check-licenses.ts",
+    "package:verify": "bun run test:package",
+    "test": "bun test",
+    "test:control-plane": "cargo build -p workflowd && bun test ./packages/opencode-cycle/test/client.e2e.ts",
+    "test:native-package": "cargo build -p workflowd && bun scripts/ci/test-packed-native.ts",
+    "test:package": "cargo build -p workflowd && bun scripts/ci/test-packed-plugin.ts",
+    "test:repeat-critical": "cargo build -p workflowd && bun scripts/ci/repeat-critical-suite.ts --iterations 20 --output target/certification/critical-suite.json",
+    "test:scale:500k": "cargo run -p workflow-code-intel --release --example codebase_500k -- --output target/certification/codebase-500k.json",
+    "typecheck": "tsc -b --pretty false && tsc -p scripts/tsconfig.json --pretty false"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/node": "26.2.0",
+    "json-schema-to-typescript": "15.0.4",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.16",
+    "@opencode-ai/sdk": "1.18.16",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "puppeteer-core": "25.6.0"
+  }
+}

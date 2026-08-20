@@ -1,0 +1,90 @@
+name: Publish certified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate_run_id:
+        description: Successful Release candidate workflow run ID
+        required: true
+        type: string
+      version:
+        description: Certified semantic version
+        required: true
+        default: 1.0.0
+        type: string
+
+concurrency:
+  group: publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish immutable certified artifacts
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+      - name: Download the sealed candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "${{ inputs.release_candidate_run_id }}" --repo "$GITHUB_REPOSITORY" --name "opencode-cycle-${{ inputs.version }}-release-candidate" --dir candidate
+      - name: Verify candidate origin, contents and publication order
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.release_candidate_run_id }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .conclusion)" = success
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .name)" = "Release candidate"
+          revision="$(jq -r .revision candidate/release-manifest.json)"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .head_sha)" = "$revision"
+          git checkout --detach "$revision"
+          (cd candidate && sha256sum --check SHA256SUMS)
+          bun scripts/release/publication-plan.ts --candidate candidate --version "$VERSION" --revision "$revision" --output candidate/publication-order.txt
+      - name: Install the certified npm publisher
+        run: npm install --global npm@12.0.2
+      - name: Publish native packages before the plugin
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          while IFS= read -r archive; do
+            npm publish "$archive" --access public
+          done < candidate/publication-order.txt
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          revision="$(jq -r .revision candidate/release-manifest.json)"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists" >&2
+            exit 1
+          fi
+          gh release create "v$VERSION" \
+            candidate/artifacts/* \
+            candidate/certifications/*.json \
+            candidate/certifications/scale/*.json \
+            candidate/release-manifest.json \
+            candidate/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$revision" \
+            --title "Cycle for OpenCode v$VERSION" \
+            --generate-notes
