@@ -17,6 +17,7 @@ fuzz/corpus/generated/
 benchmarks/results/local/
 
 # Local development material (not published)
+.worktrees/
 AGENTS.md
 PRODUCT.md
 CONTRIBUTING.md
