@@ -14,6 +14,7 @@ for (const mode of ["full", "quick"] as const) {
   let executorRuns = 0
   let arbiterRuns = 0
   let architectureRuns = 0
+  let taskReviewRuns = 0
   const architectPrompts: string[] = []
   let statusCalls = 0
   const executorPrompts: string[] = []
@@ -78,7 +79,16 @@ for (const mode of ["full", "quick"] as const) {
             join(options.query.directory, "feature.txt"),
             executorRuns === 1 ? "first candidate\n" : "repaired candidate\n",
           )
-          return response({ status: "completed", summary: `Execution ${executorRuns}` })
+          return response({ status: "submitted", summary: `Execution ${executorRuns}` })
+        }
+        if (
+          options.body.agent === "Cycle Functional Reviewer" &&
+          prompt.includes("Independently review one submitted task")
+        ) {
+          taskReviewRuns += 1
+          return response(
+            taskReviewRuns === 1 ? taskReviewRejection(prompt) : taskReviewVerdict(prompt),
+          )
         }
         if (options.body.agent.includes("Reviewer")) {
           if (mode === "quick") throw new Error("Quick mode started an independent reviewer")
@@ -246,18 +256,20 @@ for (const mode of ["full", "quick"] as const) {
     expect(result.state).toBe("completed")
     expect(architectureRuns).toBe(2)
     expect(architectPrompts[1]).toContain("at least one write scope")
-    expect(executorRuns).toBe(2)
+    expect(executorRuns).toBe(3)
+    expect(taskReviewRuns).toBe(3)
     expect(arbiterRuns).toBe(2)
     expect(verificationAttestations).toHaveLength(2)
     expect(verificationAttestations[0]).toEqual([
-      expect.objectContaining({ candidate_digest: "1".repeat(64) }),
-    ])
-    expect(verificationAttestations[1]).toEqual([
       expect.objectContaining({ candidate_digest: "2".repeat(64) }),
     ])
+    expect(verificationAttestations[1]).toEqual([
+      expect.objectContaining({ candidate_digest: "3".repeat(64) }),
+    ])
     expect(statusCalls).toBeGreaterThan(1)
-    expect(executorPrompts[1]).toContain("Repair the implementation.")
-    expect(sessions.length).toBe(mode === "full" ? 10 : 6)
+    expect(executorPrompts[1]).toContain("Independent task review rejected")
+    expect(executorPrompts[2]).toContain("Repair the implementation.")
+    expect(sessions.length).toBe(mode === "full" ? 14 : 10)
     expect(childSignals.length).toBeGreaterThan(0)
     expect(childSignals.every((signal) => signal === controller.signal)).toBeTrue()
     expect(launchedModels.get("Cycle Architect")).toEqual({ providerID: "provider-a", modelID: "architect" })
@@ -281,7 +293,47 @@ for (const mode of ["full", "quick"] as const) {
   } finally {
     await rm(repository, { force: true, recursive: true })
   }
-  }, 15_000)
+  }, 60_000)
+}
+
+function taskReviewVerdict(prompt: string) {
+  const taskId = prompt.match(/"id":"([0-9a-f-]{36})"/u)?.[1] ?? ""
+  const revision = prompt.match(/"revision":"([0-9a-f]{40})"/u)?.[1] ?? ""
+  const evidenceId = prompt.match(/"commands":\[\{[^}]*"id":"([0-9a-f-]{36})"/u)?.[1] ?? ""
+  return {
+    decision: "approved",
+    findings: [],
+    repair_target: null,
+    requirements: [
+      {
+        evidence_ids: [evidenceId],
+        requirement_id: "REQ-1",
+        status: "satisfied",
+      },
+    ],
+    revision,
+    task_id: taskId,
+  }
+}
+
+function taskReviewRejection(prompt: string) {
+  const verdict = taskReviewVerdict(prompt)
+  return {
+    ...verdict,
+    decision: "rejected",
+    findings: [
+      {
+        evidence_ids: verdict.requirements[0]?.evidence_ids ?? [],
+        severity: "medium",
+        summary: "The submitted task does not satisfy the acceptance criterion.",
+      },
+    ],
+    repair_target: "execution",
+    requirements: verdict.requirements.map((requirement) => ({
+      ...requirement,
+      status: "unsatisfied",
+    })),
+  }
 }
 
 function reviewVerdict(currentEvidenceId: string) {

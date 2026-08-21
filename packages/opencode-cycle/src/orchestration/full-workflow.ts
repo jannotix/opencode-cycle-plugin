@@ -8,8 +8,10 @@ import type { WorkflowRole } from "../permissions.js"
 import { runArbiter } from "./arbiter.js"
 import { ArchitectOutputError, runArchitect } from "./architect.js"
 import { assertGitRepository } from "../git-repository.js"
-import { runExecutionPlan } from "./executor.js"
+import { runExecutionPlan, type SubmittedTaskExecutionResult, type TaskExecutionResult } from "./executor.js"
 import { runIndependentReviews } from "./reviewers.js"
+import { runTaskReview } from "./task-review.js"
+import { runTaskVerification } from "./task-verification.js"
 
 interface FullWorkflowInput {
   readonly activeModel: string | null
@@ -111,8 +113,12 @@ export async function runFullWorkflow(
 
     await waitForRunnable(controlPlane, input)
     const executorVariant = roleVariant(input, "executor")
+    const activePlan = plan
+    const activeWorktree = worktree
     const executions = await runExecutionPlan(client, {
-      directory: worktree.path,
+      directory: activeWorktree.path,
+      finalizeTask: (task, result) =>
+        finalizeSubmittedTask(client, controlPlane, input, activeWorktree.path, activePlan, task, result),
       model: input.models.executor ?? input.activeModel,
       onSessionCreated: (sessionId) => input.registerSession(sessionId, "executor"),
       originalRequest: input.originalRequest,
@@ -153,6 +159,10 @@ export async function runFullWorkflow(
         )
         if (state !== "architecture") return { state }
         plan = undefined
+        continue
+      }
+      if (last?.status === "review_rejected" || last?.status === "verification_failed") {
+        repairFeedback = last.summary
         continue
       }
       return {
@@ -331,6 +341,111 @@ export async function runFullWorkflow(
     if (result.workflowState === "architecture") plan = undefined
     else if (result.workflowState !== "execution") return { state: result.workflowState }
   }
+}
+
+async function finalizeSubmittedTask(
+  client: PluginInput["client"],
+  controlPlane: LocalControlPlane,
+  input: FullWorkflowInput,
+  directory: string,
+  plan: Awaited<ReturnType<typeof runArchitect>>["plan"],
+  task: Awaited<ReturnType<typeof runArchitect>>["plan"]["tasks"][number],
+  result: SubmittedTaskExecutionResult,
+): Promise<TaskExecutionResult> {
+  const verification = await runTaskVerification({
+    baseRevision: result.baseRevision,
+    changedPaths: result.changedPaths,
+    directory,
+    revision: result.revision,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    task,
+  })
+  await controlPlane.audit(
+    observation(
+      {
+        files: result.changedPaths,
+        projectKey: input.projectKey,
+        role: "executor",
+        sessionID: result.sessionId,
+        taskID: result.taskId,
+        workflowID: input.workflowId,
+      },
+      {
+        gate: "task_verification",
+        status: verification.passed ? "passed" : "failed",
+        type: "verification",
+      },
+      { revision: result.revision, verification_digest: digest(verification) },
+    ),
+  )
+  if (!verification.passed) {
+    return {
+      ...result,
+      status: "verification_failed",
+      summary: `Deterministic task verification failed: ${
+        verification.bindingError ??
+        (verification.commands
+          .filter((command) => command.status !== "passed")
+          .map((command) => `${command.invocation}=${command.status}`)
+          .join(", ") || "incomplete verification evidence")
+      }`,
+    }
+  }
+  const reviewerVariant = roleVariant(input, "functional_reviewer")
+  let review: Awaited<ReturnType<typeof runTaskReview>>
+  try {
+    review = await runTaskReview(client, {
+      baseRevision: result.baseRevision,
+      changedPaths: result.changedPaths,
+      directory,
+      model: input.models.functional_reviewer ?? input.activeModel,
+      onSessionCreated: (sessionId) => input.registerSession(sessionId, "functional_reviewer"),
+      originalRequest: input.originalRequest,
+      parentSessionId: input.parentSessionId,
+      plan,
+      revision: result.revision,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      task,
+      ...(reviewerVariant === undefined ? {} : { variant: reviewerVariant }),
+      verification,
+    })
+  } catch (error) {
+    input.signal?.throwIfAborted()
+    return {
+      ...result,
+      status: "review_rejected",
+      summary: `Independent task review was unavailable or invalid: ${boundedError(error)}`,
+    }
+  }
+  await controlPlane.audit(
+    observation(
+      {
+        files: result.changedPaths,
+        projectKey: input.projectKey,
+        role: "functional_reviewer",
+        sessionID: review.sessionId,
+        taskID: result.taskId,
+        workflowID: input.workflowId,
+      },
+      { action: `task_review_${review.verdict.decision}`, type: "workflow" },
+      { revision: result.revision, verdict_digest: digest(review.verdict) },
+    ),
+  )
+  if (review.verdict.decision !== "approved") {
+    return {
+      ...result,
+      status: review.verdict.repair_target === "architecture" ? "plan_defect" : "review_rejected",
+      summary: `Independent task review rejected ${task.id}: ${review.verdict.findings
+        .map((finding) => finding.summary)
+        .join("; ") || "requirements unsatisfied"}`,
+    }
+  }
+  return { ...result, status: "completed" }
+}
+
+function boundedError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.slice(0, 1_024)
 }
 
 async function waitForRunnable(

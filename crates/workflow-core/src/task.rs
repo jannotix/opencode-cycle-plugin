@@ -39,8 +39,13 @@ pub enum TaskCommand {
     Lease,
     Start,
     SubmitCandidate,
-    VerificationPassed { mandatory_gates_passed: bool },
-    VerificationFailed { retryable: bool },
+    VerificationPassed {
+        mandatory_gates_passed: bool,
+        reviewer_approved: bool,
+    },
+    VerificationFailed {
+        retryable: bool,
+    },
     Block,
     Unblock,
     Cancel,
@@ -108,8 +113,9 @@ impl Task {
             }
             TaskCommand::VerificationPassed {
                 mandatory_gates_passed,
+                reviewer_approved,
             } if self.state == TaskState::Verifying => {
-                if !mandatory_gates_passed {
+                if !mandatory_gates_passed || !reviewer_approved {
                     return Err(crate::TransitionError::MandatoryGateFailed);
                 }
                 Ok(self.transition(TaskState::Completed))

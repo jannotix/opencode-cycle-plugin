@@ -175,22 +175,28 @@ fn invalid_workflow_transition_is_transactional() {
 }
 
 #[test]
-fn task_completion_requires_successful_mandatory_verification() {
-    let mut task = Task::new();
-    task.apply(TaskCommand::DependenciesSatisfied).unwrap();
-    task.apply(TaskCommand::Lease).unwrap();
-    task.apply(TaskCommand::Start).unwrap();
-    task.apply(TaskCommand::SubmitCandidate).unwrap();
-    assert!(
-        task.apply(TaskCommand::VerificationPassed {
-            mandatory_gates_passed: false,
-        })
-        .is_err()
-    );
-    assert_eq!(task.state(), TaskState::Verifying);
-    task.apply(TaskCommand::VerificationPassed {
-        mandatory_gates_passed: true,
-    })
-    .unwrap();
-    assert_eq!(task.state(), TaskState::Completed);
+fn task_completion_requires_successful_mandatory_verification_and_reviewer_approval() {
+    for (mandatory_gates_passed, reviewer_approved, completes) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut task = Task::new();
+        task.apply(TaskCommand::DependenciesSatisfied).unwrap();
+        task.apply(TaskCommand::Lease).unwrap();
+        task.apply(TaskCommand::Start).unwrap();
+        task.apply(TaskCommand::SubmitCandidate).unwrap();
+        let result = task.apply(TaskCommand::VerificationPassed {
+            mandatory_gates_passed,
+            reviewer_approved,
+        });
+        if completes {
+            assert!(result.is_ok());
+            assert_eq!(task.state(), TaskState::Completed);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(task.state(), TaskState::Verifying);
+        }
+    }
 }

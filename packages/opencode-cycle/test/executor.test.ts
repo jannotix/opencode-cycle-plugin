@@ -7,7 +7,7 @@ import { join } from "node:path"
 import type { ArchitecturePlanInput } from "../src/client.js"
 import { runExecutionPlan } from "../src/orchestration/executor.js"
 
-test("executor changes only authorized scopes and checkpoints each completed task", async () => {
+test("executor submits authorized scoped changes and never closes the task itself", async () => {
   const repository = await createRepository()
   const calls: unknown[] = []
   try {
@@ -23,7 +23,7 @@ test("executor changes only authorized scopes and checkpoints each completed tas
     )
 
     expect(results).toHaveLength(1)
-    expect(results[0]?.status).toBe("completed")
+    expect(results[0]?.status).toBe("submitted")
     expect(results[0]?.changedPaths).toEqual(["feature.txt"])
     expect(await git(repository, ["status", "--porcelain"])).toBe("")
     expect(await git(repository, ["rev-list", "--count", "HEAD"])).toBe("2")
@@ -36,6 +36,7 @@ test("executor changes only authorized scopes and checkpoints each completed tas
     const prompt = promptCall?.prompt.body.parts[0]?.text ?? ""
     expect(prompt).toContain("Do not call cycle_control, cycle_role, or goal operations")
     expect(prompt).toContain("Workflow governance runs outside this executor session")
+    expect(prompt).toContain("Never return completed")
     expect(prompt).toContain("Assigned task")
     expect(prompt).not.toContain("Architecture context")
   } finally {
@@ -64,14 +65,38 @@ test("executor fails closed when a task writes outside its authorized scope", as
   }
 }, { timeout: 30_000 })
 
-test("executor accepts one terminal fenced receipt after narrative output", async () => {
+test("executor rejects self-completed receipts", async () => {
+  const repository = await createRepository()
+  try {
+    await expect(
+      runExecutionPlan(
+        client(
+          async () => {},
+          [],
+          'Verification passed.\n```json\n{"status":"completed","summary":"Task completed."}\n```',
+        ) as never,
+        {
+          directory: repository,
+          model: null,
+          originalRequest: "Verify the feature.",
+          parentSessionId: "parent",
+          plan: plan("feature.txt"),
+        },
+      ),
+    ).rejects.toThrow("invalid status")
+  } finally {
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
+test("executor accepts one terminal submitted receipt after narrative output", async () => {
   const repository = await createRepository()
   try {
     const results = await runExecutionPlan(
       client(
         async () => {},
         [],
-        'Verification passed.\n```json\n{"status":"completed","summary":"Task completed."}\n```',
+        'Ready for review.\n```json\n{"status":"submitted","summary":"Task submitted."}\n```',
       ) as never,
       {
         directory: repository,
@@ -82,11 +107,39 @@ test("executor accepts one terminal fenced receipt after narrative output", asyn
       },
     )
 
-    expect(results[0]?.status).toBe("completed")
+    expect(results[0]?.status).toBe("submitted")
   } finally {
     await rm(repository, { force: true, recursive: true })
   }
 }, { timeout: 30_000 })
+
+for (const status of ["blocked", "plan_defect"] as const) {
+  test(`executor never checkpoints a ${status} result`, async () => {
+    const repository = await createRepository()
+    try {
+      const results = await runExecutionPlan(
+        client(
+          async (directory) => writeFile(join(directory, "feature.txt"), `${status}\n`),
+          [],
+          JSON.stringify({ status, summary: `${status} evidence` }),
+        ) as never,
+        {
+          directory: repository,
+          model: null,
+          originalRequest: "Implement the complete feature.",
+          parentSessionId: "parent",
+          plan: plan("feature.txt"),
+        },
+      )
+
+      expect(results[0]?.status).toBe(status)
+      expect(await git(repository, ["rev-list", "--count", "HEAD"])).toBe("1")
+      expect(await git(repository, ["status", "--porcelain"])).toContain("feature.txt")
+    } finally {
+      await rm(repository, { force: true, recursive: true })
+    }
+  }, { timeout: 30_000 })
+}
 
 test("disjoint same-level tasks run in isolated worktrees and merge onto the source", async () => {
   const repository = await createRepository()
@@ -108,7 +161,7 @@ test("disjoint same-level tasks run in isolated worktrees and merge onto the sou
             await writeFile(join(options.query.directory, file), "complete\n")
             return {
               data: {
-                parts: [{ text: '{"status":"completed","summary":"Task completed."}', type: "text" }],
+                parts: [{ text: '{"status":"submitted","summary":"Task submitted."}', type: "text" }],
               },
             }
           },
@@ -116,6 +169,7 @@ test("disjoint same-level tasks run in isolated worktrees and merge onto the sou
       } as never,
       {
         directory: repository,
+        finalizeTask: async (_task, result) => ({ ...result, status: "completed" }),
         model: null,
         originalRequest: "Implement independent files.",
         parentSessionId: "parent",
@@ -150,7 +204,7 @@ test("overlapping write scopes stay sequential on the source worktree", async ()
             await writeFile(join(options.query.directory, "tracked.txt"), "updated\n")
             return {
               data: {
-                parts: [{ text: '{"status":"completed","summary":"Task completed."}', type: "text" }],
+                parts: [{ text: '{"status":"submitted","summary":"Task submitted."}', type: "text" }],
               },
             }
           },
@@ -158,6 +212,7 @@ test("overlapping write scopes stay sequential on the source worktree", async ()
       } as never,
       {
         directory: repository,
+        finalizeTask: async (_task, result) => ({ ...result, status: "completed" }),
         model: null,
         originalRequest: "Implement overlapping files.",
         parentSessionId: "parent",
@@ -197,10 +252,48 @@ test("executor rejects ambiguous fenced receipts", async () => {
   }
 }, { timeout: 30_000 })
 
+test("submitted task alone does not advance dependent work without finalization", async () => {
+  const repository = await createRepository()
+  const directories: string[] = []
+  try {
+    const results = await runExecutionPlan(
+      {
+        session: {
+          async create() {
+            return { data: { id: crypto.randomUUID() } }
+          },
+          async prompt(options: { query: { directory: string } }) {
+            directories.push(options.query.directory)
+            await writeFile(join(options.query.directory, "alpha.txt"), "submitted\n")
+            return {
+              data: {
+                parts: [{ text: '{"status":"submitted","summary":"Task submitted."}', type: "text" }],
+              },
+            }
+          },
+        },
+      } as never,
+      {
+        directory: repository,
+        model: null,
+        originalRequest: "Implement dependent files.",
+        parentSessionId: "parent",
+        plan: dependentTaskPlan(),
+      },
+    )
+
+    expect(results).toHaveLength(1)
+    expect(results[0]?.status).toBe("submitted")
+    expect(directories).toEqual([repository])
+  } finally {
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
 function client(
   action: (directory: string) => Promise<void>,
   calls: unknown[],
-  output = '{"status":"completed","summary":"Task completed."}',
+  output = '{"status":"submitted","summary":"Task submitted."}',
 ) {
   return {
     session: {
@@ -218,6 +311,23 @@ function client(
         }
       },
     },
+  }
+}
+
+function dependentTaskPlan(): ArchitecturePlanInput {
+  const base = twoTaskPlan(["alpha.txt"], ["beta.txt"])
+  const first = base.tasks[0]
+  const second = base.tasks[1]
+  if (first === undefined || second === undefined) throw new Error("Invalid fixture")
+  return {
+    ...base,
+    tasks: [
+      first,
+      {
+        ...second,
+        dependencies: [first.id],
+      },
+    ],
   }
 }
 

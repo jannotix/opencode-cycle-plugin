@@ -60,6 +60,7 @@ fn task_in_state(state: TaskState) -> Task {
     if state == TaskState::Completed {
         task.apply(TaskCommand::VerificationPassed {
             mandatory_gates_passed: true,
+            reviewer_approved: true,
         })
         .unwrap();
     } else if state == TaskState::Failed {
@@ -114,6 +115,7 @@ fn every_forbidden_task_transition_preserves_state() {
         TaskCommand::SubmitCandidate,
         TaskCommand::VerificationPassed {
             mandatory_gates_passed: true,
+            reviewer_approved: true,
         },
         TaskCommand::VerificationFailed { retryable: true },
         TaskCommand::Block,
