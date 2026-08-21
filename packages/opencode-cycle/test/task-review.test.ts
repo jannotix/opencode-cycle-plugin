@@ -26,6 +26,10 @@ test("task review prompt uses original request and verification evidence without
   expect(prompt).toContain("Build the exact feature.")
   expect(prompt).toContain("Raw deterministic task verification receipt")
   expect(prompt).toContain(input.revision)
+  expect(prompt).toContain(`task:${input.task.id}:acceptance:1`)
+  expect(prompt).toContain("requirement:REQ-1:acceptance:1")
+  expect(prompt).toContain("Task works.")
+  expect(prompt).toContain("Feature works.")
   expect(prompt).not.toContain("Task completed.")
 })
 
@@ -116,6 +120,51 @@ test("task review rejects wrong bindings, incomplete coverage and invalid approv
   expect(() =>
     parseTaskReview(JSON.stringify({ ...validVerdict(input), unexpected: true }), input),
   ).toThrow("missing or unknown fields")
+  expect(() =>
+    parseTaskReview(JSON.stringify({ ...validVerdict(input), criteria: [] }), input),
+  ).toThrow("between 1 and 256")
+  expect(() =>
+    parseTaskReview(
+      JSON.stringify({ ...validVerdict(input), criteria: validVerdict(input).criteria.slice(0, 1) }),
+      input,
+    ),
+  ).toThrow("omitted acceptance criterion")
+  expect(() =>
+    parseTaskReview(
+      JSON.stringify({
+        ...validVerdict(input),
+        criteria: [...validVerdict(input).criteria, validVerdict(input).criteria[0]],
+      }),
+      input,
+    ),
+  ).toThrow("duplicate acceptance criterion")
+  expect(() =>
+    parseTaskReview(
+      JSON.stringify({
+        ...validVerdict(input),
+        criteria: [
+          ...validVerdict(input).criteria,
+          {
+            criterion_id: "requirement:REQ-OTHER:acceptance:1",
+            evidence_ids: ["evidence-1"],
+            status: "satisfied",
+          },
+        ],
+      }),
+      input,
+    ),
+  ).toThrow("unassigned acceptance criterion")
+  expect(() =>
+    parseTaskReview(
+      JSON.stringify({
+        ...validVerdict(input),
+        criteria: validVerdict(input).criteria.map((criterion, index) =>
+          index === 0 ? { ...criterion, status: "unsatisfied" } : criterion,
+        ),
+      }),
+      input,
+    ),
+  ).toThrow("cannot approve unsatisfied acceptance criteria")
 })
 
 test("task review is unavailable until deterministic verification passes", async () => {
@@ -159,6 +208,18 @@ test("task review requires an exact task, revision, path and command receipt bin
 
 function validVerdict(input: TaskReviewInput) {
   return {
+    criteria: [
+      {
+        criterion_id: `task:${input.task.id}:acceptance:1`,
+        evidence_ids: ["evidence-1"],
+        status: "satisfied",
+      },
+      {
+        criterion_id: "requirement:REQ-1:acceptance:1",
+        evidence_ids: ["evidence-1"],
+        status: "satisfied",
+      },
+    ],
     decision: "approved",
     findings: [],
     repair_target: null,

@@ -301,6 +301,18 @@ function taskReviewVerdict(prompt: string) {
   const revision = prompt.match(/"revision":"([0-9a-f]{40})"/u)?.[1] ?? ""
   const evidenceId = prompt.match(/"commands":\[\{[^}]*"id":"([0-9a-f-]{36})"/u)?.[1] ?? ""
   return {
+    criteria: [
+      {
+        criterion_id: `task:${taskId}:acceptance:1`,
+        evidence_ids: [evidenceId],
+        status: "satisfied",
+      },
+      {
+        criterion_id: "requirement:REQ-1:acceptance:1",
+        evidence_ids: [evidenceId],
+        status: "satisfied",
+      },
+    ],
     decision: "approved",
     findings: [],
     repair_target: null,
@@ -331,6 +343,10 @@ function taskReviewRejection(prompt: string) {
     repair_target: "execution",
     requirements: verdict.requirements.map((requirement) => ({
       ...requirement,
+      status: "unsatisfied",
+    })),
+    criteria: verdict.criteria.map((criterion) => ({
+      ...criterion,
       status: "unsatisfied",
     })),
   }

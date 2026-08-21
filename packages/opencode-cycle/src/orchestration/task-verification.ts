@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { promisify } from "node:util"
 import { spawn } from "bun"
 
@@ -10,6 +11,8 @@ const execFileAsync = promisify(execFile)
 const OUTPUT_LIMIT_BYTES = 64 * 1024
 const OUTPUT_PREVIEW_CHARACTERS = 4_096
 const DEFAULT_TIMEOUT_MILLIS = 120_000
+const TERMINATION_GRACE_MILLIS = 500
+const TERMINATION_LIMIT_MILLIS = 5_000
 const FORBIDDEN_EXECUTABLES = new Set([
   "bash", "cmd", "del", "env", "fish", "git", "powershell", "pwsh", "rm", "sh",
   "shutdown", "sudo", "su", "wsl", "zsh",
@@ -60,6 +63,10 @@ export async function runTaskVerification(input: TaskVerificationInput): Promise
   for (const invocation of input.task.verification_commands) {
     input.signal?.throwIfAborted()
     commands.push(await runVerificationCommand(input.directory, invocation, input.timeoutMillis, input.signal))
+    const postCommandBindingError = await revisionBindingError(input)
+    if (postCommandBindingError !== null) {
+      return failedReceipt(input, postCommandBindingError, commands)
+    }
     if (commands.at(-1)?.status !== "passed") break
   }
   return {
@@ -112,21 +119,31 @@ async function runVerificationCommand(
   let aborted = false
   let outputExceeded = false
   let timedOut = false
-  const stop = (): void => {
-    try { child.kill() } catch { /* The process already exited. */ }
+  let terminationError: unknown
+  let terminationPromise: Promise<void> | undefined
+  const terminate = (): void => {
+    terminationPromise ??= terminateProcessTree(child).catch((error: unknown) => {
+      terminationError = error
+    })
   }
-  const onAbort = (): void => { aborted = true; stop() }
+  const onAbort = (): void => { aborted = true; terminate() }
   signal?.addEventListener("abort", onAbort, { once: true })
-  const timeout = setTimeout(() => { timedOut = true; stop() }, boundedTimeout(timeoutMillis))
+  if (signal?.aborted === true) onAbort()
+  const timeout = setTimeout(() => { timedOut = true; terminate() }, boundedTimeout(timeoutMillis))
 
   try {
     const perStreamLimit = OUTPUT_LIMIT_BYTES / 2
     const [stdout, stderr, exitCode] = await Promise.all([
-      capture(child.stdout, perStreamLimit, () => { outputExceeded = true; stop() }),
-      capture(child.stderr, perStreamLimit, () => { outputExceeded = true; stop() }),
+      capture(child.stdout, perStreamLimit, () => { outputExceeded = true; terminate() }),
+      capture(child.stderr, perStreamLimit, () => { outputExceeded = true; terminate() }),
       child.exited,
     ])
+    terminate()
+    await terminationPromise
     if (aborted) signal?.throwIfAborted()
+    if (terminationError !== undefined) {
+      return failedCommandReceipt(invocation, tool, args, terminationError, timedOut)
+    }
     return {
       args,
       exitCode,
@@ -150,11 +167,90 @@ function spawnVerificationProcess(directory: string, tool: string, args: readonl
   return spawn({
     cmd: [tool, ...args],
     cwd: directory,
+    detached: true,
     env: verificationEnvironment(),
     stdin: "ignore",
     stderr: "pipe",
     stdout: "pipe",
+    windowsHide: true,
   })
+}
+
+type VerificationProcess = ReturnType<typeof spawnVerificationProcess>
+
+async function terminateProcessTree(child: VerificationProcess): Promise<void> {
+  if (process.platform === "win32") {
+    await terminateWindowsProcessTree(child)
+    return
+  }
+  signalProcessGroup(child.pid, "SIGTERM")
+  if (!(await waitForProcessGroupExit(child.pid, TERMINATION_GRACE_MILLIS))) {
+    signalProcessGroup(child.pid, "SIGKILL")
+  }
+  await waitForExit(child.exited, TERMINATION_LIMIT_MILLIS)
+  if (!(await waitForProcessGroupExit(child.pid, TERMINATION_LIMIT_MILLIS))) {
+    throw new Error("Verification process group did not terminate")
+  }
+}
+
+async function terminateWindowsProcessTree(child: VerificationProcess): Promise<void> {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
+  const killer = spawn({
+    cmd: [join(systemRoot, "System32", "taskkill.exe"), "/PID", String(child.pid), "/T", "/F"],
+    env: verificationEnvironment(),
+    stdin: "ignore",
+    stderr: "ignore",
+    stdout: "ignore",
+    windowsHide: true,
+  })
+  if (!(await waitForExit(killer.exited, TERMINATION_LIMIT_MILLIS))) {
+    killer.kill()
+    if (!(await waitForExit(killer.exited, TERMINATION_GRACE_MILLIS))) {
+      throw new Error("Windows process-tree terminator did not exit")
+    }
+  }
+  if (!(await waitForExit(child.exited, TERMINATION_LIMIT_MILLIS))) {
+    child.kill()
+    if (!(await waitForExit(child.exited, TERMINATION_GRACE_MILLIS))) {
+      throw new Error("Verification process did not terminate")
+    }
+  }
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+  }
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMillis: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMillis
+  while (Date.now() < deadline) {
+    try {
+      process.kill(-pid, 0)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true
+      throw error
+    }
+    await delay(25)
+  }
+  return false
+}
+
+async function waitForExit(exited: Promise<number>, timeoutMillis: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMillis)
+    void exited.then(() => {
+      clearTimeout(timeout)
+      resolve(true)
+    })
+  })
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 async function revisionBindingError(input: TaskVerificationInput): Promise<string | null> {
@@ -191,9 +287,13 @@ async function revisionBindingError(input: TaskVerificationInput): Promise<strin
   }
 }
 
-function failedReceipt(input: TaskVerificationInput, bindingError: string): TaskVerificationReceipt {
+function failedReceipt(
+  input: TaskVerificationInput,
+  bindingError: string,
+  commands: readonly TaskVerificationCommandReceipt[] = [],
+): TaskVerificationReceipt {
   return {
-    baseRevision: input.baseRevision, bindingError, changedPaths: [...input.changedPaths], commands: [],
+    baseRevision: input.baseRevision, bindingError, changedPaths: [...input.changedPaths], commands,
     passed: false, revision: input.revision, taskId: input.task.id,
   }
 }

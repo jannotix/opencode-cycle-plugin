@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -12,8 +12,7 @@ test("deterministic task verification records passed commands with bounded diges
   try {
     const baseRevision = await git(repository, ["rev-parse", "HEAD"])
     await writeFile(join(repository, "feature.txt"), "complete\n")
-    await git(repository, ["add", "."])
-    await git(repository, ["commit", "-m", "candidate"])
+    await git(repository, ["commit", "-am", "candidate"])
     const revision = await git(repository, ["rev-parse", "HEAD"])
 
     const receipt = await runTaskVerification({
@@ -38,7 +37,7 @@ test("deterministic task verification records passed commands with bounded diges
   }
 }, { timeout: 30_000 })
 
-test("deterministic task verification fails on non-zero exit, timeout and revision mismatch", async () => {
+test("deterministic task verification fails on non-zero exit and revision mismatch", async () => {
   const repository = await createRepository()
   try {
     const revision = await git(repository, ["rev-parse", "HEAD"])
@@ -53,17 +52,6 @@ test("deterministic task verification fails on non-zero exit, timeout and revisi
     expect(failed.passed).toBe(false)
     expect(failed.commands[0]?.exitCode).toBe(7)
     expect(failed.commands[0]?.status).toBe("failed")
-
-    const timeout = await runTaskVerification({
-      baseRevision: revision,
-      changedPaths: [],
-      directory: repository,
-      revision,
-      task: task(['node -e "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2000)"']),
-      timeoutMillis: 50,
-    })
-    expect(timeout.passed).toBe(false)
-    expect(timeout.commands[0]?.status).toBe("timeout")
 
     const mismatch = await runTaskVerification({
       baseRevision: revision,
@@ -83,8 +71,7 @@ test("deterministic task verification binds base revision and changed paths", as
   try {
     const baseRevision = await git(repository, ["rev-parse", "HEAD"])
     await writeFile(join(repository, "feature.txt"), "complete\n")
-    await git(repository, ["add", "."])
-    await git(repository, ["commit", "-m", "candidate"])
+    await git(repository, ["commit", "-am", "candidate"])
     const revision = await git(repository, ["rev-parse", "HEAD"])
 
     const wrongBase = await runTaskVerification({
@@ -192,6 +179,137 @@ test("deterministic task verification fails closed when command output exceeds i
   }
 }, { timeout: 30_000 })
 
+test("deterministic task verification rejects post-command tracked, untracked and HEAD mutations", async () => {
+  const repository = await createRepository({
+    "mutate-head.cjs": `const {spawnSync}=require("node:child_process");
+const env={...process.env,GIT_AUTHOR_NAME:"Verifier",GIT_AUTHOR_EMAIL:"verify@example.invalid",GIT_COMMITTER_NAME:"Verifier",GIT_COMMITTER_EMAIL:"verify@example.invalid"};
+const result=spawnSync("git",["commit","--allow-empty","-m","forbidden"],{env,stdio:"ignore"});
+process.exit(result.status ?? 1);
+`,
+  })
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    for (const [command, expected] of [
+      ['node -e "require(\'node:fs\').writeFileSync(\'feature.txt\',\'mutated\\n\')"', "uncommitted"],
+      ['node -e "require(\'node:fs\').writeFileSync(\'untracked.txt\',\'created\\n\')"', "uncommitted"],
+      ["node mutate-head.cjs", "current worktree revision"],
+    ] as const) {
+      await git(repository, ["reset", "--hard", revision])
+      await git(repository, ["clean", "-fd"])
+      const receipt = await runTaskVerification({
+        baseRevision: revision,
+        changedPaths: [],
+        directory: repository,
+        revision,
+        task: task([command]),
+      })
+      expect(receipt.passed).toBe(false)
+      expect(receipt.commands[0]?.status).toBe("passed")
+      expect(receipt.bindingError).toContain(expected)
+    }
+  } finally {
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
+test("timeout terminates the verification process tree", async () => {
+  const pidFile = join(tmpdir(), `cycle-verifier-timeout-${crypto.randomUUID()}.pid`)
+  const repository = await createRepository({ "process-tree.cjs": processTreeFixture(false) })
+  let descendantPid: number | undefined
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    const receipt = await runTaskVerification({
+      baseRevision: revision,
+      changedPaths: [],
+      directory: repository,
+      revision,
+      task: task([`node process-tree.cjs "${pidFile}"`]),
+      timeoutMillis: 500,
+    })
+    descendantPid = Number(await readFile(pidFile, "utf8"))
+    expect(receipt.commands[0]?.status).toBe("timeout")
+    await expectProcessExit(descendantPid)
+  } finally {
+    if (descendantPid !== undefined) killProcess(descendantPid)
+    await rm(pidFile, { force: true })
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
+test("abort terminates the verification process tree and propagates cancellation", async () => {
+  const pidFile = join(tmpdir(), `cycle-verifier-abort-${crypto.randomUUID()}.pid`)
+  const repository = await createRepository({ "process-tree.cjs": processTreeFixture(false) })
+  const controller = new AbortController()
+  let descendantPid: number | undefined
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    const verification = runTaskVerification({
+      baseRevision: revision,
+      changedPaths: [],
+      directory: repository,
+      revision,
+      signal: controller.signal,
+      task: task([`node process-tree.cjs "${pidFile}"`]),
+    })
+    descendantPid = await waitForPid(pidFile)
+    controller.abort()
+    await expect(verification).rejects.toThrow()
+    await expectProcessExit(descendantPid)
+  } finally {
+    if (descendantPid !== undefined) killProcess(descendantPid)
+    await rm(pidFile, { force: true })
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
+test("verification process-group containment leaves no background descendant after success", async () => {
+  const pidFile = join(tmpdir(), `cycle-verifier-success-${crypto.randomUUID()}.pid`)
+  const repository = await createRepository({ "process-tree.cjs": processTreeFixture(false, true) })
+  let descendantPid: number | undefined
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    const receipt = await runTaskVerification({
+      baseRevision: revision,
+      changedPaths: [],
+      directory: repository,
+      revision,
+      task: task([`node process-tree.cjs "${pidFile}"`]),
+    })
+    descendantPid = Number(await readFile(pidFile, "utf8"))
+    expect(processAlive(descendantPid)).toBe(false)
+    expect(receipt.passed).toBe(true)
+    await expectProcessExit(descendantPid)
+  } finally {
+    if (descendantPid !== undefined) killProcess(descendantPid)
+    await rm(pidFile, { force: true })
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
+test("output-limit termination kills the verification process tree", async () => {
+  const pidFile = join(tmpdir(), `cycle-verifier-output-${crypto.randomUUID()}.pid`)
+  const repository = await createRepository({ "process-tree.cjs": processTreeFixture(true) })
+  let descendantPid: number | undefined
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    const receipt = await runTaskVerification({
+      baseRevision: revision,
+      changedPaths: [],
+      directory: repository,
+      revision,
+      task: task([`node process-tree.cjs "${pidFile}"`]),
+    })
+    descendantPid = Number(await readFile(pidFile, "utf8"))
+    expect(receipt.passed).toBe(false)
+    expect(receipt.commands[0]?.status).toBe("failed")
+    await expectProcessExit(descendantPid)
+  } finally {
+    if (descendantPid !== undefined) killProcess(descendantPid)
+    await rm(pidFile, { force: true })
+    await rm(repository, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
 function task(verificationCommands: readonly string[]): ArchitecturePlanInput["tasks"][number] {
   return {
     acceptance_criteria: ["Task works."],
@@ -205,17 +323,13 @@ function task(verificationCommands: readonly string[]): ArchitecturePlanInput["t
   }
 }
 
-async function createRepository(): Promise<string> {
+async function createRepository(files: Readonly<Record<string, string>> = {}): Promise<string> {
   const repository = await mkdtemp(join(tmpdir(), "opencode-cycle-task-verification-"))
-  for (const argumentsList of [
-    ["init"],
-    ["config", "user.email", "test@example.invalid"],
-    ["config", "user.name", "Test User"],
-    ["config", "core.autocrlf", "false"],
-  ]) {
-    await git(repository, argumentsList)
-  }
+  await git(repository, ["init"])
   await writeFile(join(repository, "feature.txt"), "base\n")
+  await Promise.all(
+    Object.entries(files).map(([path, contents]) => writeFile(join(repository, path), contents)),
+  )
   await git(repository, ["add", "."])
   await git(repository, ["commit", "-m", "base"])
   return repository
@@ -223,9 +337,66 @@ async function createRepository(): Promise<string> {
 
 function git(directory: string, argumentsList: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile("git", ["-C", directory, ...argumentsList], { encoding: "utf8" }, (error, stdout) => {
+    execFile("git", [
+      "-C",
+      directory,
+      "-c",
+      "core.autocrlf=false",
+      "-c",
+      "user.email=test@example.invalid",
+      "-c",
+      "user.name=Test User",
+      ...argumentsList,
+    ], { encoding: "utf8" }, (error, stdout) => {
       if (error === null) resolve(stdout.trim())
       else reject(error)
     })
   })
+}
+
+function processTreeFixture(outputLimit: boolean, exitAfterSpawn = false): string {
+  return `const {spawn}=require("node:child_process");
+const {writeFileSync}=require("node:fs");
+const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});
+writeFileSync(process.argv[2],String(child.pid));
+${outputLimit ? 'process.stdout.write("x".repeat(100000));' : ""}
+${exitAfterSpawn ? "process.exit(0);" : "setInterval(()=>{},1000);"}
+`
+}
+
+async function waitForPid(path: string): Promise<number> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const value = await readFile(path, "utf8").catch(() => "")
+    const pid = Number(value)
+    if (Number.isSafeInteger(pid) && pid > 0) return pid
+    await Bun.sleep(25)
+  }
+  throw new Error("Verification descendant PID was not recorded")
+}
+
+async function expectProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    if (!processAlive(pid)) return
+    await Bun.sleep(25)
+  }
+  expect(processAlive(pid)).toBe(false)
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+function killProcess(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL")
+  } catch {
+    // The process already exited.
+  }
 }
