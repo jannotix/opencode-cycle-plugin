@@ -5,6 +5,9 @@ import { basename, join, resolve } from "node:path"
 
 import { PRODUCT_IDENTITY } from "../product-identity.js"
 
+const NON_PRODUCTION_PATH =
+  /(?:^|\/)(?:(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|[^/]*(?:\.(?:test|spec)(?:\.|$)|_(?:test|spec)_)[^/]*)|\.map$/iu
+
 export interface PluginPackageResult {
   readonly archive: string
   readonly checksum: string
@@ -18,6 +21,10 @@ export async function packagePlugin(root: string, output: string): Promise<Plugi
   const comparison = join(scratch, "comparison")
   try {
     await Promise.all([mkdir(resolvedOutput, { recursive: true }), mkdir(comparison)])
+    const sourceModules = (await readdir(join(packageRoot, "src"), { recursive: true }))
+      .filter((path) => path.endsWith(".ts"))
+      .map((path) => path.replaceAll("\\", "/").replace(/\.ts$/u, ".js"))
+    validatePluginSourceModules(sourceModules)
     await cleanPluginBuildOutput(packageRoot)
     await run(["bun", "pm", "pack", "--destination", resolvedOutput], packageRoot)
     await cleanPluginBuildOutput(packageRoot)
@@ -31,9 +38,6 @@ export async function packagePlugin(root: string, output: string): Promise<Plugi
     const listing = (await run(["tar", "-tf", archive], resolvedRoot))
       .split(/\r?\n/u)
       .filter(Boolean)
-    const sourceModules = (await readdir(join(packageRoot, "src"), { recursive: true }))
-      .filter((path) => path.endsWith(".ts"))
-      .map((path) => path.replaceAll("\\", "/").replace(/\.ts$/u, ".js"))
     validatePluginListing(listing, sourceModules)
     const checksum = await digest(archive)
     await writeFile(`${archive}.sha256`, `${checksum}  ${basename(archive)}\n`, "utf8")
@@ -57,11 +61,11 @@ export function validatePluginListing(
   listing: readonly string[],
   sourceModules: readonly string[],
 ): void {
-  const forbidden = /(?:^|\/)(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|\.map$/u
-  const forbiddenPath = listing.find((path) => forbidden.test(path))
+  const forbiddenPath = listing.find(isNonProductionPath)
   if (forbiddenPath !== undefined) {
     throw new Error(`Plugin package contains non-production file ${forbiddenPath}`)
   }
+  validatePluginSourceModules(sourceModules)
   const expected = [
     "package/LICENSE",
     "package/NOTICE",
@@ -75,6 +79,17 @@ export function validatePluginListing(
   }
   const missing = expected.find((path) => !actual.includes(path))
   if (missing !== undefined) throw new Error(`Plugin package is missing ${missing}`)
+}
+
+export function validatePluginSourceModules(sourceModules: readonly string[]): void {
+  const forbiddenPath = sourceModules.find(isNonProductionPath)
+  if (forbiddenPath !== undefined) {
+    throw new Error(`Plugin source contains non-production module ${forbiddenPath}`)
+  }
+}
+
+function isNonProductionPath(path: string): boolean {
+  return NON_PRODUCTION_PATH.test(path.replaceAll("\\", "/"))
 }
 
 async function singleArchive(directory: string): Promise<string> {

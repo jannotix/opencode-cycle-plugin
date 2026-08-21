@@ -4,7 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { cleanPluginBuildOutput, validatePluginListing } from "./plugin-package.js"
+import {
+  cleanPluginBuildOutput,
+  validatePluginListing,
+  validatePluginSourceModules,
+} from "./plugin-package.js"
 
 test("plugin packaging removes stale compiler output before building", async () => {
   const root = await mkdtemp(join(tmpdir(), "opencode-cycle-plugin-clean-"))
@@ -58,11 +62,42 @@ test("plugin package accepts the exact production module allowlist", () => {
   ).not.toThrow()
 })
 
+const nonProductionModules = [
+  "feature.test.js",
+  "feature.spec.js",
+  "feature_test_helper.js",
+  "feature_spec_helper.js",
+] as const
+
+test("plugin package rejects test and spec source-module filename conventions", () => {
+  for (const module of nonProductionModules) {
+    expect(() => validatePluginSourceModules([module])).toThrow(module)
+  }
+})
+
+test("plugin package rejects test and spec output filename conventions", () => {
+  for (const module of nonProductionModules) {
+    expect(() =>
+      validatePluginListing(
+        [
+          "package/LICENSE",
+          "package/NOTICE",
+          `package/dist/${module}`,
+          "package/package.json",
+        ],
+        [module],
+      ),
+    ).toThrow(`package/dist/${module}`)
+  }
+})
+
 test("public validation sources exist while archives reject non-production paths", async () => {
   const root = fileURLToPath(new URL("../../", import.meta.url))
   await Promise.all(
     [
       "tests/workspace.test.ts",
+      "packages/opencode-cycle/test/load.test.ts",
+      "packages/protocol-contracts/test/contracts.test.ts",
       "crates/workflow-core/examples/export_schema.rs",
       "crates/workflow-code-intel/examples/codebase_500k.rs",
       "docs/security/threat-model.md",

@@ -34,7 +34,6 @@ docs/security/*
 !docs/security/threat-model.md
 docs/releases/*
 !docs/releases/verification.md
-**/test/
 crates/*/examples/*
 !crates/workflow-core/examples/export_schema.rs
 !crates/workflow-code-intel/examples/codebase_500k.rs
