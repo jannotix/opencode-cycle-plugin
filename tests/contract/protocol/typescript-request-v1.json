@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "payload": {
+    "type": "request",
+    "data": {
+      "original_text": "Preserve this TypeScript fixture exactly.\n",
+      "attachment_hashes": [
+        "0000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "amendments": [
+        {
+          "sequence": 1,
+          "text": "Use the full workflow.",
+          "received_at": "2026-08-12T10:00:00Z"
+        }
+      ]
+    }
+  }
+}

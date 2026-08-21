@@ -5,7 +5,6 @@ import { join, resolve } from "node:path"
 import { PRODUCT_IDENTITY, SHIPPED_NATIVE_PACKAGE_NAMES } from "../product-identity.js"
 import {
   REQUIRED_CERTIFIED_PLATFORMS,
-  UNTESTED_DESKTOP_PLATFORMS,
   QUALITY_EVIDENCE_NAMES,
 } from "./release-manifest.js"
 
@@ -40,13 +39,6 @@ export function buildPublicationPlan(
       .map((item) => item.platform),
     REQUIRED_CERTIFIED_PLATFORMS,
     "desktop certification",
-  )
-  requireExactSet(
-    manifest.certifications
-      .filter((item) => item.status === "untested")
-      .map((item) => item.platform),
-    UNTESTED_DESKTOP_PLATFORMS,
-    "untested desktop platform",
   )
   requireExactSet(
     manifest.qualityEvidence.map((item) => item.name),

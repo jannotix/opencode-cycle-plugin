@@ -10,13 +10,8 @@ export const PRODUCT_IDENTITY = {
 } as const
 
 export const NATIVE_PACKAGE_NAMES = [
-  "@opencode-cycle/native-darwin-arm64",
-  "@opencode-cycle/native-darwin-x64",
   "@opencode-cycle/native-linux-x64",
   "@opencode-cycle/native-win32-x64",
 ] as const
 
-export const SHIPPED_NATIVE_PACKAGE_NAMES = [
-  "@opencode-cycle/native-linux-x64",
-  "@opencode-cycle/native-win32-x64",
-] as const
+export const SHIPPED_NATIVE_PACKAGE_NAMES = NATIVE_PACKAGE_NAMES

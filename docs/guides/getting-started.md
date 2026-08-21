@@ -112,12 +112,11 @@ For a multi-milestone product, create a persistent goal before implementation. S
 
 Cycle for OpenCode stores its durable data outside the OpenCode installation, so an OpenCode application update cannot overwrite workflow state or project changes. On startup, the plugin checks the host contract: missing capabilities or an unsupported major/minimum version enter inert safe mode; a newer 1.x Desktop update keeps Cycle running and reports the uncertified host in doctor, help and `/cycle`. It never rewrites unrelated OpenCode configuration.
 
-Before changing plugin versions, close OpenCode Desktop and back up the complete data directory. The product name is Cycle for OpenCode; Windows and macOS keep the existing data-directory folder name so current installs are not moved:
+Before changing plugin versions, close OpenCode Desktop and back up the complete data directory. Version 1.0.0 supports Windows x64 and Linux x64 only; it does not ship macOS packages. Supported installations keep the existing data-directory folder name so current installs are not moved:
 
 | Platform | Data directory |
 | --- | --- |
 | Windows | `%LOCALAPPDATA%\OpenCode Cycle` |
-| macOS | `~/Library/Application Support/OpenCode Cycle` |
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/opencode-cycle` |
 
 Copy the entire directory while OpenCode is closed so the SQLite database, WAL state, signing key, IPC credential, checkpoints and managed worktrees remain consistent. The updater never stores durable state in a package cache or application bundle.

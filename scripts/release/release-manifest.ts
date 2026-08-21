@@ -5,19 +5,13 @@ import { basename, join, resolve } from "node:path"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
 
 export const REQUIRED_CERTIFIED_PLATFORMS = ["linux-x64", "windows-x64"] as const
-export const UNTESTED_DESKTOP_PLATFORMS = ["macos-arm64", "macos-x64"] as const
-export const DECLARED_DESKTOP_PLATFORMS = [
-  "linux-x64",
-  "macos-arm64",
-  "macos-x64",
-  "windows-x64",
-] as const
+export const DECLARED_DESKTOP_PLATFORMS = REQUIRED_CERTIFIED_PLATFORMS
 export const CERTIFIED_PLATFORMS = DECLARED_DESKTOP_PLATFORMS
 
 export const QUALITY_EVIDENCE_NAMES = ["codebase-500k", "critical-suite"] as const
 
 export type CertifiedPlatform = (typeof DECLARED_DESKTOP_PLATFORMS)[number]
-export type CertificationStatus = "certified" | "untested"
+export type CertificationStatus = "certified"
 export type QualityEvidenceName = (typeof QUALITY_EVIDENCE_NAMES)[number]
 
 export interface ReleaseCertification {
@@ -75,10 +69,6 @@ export function buildReleaseManifest(input: ReleaseManifestInput): ReleaseManife
         throw new Error(`Missing certification evidence: ${item.platform}`)
       }
       validateDigest(item.evidenceSha256)
-    } else if ((UNTESTED_DESKTOP_PLATFORMS as readonly string[]).includes(item.platform)) {
-      if (item.status !== "untested" || item.evidenceSha256 !== undefined) {
-        throw new Error(`macOS Desktop is untested and must not include certification evidence: ${item.platform}`)
-      }
     } else {
       throw new Error(`Unsupported certification platform: ${item.platform}`)
     }
@@ -117,9 +107,6 @@ export function classifyCertificationEvidence(
   | { readonly kind: "quality"; readonly name: QualityEvidenceName } {
   if (!isRecord(evidence)) throw new Error("Certification evidence must be an object")
   if (typeof evidence.platform === "string") {
-    if ((UNTESTED_DESKTOP_PLATFORMS as readonly string[]).includes(evidence.platform)) {
-      throw new Error(`Desktop certification for ${evidence.platform} is not accepted; macOS is untested`)
-    }
     if (!(REQUIRED_CERTIFIED_PLATFORMS as readonly string[]).includes(evidence.platform)) {
       throw new Error("Desktop certification has an invalid platform")
     }
@@ -193,10 +180,7 @@ async function main(): Promise<void> {
       platform,
       status: "certified" as const,
     }))
-  const certifications = [
-    ...certified,
-    ...UNTESTED_DESKTOP_PLATFORMS.map((platform) => ({ platform, status: "untested" as const })),
-  ]
+  const certifications = certified
   const qualityEvidence = classified
     .filter((item) => item.kind === "quality")
     .map(({ evidenceSha256, name }) => ({ evidenceSha256, name }))

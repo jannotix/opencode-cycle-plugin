@@ -1,0 +1,18 @@
+{
+  "version": "1.18.16",
+  "release": "https://github.com/anomalyco/opencode/releases/tag/v1.18.16",
+  "assets": {
+    "windows-x64": {
+      "name": "opencode-desktop-win-x64.exe",
+      "sha256": "f6e5fb987b97bdcee9536fa2e3beb18fdcd1a9bc5b87e4bf9b490b93ce63a074",
+      "size": 126255480,
+      "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.16/opencode-desktop-win-x64.exe"
+    },
+    "linux-x64": {
+      "name": "opencode-desktop-linux-x86_64.AppImage",
+      "sha256": "401244cf5125aac8982b9872e11230b3db9e7c32193805126277acfb23f96f3a",
+      "size": 158796596,
+      "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.16/opencode-desktop-linux-x86_64.AppImage"
+    }
+  }
+}

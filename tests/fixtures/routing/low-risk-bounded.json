@@ -1,0 +1,15 @@
+{
+  "name": "bounded local documentation and test adjustment",
+  "facts": [
+    {
+      "category": "documentation",
+      "source": "deterministic"
+    },
+    {
+      "category": "localized_change",
+      "source": "user"
+    }
+  ],
+  "preference": "auto",
+  "expected_mode": "quick"
+}

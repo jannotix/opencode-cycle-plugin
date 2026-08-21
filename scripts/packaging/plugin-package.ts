@@ -57,6 +57,11 @@ export function validatePluginListing(
   listing: readonly string[],
   sourceModules: readonly string[],
 ): void {
+  const forbidden = /(?:^|\/)(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|\.map$/u
+  const forbiddenPath = listing.find((path) => forbidden.test(path))
+  if (forbiddenPath !== undefined) {
+    throw new Error(`Plugin package contains non-production file ${forbiddenPath}`)
+  }
   const expected = [
     "package/LICENSE",
     "package/NOTICE",

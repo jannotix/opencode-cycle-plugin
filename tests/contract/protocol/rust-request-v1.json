@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "payload": {
+    "type": "request",
+    "data": {
+      "original_text": "Implement the accepted workflow.",
+      "attachment_hashes": [],
+      "amendments": []
+    }
+  }
+}

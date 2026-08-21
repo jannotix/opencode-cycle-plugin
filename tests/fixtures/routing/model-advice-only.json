@@ -1,0 +1,11 @@
+{
+  "name": "unconfirmed model risk advice",
+  "facts": [
+    {
+      "category": "authentication",
+      "source": "model_advisory"
+    }
+  ],
+  "preference": "auto",
+  "expected_mode": "quick"
+}

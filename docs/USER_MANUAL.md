@@ -641,12 +641,11 @@ Useful commands:
 
 ## 23. Updates, Backups, and Removal
 
-Before changing plugin versions, close OpenCode Desktop and copy the entire data directory. The product name is Cycle for OpenCode; Windows and macOS keep the existing data-directory folder name so current installs are not moved:
+Before changing plugin versions, close OpenCode Desktop and copy the entire data directory. Version 1.0.0 supports Windows x64 and Linux x64 only; it does not ship macOS packages. Supported installations keep the existing data-directory folder name so current installs are not moved:
 
 | Platform | Data directory |
 | --- | --- |
 | Windows | `%LOCALAPPDATA%\OpenCode Cycle` |
-| macOS | `~/Library/Application Support/OpenCode Cycle` |
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/opencode-cycle` |
 
 After an update:
