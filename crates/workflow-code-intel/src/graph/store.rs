@@ -21,10 +21,22 @@ pub struct PartitionBatch<'connection> {
 }
 
 const CACHE_SIZE_KIB: i64 = 64 * 1_024;
-// SQLite's application_id is a database-format boundary independent from the
-// schema version. OWF1 certifies that every graph row uses predecessor-readable
-// full v1 JSON; zero requires the atomic recovery pass below.
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 5;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 17;
+// Private, unregistered SQLite application_id allocation owned by OpenCode
+// Workflow code-graph storage. The official registry is
+// https://www.sqlite.org/src/file?name=magic.txt&ci=trunk; OWF1 was not listed
+// when checked on 2026-08-22. Preserve this value for dfae718 compatibility.
+// Zero means recovery is incomplete; OWF1 certifies predecessor-readable full
+// v1 JSON; every other nonzero value is a collision and must fail closed.
 const FULL_V1_APPLICATION_ID: i64 = 0x4f57_4631;
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_FAIL_AFTER_PARTITIONS: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +71,7 @@ pub enum GraphStoreError {
     Serialization(serde_json::Error),
     Sqlite(rusqlite::Error),
     UnsupportedApplicationId(i64),
+    UnsupportedSchemaVersion(u32),
 }
 
 impl std::fmt::Display for GraphStoreError {
@@ -77,6 +90,12 @@ impl std::fmt::Display for GraphStoreError {
                 write!(
                     formatter,
                     "unsupported graph storage application id: {value}"
+                )
+            }
+            Self::UnsupportedSchemaVersion(value) => {
+                write!(
+                    formatter,
+                    "unsupported graph storage schema version: {value}"
                 )
             }
         }
@@ -106,15 +125,18 @@ impl From<serde_json::Error> for GraphStoreError {
 impl GraphStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GraphStoreError> {
         let mut connection = Connection::open(path)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < MIN_SUPPORTED_SCHEMA_VERSION {
+            return Err(GraphStoreError::MissingSchema);
+        }
+        if version > MAX_SUPPORTED_SCHEMA_VERSION {
+            return Err(GraphStoreError::UnsupportedSchemaVersion(version));
+        }
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         connection.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version < 5 {
-            return Err(GraphStoreError::MissingSchema);
-        }
         restore_full_v1_compatibility(&mut connection)?;
         Ok(Self { connection })
     }
@@ -372,84 +394,166 @@ fn restore_full_v1_compatibility(connection: &mut Connection) -> Result<(), Grap
         return Err(GraphStoreError::UnsupportedApplicationId(application_id));
     }
 
+    let partition_ids = load_partition_ids(connection)?;
+    for (index, partition_id) in partition_ids.iter().enumerate() {
+        restore_partition_full_v1(connection, partition_id)?;
+        recovery_partition_commit_checkpoint(index + 1)?;
+    }
+    finalize_full_v1_compatibility(connection)?;
+    Ok(())
+}
+
+fn load_partition_ids(connection: &Connection) -> Result<Vec<String>, GraphStoreError> {
+    let mut statement = connection.prepare("SELECT id FROM code_partitions ORDER BY id")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(GraphStoreError::Sqlite)
+}
+
+fn validated_partition_id(
+    connection: &Connection,
+    stored_partition_id: &str,
+) -> Result<Option<PartitionId>, GraphStoreError> {
+    let metadata = connection
+        .query_row(
+            "SELECT project_id, scope FROM code_partitions WHERE id = ?1",
+            [stored_partition_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_project_id, scope)) = metadata else {
+        return Ok(None);
+    };
+    let project_id = stored_project_id
+        .parse::<ProjectId>()
+        .map_err(|_| GraphStoreError::Domain(GraphError::InvalidPartition))?;
+    let partition_id = PartitionId::new(project_id, &scope);
+    if partition_id.to_string() != stored_partition_id {
+        return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
+    }
+    Ok(Some(partition_id))
+}
+
+fn restore_partition_full_v1(
+    connection: &mut Connection,
+    stored_partition_id: &str,
+) -> Result<(), GraphStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let partitions = {
-        let mut statement =
-            transaction.prepare("SELECT id, project_id, scope FROM code_partitions ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
+    let Some(partition_id) = validated_partition_id(&transaction, stored_partition_id)? else {
+        transaction.commit()?;
+        return Ok(());
+    };
+
+    let nodes = {
+        let mut statement = transaction.prepare(
+            "SELECT generation, id, node_json FROM code_nodes
+             WHERE partition_id = ?1 ORDER BY generation, id",
+        )?;
+        let rows = statement.query_map([stored_partition_id], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-
-    for (stored_partition_id, stored_project_id, scope) in partitions {
-        let project_id = stored_project_id
-            .parse::<ProjectId>()
-            .map_err(|_| GraphStoreError::Domain(GraphError::InvalidPartition))?;
-        let partition_id = PartitionId::new(project_id, &scope);
-        if partition_id.to_string() != stored_partition_id {
-            return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
-        }
-
-        let nodes = {
-            let mut statement = transaction.prepare(
-                "SELECT generation, id, node_json FROM code_nodes
-                 WHERE partition_id = ?1 ORDER BY generation, id",
+    for (generation, row_id, json) in nodes {
+        let node = deserialize_node(partition_id, &row_id, &json)?;
+        let full_json = serde_json::to_string(&node)?;
+        if full_json != json {
+            transaction.execute(
+                "UPDATE code_nodes SET node_json = ?1
+                 WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
+                params![full_json, stored_partition_id, generation, row_id],
             )?;
-            let rows = statement.query_map([&stored_partition_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for (generation, row_id, json) in nodes {
-            let node = deserialize_node(partition_id, &row_id, &json)?;
-            let full_json = serde_json::to_string(&node)?;
-            if full_json != json {
-                transaction.execute(
-                    "UPDATE code_nodes SET node_json = ?1
-                     WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
-                    params![full_json, &stored_partition_id, generation, row_id],
-                )?;
-            }
-        }
-
-        let edges = {
-            let mut statement = transaction.prepare(
-                "SELECT generation, id, edge_json FROM code_edges
-                 WHERE partition_id = ?1 ORDER BY generation, id",
-            )?;
-            let rows = statement.query_map([&stored_partition_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for (generation, row_id, json) in edges {
-            let edge = deserialize_edge(partition_id, &row_id, &json)?;
-            let full_json = serde_json::to_string(&edge)?;
-            if full_json != json {
-                transaction.execute(
-                    "UPDATE code_edges SET edge_json = ?1
-                     WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
-                    params![full_json, &stored_partition_id, generation, row_id],
-                )?;
-            }
         }
     }
 
+    let edges = {
+        let mut statement = transaction.prepare(
+            "SELECT generation, id, edge_json FROM code_edges
+             WHERE partition_id = ?1 ORDER BY generation, id",
+        )?;
+        let rows = statement.query_map([stored_partition_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (generation, row_id, json) in edges {
+        let edge = deserialize_edge(partition_id, &row_id, &json)?;
+        let full_json = serde_json::to_string(&edge)?;
+        if full_json != json {
+            transaction.execute(
+                "UPDATE code_edges SET edge_json = ?1
+                 WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
+                params![full_json, stored_partition_id, generation, row_id],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn finalize_full_v1_compatibility(connection: &mut Connection) -> Result<(), GraphStoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for stored_partition_id in load_partition_ids(&transaction)? {
+        let Some(partition_id) = validated_partition_id(&transaction, &stored_partition_id)? else {
+            continue;
+        };
+        let mut statement = transaction.prepare(
+            "SELECT id, node_json FROM code_nodes
+             WHERE partition_id = ?1 ORDER BY generation, id",
+        )?;
+        let rows = statement.query_map([&stored_partition_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, json) = row?;
+            let node = serde_json::from_str::<GraphNode>(&json)?;
+            if node.partition_id != partition_id || node.id.to_string() != row_id {
+                return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
+            }
+        }
+        drop(statement);
+
+        let mut statement = transaction.prepare(
+            "SELECT id, edge_json FROM code_edges
+             WHERE partition_id = ?1 ORDER BY generation, id",
+        )?;
+        let rows = statement.query_map([&stored_partition_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, json) = row?;
+            let edge = serde_json::from_str::<GraphEdge>(&json)?;
+            if edge.partition_id != partition_id || edge.id.to_string() != row_id {
+                return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
+            }
+        }
+    }
     transaction.pragma_update(None, "application_id", FULL_V1_APPLICATION_ID)?;
     transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn recovery_partition_commit_checkpoint(completed: usize) -> Result<(), GraphStoreError> {
+    RECOVERY_FAIL_AFTER_PARTITIONS.with(|value| {
+        if value.get() == Some(completed) {
+            Err(GraphStoreError::Incomplete)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn recovery_partition_commit_checkpoint(_: usize) -> Result<(), GraphStoreError> {
     Ok(())
 }
 
@@ -821,6 +925,68 @@ mod tests {
         }
     }
 
+    fn stored_graph_rows(connection: &Connection) -> Vec<(String, String, i64, String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT 'node', partition_id, generation, id, node_json FROM code_nodes
+                 UNION ALL
+                 SELECT 'edge', partition_id, generation, id, edge_json FROM code_edges
+                 ORDER BY 1, 2, 3, 4",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    fn row_format_counts(
+        connection: &Connection,
+        partition: &GraphPartition,
+    ) -> (u32, u32, u32, u32) {
+        let full_nodes = connection
+            .query_row(
+                "SELECT count(*) FROM code_nodes
+                 WHERE partition_id = ?1 AND json_type(node_json, '$.id') = 'text'",
+                [partition.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compact_nodes = connection
+            .query_row(
+                "SELECT count(*) FROM code_nodes
+                 WHERE partition_id = ?1 AND json_type(node_json, '$.id') IS NULL",
+                [partition.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let full_edges = connection
+            .query_row(
+                "SELECT count(*) FROM code_edges
+                 WHERE partition_id = ?1 AND json_type(edge_json, '$.id') = 'text'",
+                [partition.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compact_edges = connection
+            .query_row(
+                "SELECT count(*) FROM code_edges
+                 WHERE partition_id = ?1 AND json_type(edge_json, '$.id') IS NULL",
+                [partition.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (full_nodes, compact_nodes, full_edges, compact_edges)
+    }
+
     fn predecessor_load_partition(
         connection: &Connection,
         partition_id: PartitionId,
@@ -922,6 +1088,89 @@ mod tests {
     }
 
     #[test]
+    fn schema_upper_bound_matches_the_primary_store() {
+        assert_eq!(
+            MAX_SUPPORTED_SCHEMA_VERSION,
+            workflow_store::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_marker_or_row_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let partition = sample_partition();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        store
+            .replace_partition(&partition, true, timestamp)
+            .unwrap();
+        write_compact_rows(&store.connection, &partition);
+        let before = stored_graph_rows(&store.connection);
+        store
+            .connection
+            .pragma_update(
+                None,
+                "user_version",
+                workflow_store::CURRENT_SCHEMA_VERSION + 1,
+            )
+            .unwrap();
+        drop(store);
+
+        assert!(matches!(
+            GraphStore::open(&path),
+            Err(GraphStoreError::UnsupportedSchemaVersion(version))
+                if version == workflow_store::CURRENT_SCHEMA_VERSION + 1
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let user_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, 0);
+        assert_eq!(user_version, workflow_store::CURRENT_SCHEMA_VERSION + 1);
+        assert_eq!(stored_graph_rows(&connection), before);
+    }
+
+    #[test]
+    fn future_schema_with_full_v1_marker_never_returns_a_writable_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let partition = sample_partition();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        store
+            .replace_partition(&partition, true, timestamp)
+            .unwrap();
+        let before = stored_graph_rows(&store.connection);
+        store
+            .connection
+            .pragma_update(
+                None,
+                "user_version",
+                workflow_store::CURRENT_SCHEMA_VERSION + 1,
+            )
+            .unwrap();
+        drop(store);
+
+        assert!(matches!(
+            GraphStore::open(&path),
+            Err(GraphStoreError::UnsupportedSchemaVersion(version))
+                if version == workflow_store::CURRENT_SCHEMA_VERSION + 1
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+        assert_eq!(stored_graph_rows(&connection), before);
+    }
+
+    #[test]
     fn compact_rows_are_atomically_restored_for_the_predecessor_reader() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workflow.db");
@@ -972,18 +1221,77 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_row_id_blocks_recovery_and_rolls_back_every_rewrite() {
+    fn recovery_resumes_after_a_bounded_partition_commit_failure() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workflow.db");
         drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
-        let partition = sample_partition();
+        let mut partitions = (0..24).map(|_| sample_partition()).collect::<Vec<_>>();
+        partitions.sort_by_key(|partition| partition.id.to_string());
         let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
         let mut store = GraphStore::open(&path).unwrap();
-        store
-            .replace_partition(&partition, true, timestamp)
+        for partition in &partitions {
+            store.replace_partition(partition, true, timestamp).unwrap();
+            write_compact_rows(&store.connection, partition);
+        }
+        drop(store);
+
+        RECOVERY_FAIL_AFTER_PARTITIONS.with(|value| value.set(Some(7)));
+        let result = GraphStore::open(&path);
+        RECOVERY_FAIL_AFTER_PARTITIONS.with(|value| value.set(None));
+        assert!(result.is_err());
+
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
-        write_compact_rows(&store.connection, &partition);
-        let corrupt = partition.nodes.values().next().unwrap();
+        assert_eq!(application_id, 0);
+        for (index, partition) in partitions.iter().enumerate() {
+            let counts = row_format_counts(&connection, partition);
+            assert_eq!(
+                counts,
+                if index < 7 {
+                    (3, 0, 2, 0)
+                } else {
+                    (0, 3, 0, 2)
+                }
+            );
+        }
+        drop(connection);
+
+        drop(GraphStore::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+        for partition in &partitions {
+            assert_eq!(row_format_counts(&connection, partition), (3, 0, 2, 0));
+            assert_eq!(
+                predecessor_load_partition(&connection, partition.id),
+                *partition
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_last_sorting_row_rolls_back_only_its_active_partition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let mut partitions = vec![sample_partition(), sample_partition(), sample_partition()];
+        partitions.sort_by_key(|partition| partition.id.to_string());
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        for partition in &partitions {
+            store.replace_partition(partition, true, timestamp).unwrap();
+            write_compact_rows(&store.connection, partition);
+        }
+        let corrupt_partition = partitions.last().unwrap();
+        let corrupt = corrupt_partition
+            .nodes
+            .values()
+            .max_by_key(|node| node.id)
+            .unwrap();
         store
             .connection
             .execute(
@@ -998,15 +1306,35 @@ mod tests {
         let application_id: i64 = connection
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
-        let compact_rows: u32 = connection
+        assert_eq!(application_id, 0);
+        for partition in &partitions[..partitions.len() - 1] {
+            let full_nodes: u32 = connection
+                .query_row(
+                    "SELECT count(*) FROM code_nodes
+                     WHERE partition_id = ?1 AND json_type(node_json, '$.id') = 'text'",
+                    [partition.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let full_edges: u32 = connection
+                .query_row(
+                    "SELECT count(*) FROM code_edges
+                     WHERE partition_id = ?1 AND json_type(edge_json, '$.id') = 'text'",
+                    [partition.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((full_nodes, full_edges), (3, 2));
+        }
+        let compact_nodes: u32 = connection
             .query_row(
-                "SELECT count(*) FROM code_nodes WHERE json_type(node_json, '$.id') IS NULL",
-                [],
+                "SELECT count(*) FROM code_nodes
+                 WHERE partition_id = ?1 AND json_type(node_json, '$.id') IS NULL",
+                [corrupt_partition.id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(application_id, 0);
-        assert_eq!(compact_rows, 3);
+        assert_eq!(compact_nodes, 3);
     }
 
     #[test]
