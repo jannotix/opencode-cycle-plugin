@@ -617,6 +617,37 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
       ],
     }
     await controlPlane.submitArchitecture(projectKey, workflowId, architecture)
+    const unpreparedReport = closureReport(
+      architecture,
+      rootTaskId,
+      workflow.requestDigest,
+      "b".repeat(40),
+      "a".repeat(40),
+    )
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, unpreparedReport),
+    ).rejects.toThrow("requires a prepared worktree base revision")
+    const worktree = await controlPlane.prepareWorktree(projectKey, repository, workflowId)
+    await controlPlane.audit({
+      actor_id: "opencode-plugin",
+      candidate_id: null,
+      data: { externally_attributed: false, revision: worktree.baseRevision, type: "git" },
+      evidence_ids: [],
+      files: [],
+      metadata: { action: "execution_worktree_prepared" },
+      model: null,
+      project_key: projectKey,
+      role: null,
+      session_id: null,
+      task_id: null,
+      timestamp_unix_millis: Date.now(),
+      workflow_id: workflowId,
+    })
+    await mkdir(join(worktree.path, "src"), { recursive: true })
+    await writeFile(join(worktree.path, "src", "feature.ts"), "root task\n")
+    await execGit(worktree.path, ["add", "src/feature.ts"])
+    await execGit(worktree.path, ["commit", "-m", "root task"])
+    const rootRevision = await gitHead(worktree.path)
     expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
       tasks: [
         { state: "pending", taskId: dependentTaskId },
@@ -625,10 +656,22 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
       workflowId,
     })
 
-    const rootReport = closureReport(architecture, rootTaskId, workflow.requestDigest)
-    const dependentReport = closureReport(architecture, dependentTaskId, workflow.requestDigest)
+    const rootReport = closureReport(
+      architecture,
+      rootTaskId,
+      workflow.requestDigest,
+      worktree.baseRevision,
+      rootRevision,
+    )
+    const prematureDependentReport = closureReport(
+      architecture,
+      dependentTaskId,
+      workflow.requestDigest,
+      rootRevision,
+      rootRevision,
+    )
     await expect(
-      controlPlane.reportTaskClosure(projectKey, workflowId, dependentReport),
+      controlPlane.reportTaskClosure(projectKey, workflowId, prematureDependentReport),
     ).rejects.toThrow("task is not ready for closure")
     await expect(
       controlPlane.reportTaskClosure("wrong-project", workflowId, rootReport),
@@ -638,7 +681,13 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
     ).rejects.toThrow("workflow request does not exist")
 
     const unknownTaskId = crypto.randomUUID()
-    const unknown = closureReport(architecture, unknownTaskId, workflow.requestDigest)
+    const unknown = closureReport(
+      architecture,
+      unknownTaskId,
+      workflow.requestDigest,
+      worktree.baseRevision,
+      rootRevision,
+    )
     await expect(
       controlPlane.reportTaskClosure(projectKey, workflowId, unknown),
     ).rejects.toThrow(/authoritative .*architecture/u)
@@ -773,6 +822,29 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
         },
       }),
     ).rejects.toThrow("identity or revision binding is invalid")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        base_revision: "0".repeat(40),
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("base revision does not belong")
+    const unknownSubmittedRevision = "0".repeat(40)
+    const unknownSubmittedVerdict = {
+      ...rootReport.reviewer.verdict,
+      revision: unknownSubmittedRevision,
+    }
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        receipt_id: crypto.randomUUID(),
+        reviewer: {
+          verdict: unknownSubmittedVerdict,
+          verdict_digest: digest(unknownSubmittedVerdict),
+        },
+        submitted_revision: unknownSubmittedRevision,
+      }),
+    ).rejects.toThrow("submitted revision does not belong")
 
     expect(await controlPlane.reportTaskClosure(projectKey, workflowId, rootReport)).toMatchObject({
       duplicate: false,
@@ -802,11 +874,21 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
       ].sort((left, right) => left.taskId.localeCompare(right.taskId)),
       workflowId,
     })
+    await writeFile(join(worktree.path, "src", "feature.ts"), "dependent task\n")
+    await execGit(worktree.path, ["add", "src/feature.ts"])
+    await execGit(worktree.path, ["commit", "-m", "dependent task"])
+    const dependentRevision = await gitHead(worktree.path)
+    const dependentReport = closureReport(
+      architecture,
+      dependentTaskId,
+      workflow.requestDigest,
+      rootRevision,
+      dependentRevision,
+    )
     expect(
       await controlPlane.reportTaskClosure(projectKey, workflowId, dependentReport),
     ).toMatchObject({ taskId: dependentTaskId, taskState: "completed" })
 
-    const worktree = await controlPlane.prepareWorktree(projectKey, repository, workflowId)
     const verificationPlan = await controlPlane.planVerification(projectKey, workflowId)
     const candidate = await controlPlane.freezeCandidate(
       projectKey,
@@ -867,16 +949,30 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
       },
     )
     expect(repair.workflowState).toBe("execution")
-    const repairedRoot = closureRevision(rootReport, "d".repeat(40), "e".repeat(64))
+    await writeFile(join(worktree.path, "src", "feature.ts"), "repaired root task\n")
+    await execGit(worktree.path, ["add", "src/feature.ts"])
+    await execGit(worktree.path, ["commit", "-m", "repair root task"])
+    const repairedRevision = await gitHead(worktree.path)
+    const repairedRoot = closureReport(
+      architecture,
+      rootTaskId,
+      workflow.requestDigest,
+      dependentRevision,
+      repairedRevision,
+      "e".repeat(64),
+    )
     expect(
       await controlPlane.reportTaskClosure(projectKey, workflowId, repairedRoot),
     ).toMatchObject({ duplicate: false, taskId: rootTaskId, taskState: "completed" })
     await expect(
-      controlPlane.reportTaskClosure(
-        projectKey,
-        workflowId,
-        closureRevision(rootReport, "f".repeat(40), "1".repeat(64)),
-      ),
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...repairedRoot,
+        commands: repairedRoot.commands.map((command) => ({
+          ...command,
+          output_digest: "1".repeat(64),
+        })),
+        receipt_id: crypto.randomUUID(),
+      }),
     ).rejects.toThrow("idempotency")
 
     expect(await controlPlane.reportExecution(projectKey, workflowId, "plan_defect")).toBe(
@@ -943,10 +1039,12 @@ function closureReport(
   },
   taskId: string,
   requestDigest: string,
+  baseRevision: string,
+  submittedRevision: string,
+  outputDigest = "c".repeat(64),
 ) {
   const planned = architecture.tasks.find((value) => value.id === taskId) ?? task(taskId, [])
   const evidenceId = crypto.randomUUID()
-  const revision = "a".repeat(40)
   const verdict = {
     criteria: [
       ...planned.acceptance_criteria.map((_criterion, index) => ({
@@ -970,41 +1068,25 @@ function closureReport(
       requirement_id: "REQ-1",
       status: "satisfied" as const,
     }],
-    revision,
+    revision: submittedRevision,
     task_id: taskId,
   }
   return {
     architecture_digest: digest(architecture),
-    base_revision: "b".repeat(40),
+    base_revision: baseRevision,
     changed_paths: ["src/feature.ts"],
     commands: [{
       evidence_id: evidenceId,
       exit_code: 0,
       invocation: "rustc --version",
-      output_digest: "c".repeat(64),
+      output_digest: outputDigest,
       status: "passed" as const,
     }],
     receipt_id: crypto.randomUUID(),
     request_digest: requestDigest,
     reviewer: { verdict, verdict_digest: digest(verdict) },
-    submitted_revision: revision,
+    submitted_revision: submittedRevision,
     task_id: taskId,
-  }
-}
-
-function closureRevision(
-  report: ReturnType<typeof closureReport>,
-  revision: string,
-  outputDigest: string,
-) {
-  const verdict = { ...report.reviewer.verdict, revision }
-  return {
-    ...report,
-    base_revision: report.submitted_revision,
-    commands: report.commands.map((command) => ({ ...command, output_digest: outputDigest })),
-    receipt_id: crypto.randomUUID(),
-    reviewer: { verdict, verdict_digest: digest(verdict) },
-    submitted_revision: revision,
   }
 }
 
@@ -1054,6 +1136,15 @@ function execGit(directory: string, argumentsList: readonly string[]): Promise<v
   return new Promise((resolve, reject) => {
     execFile("git", ["-C", directory, ...argumentsList], (error) => {
       if (error === null) resolve()
+      else reject(error)
+    })
+  })
+}
+
+function gitHead(directory: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", ["-C", directory, "rev-parse", "HEAD"], { encoding: "utf8" }, (error, stdout) => {
+      if (error === null) resolve(stdout.trim())
       else reject(error)
     })
   })

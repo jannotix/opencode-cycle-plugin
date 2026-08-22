@@ -768,7 +768,7 @@ where
                 let task_id = report.task_id;
                 let result = {
                     let mut locked = store.lock().await;
-                    report_task_closure(&mut locked, &report)
+                    report_task_closure(&mut locked, worktrees.as_ref(), &report)
                 };
                 match result {
                     Ok(applied) => {
@@ -1018,6 +1018,7 @@ fn report_execution(
 
 fn report_task_closure(
     store: &mut Store,
+    worktrees: &Path,
     report: &workflow_ipc::protocol::TaskClosureReport,
 ) -> Result<workflow_store::TaskApplyResult, String> {
     use std::collections::BTreeSet;
@@ -1029,11 +1030,8 @@ fn report_task_closure(
     {
         return Err("task closure project key is invalid".to_owned());
     }
-    validate_project(
-        store,
-        workflow_core::ProjectId::from_stable_key(&report.project_key),
-        report.workflow_id,
-    )?;
+    let project_id = workflow_core::ProjectId::from_stable_key(&report.project_key);
+    validate_project(store, project_id, report.workflow_id)?;
     let (_, request) = store
         .load_request(report.workflow_id)
         .map_err(|error| error.to_string())?
@@ -1159,6 +1157,17 @@ fn report_task_closure(
     }) {
         return Err("task dependencies are not completed".to_owned());
     }
+    let worktree_base = store
+        .load_worktree_base_revision(report.workflow_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "task closure requires a prepared worktree base revision".to_owned())?;
+    validate_task_revision_binding(
+        worktrees,
+        project_id,
+        report.workflow_id,
+        &worktree_base,
+        report,
+    )?;
     let ready_dependents = architecture
         .tasks
         .iter()
@@ -1186,6 +1195,165 @@ fn report_task_closure(
             timestamp: workflow_core::WorkflowTimestamp::now(),
         })
         .map_err(|error| error.to_string())
+}
+
+fn validate_task_revision_binding(
+    worktrees: &Path,
+    project_id: workflow_core::ProjectId,
+    workflow_id: workflow_core::WorkflowId,
+    prepared_base: &str,
+    report: &workflow_ipc::protocol::TaskClosureReport,
+) -> Result<(), String> {
+    let managed_root = worktrees
+        .canonicalize()
+        .map_err(|_| "task closure requires a prepared managed worktree".to_owned())?;
+    let expected = managed_root
+        .join(project_id.to_string())
+        .join(workflow_id.to_string());
+    let worktree = expected
+        .canonicalize()
+        .map_err(|_| "task closure requires a prepared managed worktree".to_owned())?;
+    let relative = worktree
+        .strip_prefix(&managed_root)
+        .map_err(|_| "task closure managed worktree is outside its trusted root".to_owned())?;
+    if relative.components().count() != 2 || !worktree.join(".git").is_file() {
+        return Err("task closure managed worktree identity is invalid".to_owned());
+    }
+
+    let resolved_prepared = resolve_worktree_revision(&worktree, prepared_base).map_err(|_| {
+        "prepared worktree base revision is not present in the managed worktree".to_owned()
+    })?;
+    if resolved_prepared != prepared_base {
+        return Err("prepared worktree base revision is not canonical".to_owned());
+    }
+    let resolved_base =
+        resolve_worktree_revision(&worktree, &report.base_revision).map_err(|_| {
+            "task closure base revision does not belong to the prepared worktree".to_owned()
+        })?;
+    if resolved_base != report.base_revision
+        || !worktree_revision_is_ancestor(&worktree, prepared_base, &report.base_revision)?
+    {
+        return Err(
+            "task closure base revision does not belong to the prepared worktree".to_owned(),
+        );
+    }
+    let resolved_submitted = resolve_worktree_revision(&worktree, &report.submitted_revision)
+        .map_err(|_| {
+            "task closure submitted revision does not belong to the prepared worktree".to_owned()
+        })?;
+    let head = resolve_worktree_revision(&worktree, "HEAD")
+        .map_err(|_| "task closure prepared worktree HEAD is invalid".to_owned())?;
+    if resolved_submitted != report.submitted_revision
+        || !worktree_revision_is_ancestor(
+            &worktree,
+            &report.base_revision,
+            &report.submitted_revision,
+        )?
+        || !worktree_revision_is_ancestor(&worktree, &report.submitted_revision, &head)?
+    {
+        return Err(
+            "task closure submitted revision does not belong to the prepared worktree".to_owned(),
+        );
+    }
+    if report.base_revision != report.submitted_revision {
+        let parents = worktree_git_output(
+            &worktree,
+            &[
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                &report.submitted_revision,
+            ],
+        )?;
+        let parents = std::str::from_utf8(&parents)
+            .map_err(|_| "task closure submitted revision parents are invalid".to_owned())?
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        if parents.as_slice()
+            != [
+                report.submitted_revision.as_str(),
+                report.base_revision.as_str(),
+            ]
+        {
+            return Err(
+                "task closure base revision is not the submitted revision's task parent".to_owned(),
+            );
+        }
+    }
+
+    let changed = worktree_git_output(
+        &worktree,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &report.base_revision,
+            &report.submitted_revision,
+            "--",
+        ],
+    )?;
+    let changed = std::str::from_utf8(&changed)
+        .map_err(|_| "prepared worktree changed paths are not valid UTF-8".to_owned())?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let reported = report
+        .changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if changed != reported {
+        return Err(
+            "task closure changed paths do not match the prepared worktree revision".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_worktree_revision(worktree: &Path, revision: &str) -> Result<String, String> {
+    let revision = if revision == "HEAD" {
+        revision.to_owned()
+    } else {
+        format!("{revision}^{{commit}}")
+    };
+    let output = worktree_git_output(worktree, &["rev-parse", "--verify", &revision])?;
+    std::str::from_utf8(&output)
+        .map(str::trim)
+        .map(str::to_owned)
+        .map_err(|_| "prepared worktree revision is not valid UTF-8".to_owned())
+}
+
+fn worktree_revision_is_ancestor(
+    worktree: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(|_| "prepared worktree Git binding could not be inspected".to_owned())?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err("prepared worktree Git ancestry could not be inspected".to_owned()),
+    }
+}
+
+fn worktree_git_output(worktree: &Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(arguments)
+        .output()
+        .map_err(|_| "prepared worktree Git binding could not be inspected".to_owned())?;
+    if !output.status.success() {
+        return Err("prepared worktree Git binding is invalid".to_owned());
+    }
+    Ok(output.stdout)
 }
 
 fn validate_task_review_coverage(
