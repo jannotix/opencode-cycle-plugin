@@ -55,6 +55,31 @@ function expectReaderListenersDetached(socket: Socket): void {
   expect(socket.listenerCount("close")).toBe(0)
 }
 
+async function expectSeparateCallbackPhaseFailure(
+  emitViolation: (socket: Socket) => void,
+  expectedMessage: string,
+  expectedError?: Error,
+): Promise<void> {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  installSynchronousWrite(socket, () => {
+    socket.emit("data", frame({ data: { request_id: 1 }, type: "health" }))
+    emitViolation(socket)
+  })
+
+  try {
+    const failure = await phase(reader, { type: "health" }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toBe(expectedMessage)
+    if (expectedError !== undefined) expect(failure).toBe(expectedError)
+    expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+    expectReaderListenersDetached(socket)
+  } finally {
+    reader.dispose()
+    socket.destroy()
+  }
+}
+
 test("a challenge arriving synchronously before connect is queued for authentication", async () => {
   const socket = new Socket()
   const challenge = { data: { nonce: "challenge" }, type: "challenge" }
@@ -238,6 +263,98 @@ test("a fragmented single phase response commits only after its final chunk", as
 
   try {
     await expect(phase(reader, { type: "health" })).resolves.toEqual(response)
+  } finally {
+    reader.dispose()
+    socket.destroy()
+  }
+})
+
+test("a malformed header in synchronous callback two rejects the resolved phase", async () => {
+  const malformed = Buffer.alloc(4)
+  malformed.writeUInt32BE(0)
+  await expectSeparateCallbackPhaseFailure(
+    (socket) => socket.emit("data", malformed),
+    "workflowd sent an invalid IPC frame size",
+  )
+})
+
+test("a completed-frame overflow in synchronous callback two rejects the resolved phase", async () => {
+  await expectSeparateCallbackPhaseFailure(
+    (socket) =>
+      socket.emit(
+        "data",
+        Buffer.concat([frame({ id: 1 }), frame({ id: 2 }), frame({ id: 3 }), frame({ id: 4 })]),
+      ),
+    "workflowd exceeded the queued IPC frame limit",
+  )
+})
+
+test("an extra valid frame in synchronous callback two rejects the resolved phase", async () => {
+  await expectSeparateCallbackPhaseFailure(
+    (socket) => socket.emit("data", frame({ data: { request_id: 2 }, type: "health" })),
+    "workflowd sent IPC data after the protocol phase response",
+  )
+})
+
+test("a partial frame in synchronous callback two rejects the resolved phase", async () => {
+  const trailing = frame({ data: { request_id: 2 }, type: "health" })
+  await expectSeparateCallbackPhaseFailure(
+    (socket) => socket.emit("data", trailing.subarray(0, 3)),
+    "workflowd sent IPC data after the protocol phase response",
+  )
+})
+
+test("socket close in synchronous callback two rejects the resolved phase", async () => {
+  await expectSeparateCallbackPhaseFailure(
+    (socket) => socket.emit("close"),
+    "workflowd disconnected before responding",
+  )
+})
+
+test("socket error in synchronous callback two rejects the resolved phase", async () => {
+  const socketError = new Error("socket failed after response")
+  await expectSeparateCallbackPhaseFailure(
+    (socket) => socket.emit("error", socketError),
+    socketError.message,
+    socketError,
+  )
+})
+
+test("passive and nested phase reads are blocked until auth finalizes, then request succeeds", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  let passiveAttempt: Promise<unknown> | undefined
+  let nestedAttempt: Promise<unknown> | undefined
+  let writes = 0
+  installSynchronousWrite(socket, () => {
+    writes += 1
+    if (writes === 1) {
+      socket.emit("data", frame({ data: { protocol_version: 1 }, type: "authenticated" }))
+      passiveAttempt = reader.read(25).catch((error: unknown) => error)
+      nestedAttempt = phase(reader, { type: "health" }).catch((error: unknown) => error)
+    } else {
+      socket.emit("data", frame({ data: { request_id: 1 }, type: "health" }))
+    }
+  })
+
+  try {
+    await expect(phase(reader, { type: "authenticate" })).resolves.toEqual({
+      data: { protocol_version: 1 },
+      type: "authenticated",
+    })
+    expect((await passiveAttempt) as Error).toHaveProperty(
+      "message",
+      "workflowd protocol phase is awaiting finalization",
+    )
+    expect((await nestedAttempt) as Error).toHaveProperty(
+      "message",
+      "workflowd protocol phase is awaiting finalization",
+    )
+    await expect(phase(reader, { type: "health" })).resolves.toEqual({
+      data: { request_id: 1 },
+      type: "health",
+    })
+    expect(writes).toBe(2)
   } finally {
     reader.dispose()
     socket.destroy()

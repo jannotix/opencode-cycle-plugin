@@ -45,6 +45,16 @@ interface StagedDecode {
   readonly residue: Buffer
 }
 
+interface PhaseState {
+  response: unknown
+  responseCount: number
+}
+
+interface ArmedPhase {
+  readonly response: Promise<unknown>
+  readonly state: PhaseState
+}
+
 type ReadOutcome =
   | { readonly ok: true; readonly value: unknown }
   | { readonly error: Error; readonly ok: false }
@@ -56,6 +66,7 @@ export class IpcFrameReader {
   readonly #socket: Socket
   readonly #messages: QueuedFrame[] = []
   #pendingRead: PendingRead | undefined
+  #phaseState: PhaseState | undefined
   #queuedBytes = 0
   #terminalError: Error | undefined
 
@@ -66,11 +77,24 @@ export class IpcFrameReader {
   readonly #onData = (chunk: Buffer): void => {
     try {
       const pending = this.#pendingRead
+      const finalizingPhase =
+        this.#phaseState !== undefined && this.#phaseState.responseCount !== 0
       const staged = this.#decoder.stage(chunk, {
         maxQueuedBytes: this.#limits.maxQueuedBytes - this.#queuedBytes,
         maxQueuedFrames: this.#limits.maxQueuedFrames - this.#messages.length,
-        pendingKind: pending?.kind ?? "none",
+        pendingKind: finalizingPhase ? "none" : (pending?.kind ?? "none"),
       })
+      if (finalizingPhase && (staged.frames.length !== 0 || staged.residue.length !== 0)) {
+        throw this.#errorFactory("workflowd sent IPC data after the protocol phase response")
+      }
+      const phase = pending?.kind === "phase" ? this.#phaseState : undefined
+      if (
+        pending?.kind === "phase" &&
+        staged.frames.length !== 0 &&
+        (phase === undefined || phase.responseCount !== 0)
+      ) {
+        throw this.#errorFactory("workflowd protocol phase state is invalid")
+      }
       this.#decoder.commit(staged)
       if (staged.frames.length === 0) return
 
@@ -84,8 +108,16 @@ export class IpcFrameReader {
       if (pending !== undefined) {
         const response = staged.frames[0]
         if (response === undefined) return
-        this.#pendingRead = undefined
-        clearTimeout(pending.timeout)
+        if (pending.kind === "phase") {
+          if (phase === undefined) {
+            throw this.#errorFactory("workflowd protocol phase state is invalid")
+          }
+          phase.response = response.message
+          phase.responseCount = 1
+        } else {
+          this.#pendingRead = undefined
+          clearTimeout(pending.timeout)
+        }
         pending.resolve(response.message)
       }
     } catch (error) {
@@ -127,6 +159,9 @@ export class IpcFrameReader {
 
   read(timeoutMillis = 10_000): Promise<unknown> {
     if (this.#terminalError !== undefined) return Promise.reject(this.#terminalError)
+    if (this.#phaseState !== undefined) {
+      return Promise.reject(this.#errorFactory("workflowd protocol phase is awaiting finalization"))
+    }
     const frame = this.#messages.shift()
     if (frame !== undefined) {
       this.#queuedBytes -= frame.encodedBytes
@@ -139,8 +174,8 @@ export class IpcFrameReader {
   }
 
   async writeAndRead(frame: Buffer, timeoutMillis = 10_000): Promise<unknown> {
-    const response = this.#armPhaseRead(timeoutMillis)
-    const outcome = response.then<ReadOutcome, ReadOutcome>(
+    const armed = this.#armPhaseRead(timeoutMillis)
+    const outcome = armed.response.then<ReadOutcome, ReadOutcome>(
       (value) => ({ ok: true, value }),
       (error: unknown) => ({ error: asError(error), ok: false }),
     )
@@ -154,15 +189,18 @@ export class IpcFrameReader {
     }
     const result = await outcome
     if (!result.ok) throw result.error
-    return result.value
+    return this.#finalizePhase(armed.state, result.value)
   }
 
   dispose(): void {
     this.#terminate(this.#errorFactory("workflowd disconnected before responding"))
   }
 
-  #armPhaseRead(timeoutMillis: number): Promise<unknown> {
+  #armPhaseRead(timeoutMillis: number): ArmedPhase {
     if (this.#terminalError !== undefined) throw this.#terminalError
+    if (this.#phaseState !== undefined) {
+      throw this.#errorFactory("workflowd protocol phase is awaiting finalization")
+    }
     if (this.#pendingRead !== undefined) {
       throw this.#errorFactory("concurrent workflowd reads are not supported")
     }
@@ -173,7 +211,36 @@ export class IpcFrameReader {
       this.#terminate(error)
       throw error
     }
-    return this.#waitForFrame(timeoutMillis, "phase")
+    const state: PhaseState = { response: undefined, responseCount: 0 }
+    this.#phaseState = state
+    try {
+      return { response: this.#waitForFrame(timeoutMillis, "phase"), state }
+    } catch (error) {
+      this.#phaseState = undefined
+      throw error
+    }
+  }
+
+  #finalizePhase(state: PhaseState, response: unknown): unknown {
+    if (this.#terminalError !== undefined) throw this.#terminalError
+    const pending = this.#pendingRead
+    if (
+      this.#phaseState !== state ||
+      state.responseCount !== 1 ||
+      state.response !== response ||
+      pending?.kind !== "phase" ||
+      this.#messages.length !== 0 ||
+      this.#queuedBytes !== 0 ||
+      this.#decoder.bufferedBytes !== 0
+    ) {
+      const error = this.#errorFactory("workflowd protocol phase did not finalize cleanly")
+      this.#terminate(error)
+      throw error
+    }
+    this.#pendingRead = undefined
+    this.#phaseState = undefined
+    clearTimeout(pending.timeout)
+    return response
   }
 
   #waitForFrame(timeoutMillis: number, kind: PendingRead["kind"]): Promise<unknown> {
@@ -194,6 +261,7 @@ export class IpcFrameReader {
     this.#decoder.clear()
     this.#messages.length = 0
     this.#queuedBytes = 0
+    this.#phaseState = undefined
     const pending = this.#pendingRead
     if (pending !== undefined) {
       this.#pendingRead = undefined
