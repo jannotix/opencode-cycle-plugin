@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 
 import { NATIVE_PACKAGE_NAMES } from "../product-identity.js"
+import { inspectTarGz } from "./tar-archive.js"
 
 export const NATIVE_TARGETS = {
   "linux-x64": { cpu: "x64", executable: "workflowd", os: "linux" },
@@ -46,10 +47,7 @@ export async function packageNative(
     const archives = (await readdir(resolvedOutput)).filter((name) => name.endsWith(".tgz"))
     if (archives.length !== 1) throw new Error("Native packaging must produce exactly one archive")
     const archive = join(resolvedOutput, archives[0] as string)
-    const listing = (await run(["tar", "-tf", archive], resolvedRoot))
-      .split(/\r?\n/u)
-      .filter(Boolean)
-      .sort()
+    const listing = inspectTarGz(await readFile(archive)).map((entry) => entry.name).sort()
     const expected = [
       "package/LICENSE",
       "package/NOTICE",

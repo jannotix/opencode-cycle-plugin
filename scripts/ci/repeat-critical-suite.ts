@@ -1,7 +1,6 @@
-import { writeFile } from "node:fs/promises"
-import { dirname, resolve } from "node:path"
-import { mkdir } from "node:fs/promises"
+import { resolve } from "node:path"
 
+import { prepareReceiptOutput, publishReceiptAtomically } from "./receipt-output.js"
 import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
 
 interface IterationResult {
@@ -78,6 +77,7 @@ export function buildCriticalResult(
 async function main(): Promise<void> {
   const options = parseArguments(Bun.argv.slice(2))
   const root = resolve(import.meta.dir, "../..")
+  const output = await prepareReceiptOutput(root, options.output, { basename: "critical-suite.json" })
   const source = await captureCleanSource(root)
   const results: IterationResult[] = []
   let failure: unknown
@@ -95,11 +95,12 @@ async function main(): Promise<void> {
       break
     }
   }
-  await assertSourceUnchanged(root, source)
   const result = buildCriticalResult(options.iterations, results, source.revision)
-  const output = resolve(options.output)
-  await mkdir(dirname(output), { recursive: true })
-  await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8")
+  await publishReceiptAtomically(
+    output,
+    Buffer.from(`${JSON.stringify(result, null, 2)}\n`),
+    () => assertSourceUnchanged(root, source),
+  )
   if (!result.passed) {
     throw new Error(
       `Critical suite stopped after ${results.length} complete iterations`,

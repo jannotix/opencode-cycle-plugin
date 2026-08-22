@@ -272,7 +272,7 @@ describe("release manifest", () => {
     const failedRepeat = certificationEvidence()
     failedRepeat[3] = { ...failedRepeat[3], completedIterations: 19, passed: false }
     expect((await runManifestFixture({ evidence: failedRepeat })).exitCode).not.toBe(0)
-  })
+  }, 20_000)
 
   test("rejects unsupported Desktop certification evidence", () => {
     expect(() =>

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -50,7 +50,7 @@ test("ignored designated receipt outputs remain clean while other untracked file
     await run(["git", "init"], root)
     await run(["git", "config", "user.email", "source-state@example.invalid"], root)
     await run(["git", "config", "user.name", "Source State Test"], root)
-    await writeFile(join(root, ".gitignore"), "target/\ncandidate/\n")
+    await writeFile(join(root, ".gitignore"), "target/\ncandidate/\n.env\n")
     await writeFile(join(root, "tracked.txt"), "tracked")
     await run(["git", "add", ".gitignore", "tracked.txt"], root)
     await run(["git", "commit", "-m", "base"], root)
@@ -64,6 +64,9 @@ test("ignored designated receipt outputs remain clean while other untracked file
     await expect(captureCleanSource(root, head)).resolves.toEqual({ revision: head })
     await writeFile(join(root, "untracked.txt"), "not ignored")
     await expect(captureCleanSource(root, head)).rejects.toThrow("untracked.txt")
+    await unlink(join(root, "untracked.txt"))
+    await writeFile(join(root, ".env"), "SECRET=ignored-but-source-like")
+    await expect(captureCleanSource(root, head)).rejects.toThrow(".env")
   } finally {
     await rm(root, { force: true, recursive: true })
   }

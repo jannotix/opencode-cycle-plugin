@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
   buildDesktopActivationMarker,
   certificationBindingFromOptions,
+  createDesktopActivationWriterForTests,
   parseDesktopActivationMarker,
   writeDesktopActivationMarker,
 } from "../src/certification.js"
@@ -108,5 +109,66 @@ test("activation marker rejects missing or non-candidate Desktop health", () => 
     expect(() => buildDesktopActivationMarker(binding, invalid as never, 1_700_000_000_100)).toThrow(
       "health",
     )
+  }
+})
+
+test("activation final is absent while the private temp is paused and publishes atomically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-atomic-"))
+  const binding = {
+    nativePackageSha256,
+    nonce,
+    pluginPackageSha256,
+    revision,
+    root,
+    startedAtUnixMillis: Date.now(),
+  }
+  let release: (() => void) | undefined
+  const paused = new Promise<void>((resolve) => { release = resolve })
+  let reached = false
+  const writer = createDesktopActivationWriterForTests({
+    async afterTempSynced(path) {
+      reached = true
+      expect(await readFile(path, "utf8")).toContain("opencode-cycle-desktop-activation")
+      expect(await access(join(root, "desktop-activation.json")).then(() => true, () => false)).toBeFalse()
+      await paused
+    },
+  })
+  try {
+    const first = writer(binding, health, Date.now)
+    while (!reached) await Bun.sleep(1)
+    const second = writer(binding, health, Date.now)
+    await Bun.sleep(20)
+    expect(await access(join(root, "desktop-activation.json")).then(() => true, () => false)).toBeFalse()
+    release?.()
+    const [left, right] = await Promise.all([first, second])
+    expect(right).toEqual(left)
+    expect(parseDesktopActivationMarker(JSON.parse(await readFile(join(root, "desktop-activation.json"), "utf8")))).toEqual(left)
+  } finally {
+    release?.()
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
+test("activation temp and lock are cleaned on failure and partial finals are rejected", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-atomic-failure-"))
+  const binding = {
+    nativePackageSha256,
+    nonce,
+    pluginPackageSha256,
+    revision,
+    root,
+    startedAtUnixMillis: Date.now(),
+  }
+  try {
+    const failing = createDesktopActivationWriterForTests({
+      async afterTempSynced() { throw new Error("injected publication failure") },
+    })
+    await expect(failing(binding, health, Date.now)).rejects.toThrow("injected")
+    expect((await Array.fromAsync(new Bun.Glob("desktop-activation*").scan({ cwd: root })))).toEqual([])
+
+    await writeFile(join(root, "desktop-activation.json"), "{\"partial\":true")
+    await expect(writeDesktopActivationMarker(binding, health)).rejects.toThrow()
+  } finally {
+    await rm(root, { force: true, recursive: true })
   }
 })

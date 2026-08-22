@@ -45,7 +45,7 @@ test("Release Candidate and publish workflows share one parsed artifact layout",
   ])
 
   const desktopUpload = stepUsing(candidate.jobs.desktop, "actions/upload-artifact")
-  expect(desktopUpload.with?.path).toBe("candidate/certifications/${{ matrix.platform }}.json")
+  expect(desktopUpload.with?.path).toBe("target/certification/desktop/${{ matrix.platform }}.json")
   expect(stepUsing(candidate.jobs.scale, "actions/upload-artifact").with?.path).toBe(
     "target/certification/codebase-500k.json",
   )

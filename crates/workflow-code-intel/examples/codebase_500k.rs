@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
@@ -113,9 +114,9 @@ struct TimingResults {
 
 fn main() {
     let options = options();
+    let output = prepare_receipt_output(&options.output);
     let source = source_snapshot();
     let total_started = Instant::now();
-    let output = options.output.clone();
     let temporary = tempfile::tempdir().expect("benchmark temporary directory must be available");
     let corpus = temporary.path().join("corpus");
     fs::create_dir(&corpus).expect("benchmark corpus root must be created");
@@ -302,18 +303,12 @@ fn main() {
             total: total_time.as_millis(),
         },
     };
-    assert_source_unchanged(&source);
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).expect("benchmark result directory must be created");
-    }
-    fs::write(
-        &output,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&results).expect("benchmark results must serialize")
-        ),
-    )
-    .expect("benchmark results must be written");
+    let serialized = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&results).expect("benchmark results must serialize")
+    );
+    publish_receipt_after_check(&output, serialized.as_bytes(), || source_unchanged(&source))
+        .unwrap_or_else(|message| panic!("{message}"));
     if !passed {
         eprintln!(
             "500k codebase certification failed; inspect {}",
@@ -330,7 +325,12 @@ struct SourceSnapshot {
 
 fn source_snapshot() -> SourceSnapshot {
     let revision = git_output(&["rev-parse", "HEAD"]);
-    let changes = git_output(&["status", "--porcelain=v1", "--untracked-files=all"]);
+    let changes = git_output(&[
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ]);
     validate_source_snapshot(
         revision.trim(),
         &changes,
@@ -339,16 +339,20 @@ fn source_snapshot() -> SourceSnapshot {
     .unwrap_or_else(|message| panic!("{message}"))
 }
 
-fn assert_source_unchanged(before: &SourceSnapshot) {
+fn source_unchanged(before: &SourceSnapshot) -> Result<(), String> {
     let revision = git_output(&["rev-parse", "HEAD"]);
-    let changes = git_output(&["status", "--porcelain=v1", "--untracked-files=all"]);
+    let changes = git_output(&[
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ]);
     validate_source_unchanged(
         before,
         revision.trim(),
         &changes,
         std::env::var("CYCLE_RELEASE_REVISION").ok().as_deref(),
     )
-    .unwrap_or_else(|message| panic!("{message}"));
 }
 
 fn git_output(arguments: &[&str]) -> String {
@@ -376,10 +380,11 @@ fn validate_source_snapshot(
     if claimed_revision.is_some_and(|claimed| claimed != revision) {
         return Err("claimed release revision does not match full HEAD".to_owned());
     }
-    if !changes.trim().is_empty() {
+    let disallowed = disallowed_source_changes(changes);
+    if !disallowed.is_empty() {
         return Err(format!(
             "release source is dirty before the workload: {}",
-            changes.trim().replace('\n', ", ")
+            disallowed.join(", ")
         ));
     }
     Ok(SourceSnapshot {
@@ -401,13 +406,265 @@ fn validate_source_unchanged(
             "claimed release revision does not match full HEAD after the workload".to_owned(),
         );
     }
-    if !changes.trim().is_empty() {
+    let disallowed = disallowed_source_changes(changes);
+    if !disallowed.is_empty() {
         return Err(format!(
             "release source is dirty after the workload: {}",
-            changes.trim().replace('\n', ", ")
+            disallowed.join(", ")
         ));
     }
     Ok(())
+}
+
+fn disallowed_source_changes(changes: &str) -> Vec<&str> {
+    changes
+        .lines()
+        .filter(|line| {
+            let Some(path) = line.strip_prefix("!! ") else {
+                return !line.is_empty();
+            };
+            !allowed_ignored_path(&path.replace('\\', "/"))
+        })
+        .collect()
+}
+
+fn allowed_ignored_path(path: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        ".bun/",
+        ".superpowers/",
+        ".worktrees/",
+        "candidate/",
+        "docs/specs/",
+        "docs/superpowers/",
+        "node_modules/",
+        "packages/opencode-cycle/dist/",
+        "packages/opencode-cycle/node_modules/",
+        "packages/protocol-contracts/dist/",
+        "packages/protocol-contracts/node_modules/",
+        "target/",
+    ];
+    matches!(
+        path,
+        "packages/opencode-cycle/LICENSE" | "packages/opencode-cycle/NOTICE"
+    ) || ROOTS
+        .iter()
+        .any(|root| path == *root || path.starts_with(root))
+}
+
+fn prepare_receipt_output(requested: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("release repository root must be canonical");
+    let expected = repository
+        .join("target")
+        .join("certification")
+        .join("codebase-500k.json");
+    ensure_output_directory(&repository.join("target"));
+    ensure_output_directory(&repository.join("target").join("certification"));
+    let requested = resolve_receipt_output_path(requested);
+    validate_receipt_output_policy(
+        &repository,
+        &requested,
+        output_is_tracked(&repository, &expected),
+        output_chain_has_link(&repository, &expected),
+    )
+    .unwrap_or_else(|message| panic!("{message}"));
+    assert!(
+        !expected.exists(),
+        "release receipt output already exists before workload"
+    );
+    expected
+}
+
+fn resolve_receipt_output_path(requested: &Path) -> PathBuf {
+    let requested_absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .expect("release current directory must exist")
+            .join(requested)
+    };
+    requested_absolute
+        .file_name()
+        .and_then(|name| {
+            requested_absolute
+                .parent()?
+                .canonicalize()
+                .ok()
+                .map(|parent| parent.join(name))
+        })
+        .unwrap_or(requested_absolute)
+}
+
+fn validate_receipt_output_policy(
+    repository: &Path,
+    output: &Path,
+    tracked: bool,
+    linked: bool,
+) -> Result<(), String> {
+    let expected = repository
+        .join("target")
+        .join("certification")
+        .join("codebase-500k.json");
+    if output != expected {
+        return Err(format!(
+            "release receipt output must be exact: {}",
+            expected.display()
+        ));
+    }
+    if tracked {
+        return Err("release receipt output must not be tracked".to_owned());
+    }
+    if linked {
+        return Err(
+            "release receipt output path must not contain links or reparse points".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn output_is_tracked(repository: &Path, output: &Path) -> bool {
+    let relative = output
+        .strip_prefix(repository)
+        .expect("release output must be within repository");
+    let status = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .current_dir(repository)
+        .status()
+        .expect("release output tracking must be inspected");
+    match status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => panic!("release output tracking inspection failed"),
+    }
+}
+
+fn output_chain_has_link(repository: &Path, output: &Path) -> bool {
+    for path in [
+        repository.to_path_buf(),
+        repository.join("target"),
+        repository.join("target").join("certification"),
+        output.to_path_buf(),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || metadata_is_reparse(&metadata)
+                    || (path == output && path_link_count(&path, &metadata) != 1) =>
+            {
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("release output metadata inspection failed: {error}"),
+        }
+    }
+    false
+}
+
+fn ensure_output_directory(path: &Path) {
+    if !path.exists() {
+        fs::create_dir(path).expect("release output directory must be created directly");
+    }
+    let metadata = fs::symlink_metadata(path).expect("release output directory must be inspected");
+    assert!(
+        metadata.is_dir() && !metadata.file_type().is_symlink() && !metadata_is_reparse(&metadata),
+        "release output directory must not be linked or reparse material"
+    );
+    assert_eq!(
+        path.canonicalize()
+            .expect("release output directory must canonicalize"),
+        path,
+        "release output directory must not be aliased"
+    );
+}
+
+fn write_receipt_atomically(output: &Path, content: &[u8]) {
+    let parent = output.parent().expect("release output must have a parent");
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .expect("release receipt temporary file must be private and local");
+    temporary
+        .write_all(content)
+        .expect("release receipt temporary file must be written");
+    temporary
+        .as_file()
+        .sync_all()
+        .expect("release receipt temporary file must be synced");
+    temporary
+        .persist_noclobber(output)
+        .unwrap_or_else(|error| panic!("release receipt must publish atomically: {error}"));
+    let metadata = fs::symlink_metadata(output).expect("release receipt output must exist");
+    assert!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && !metadata_is_reparse(&metadata)
+            && path_link_count(output, &metadata) == 1,
+        "release receipt output must be one real file"
+    );
+}
+
+fn publish_receipt_after_check(
+    output: &Path,
+    content: &[u8],
+    after_write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    write_receipt_atomically(output, content);
+    if let Err(message) = after_write() {
+        fs::remove_file(output)
+            .map_err(|error| format!("{message}; failed to remove invalid receipt: {error}"))?;
+        return Err(message);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn path_link_count(path: &Path, _metadata: &fs::Metadata) -> u64 {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .expect("release output hardlink inspection requires SystemRoot");
+    let output = Command::new(system_root.join("System32").join("fsutil.exe"))
+        .args(["hardlink", "list"])
+        .arg(path)
+        .output()
+        .expect("release output hardlink inspection must run");
+    assert!(
+        output.status.success(),
+        "release output hardlink inspection failed"
+    );
+    let count = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| {
+            line.iter()
+                .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+        })
+        .count();
+    assert!(count > 0, "release output hardlink inspection was empty");
+    count as u64
+}
+
+#[cfg(unix)]
+fn path_link_count(_path: &Path, metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_link_count(_path: &Path, _metadata: &fs::Metadata) -> u64 {
+    0
 }
 
 fn valid_revision(value: &str) -> bool {
@@ -661,6 +918,67 @@ mod tests {
         assert!(validate_source_snapshot(&revision, "", Some(&"b".repeat(40))).is_err());
         let before = validate_source_snapshot(&revision, "", Some(&revision)).unwrap();
         assert!(validate_source_unchanged(&before, &"c".repeat(40), "", Some(&revision)).is_err());
+    }
+
+    #[test]
+    fn release_receipt_allows_only_explicit_ignored_generated_roots() {
+        let revision = "a".repeat(40);
+        assert!(
+            validate_source_snapshot(&revision, "!! target/\n!! node_modules/\n", Some(&revision),)
+                .is_ok()
+        );
+        assert!(validate_source_snapshot(&revision, "!! .env\n", Some(&revision)).is_err());
+    }
+
+    #[test]
+    fn release_receipt_output_is_exact_untracked_json_without_links() {
+        let root = Path::new("C:/repo");
+        let exact = Path::new("C:/repo/target/certification/codebase-500k.json");
+        assert!(validate_receipt_output_policy(root, exact, false, false).is_ok());
+        assert!(
+            validate_receipt_output_policy(root, Path::new("C:/repo/arbitrary.json"), false, false)
+                .is_err()
+        );
+        assert!(validate_receipt_output_policy(root, exact, true, false).is_err());
+        assert!(validate_receipt_output_policy(root, exact, false, true).is_err());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let lane = temporary.path().join("target").join("certification");
+        fs::create_dir_all(&lane).unwrap();
+        let requested = lane.join("codebase-500k.json");
+        let canonical = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("target")
+            .join("certification")
+            .join("codebase-500k.json");
+        assert_eq!(resolve_receipt_output_path(&requested), canonical);
+    }
+
+    #[test]
+    fn release_receipt_rejects_hardlinks_and_cleans_up_after_dirty_post_write_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.json");
+        let linked = temporary.path().join("linked.json");
+        fs::write(&source, "source").unwrap();
+        fs::hard_link(&source, &linked).unwrap();
+        assert_ne!(
+            path_link_count(&linked, &fs::symlink_metadata(&linked).unwrap()),
+            1
+        );
+
+        fs::remove_file(&linked).unwrap();
+        let output = temporary.path().join("receipt.json");
+        let result = publish_receipt_after_check(&output, b"{}\n", || {
+            assert!(
+                output.exists(),
+                "receipt must exist during the final source check"
+            );
+            Err("release source is dirty after the receipt write".to_owned())
+        });
+        assert!(result.is_err());
+        assert!(!output.exists());
     }
 
     #[test]

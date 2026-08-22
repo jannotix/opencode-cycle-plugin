@@ -146,6 +146,19 @@ describe("release SBOM", () => {
     expect(inventory.packages.map((item) => `${item.name}@${item.version}`)).toContain(
       "@opencode-ai/sdk@1.18.21",
     )
+    const identities = inventory.packages.map((item) => `${item.name}@${item.version}`)
+    expect(identities).toContain("zod@3.25.76")
+    expect(identities).toContain("zod@4.1.8")
+    expect(identities).toContain("string-width@7.2.0")
+    expect(identities).toContain("string-width@8.2.2")
+    expect(
+      inventory.packages.find((item) => `${item.name}@${item.version}` === "chromium-bidi@17.0.2")
+        ?.dependencies,
+    ).toContain("zod@3.25.76")
+    expect(
+      inventory.packages.find((item) => `${item.name}@${item.version}` === "cliui@9.0.1")
+        ?.dependencies,
+    ).toContain("string-width@7.2.0")
 
     const plugin = JSON.parse(
       await readFile(join(root, "packages", "opencode-cycle", "package.json"), "utf8"),
@@ -159,6 +172,35 @@ describe("release SBOM", () => {
     await expect(collectPackedJavaScriptInventory(root, missingSdk, version, lock)).rejects.toThrow(
       "allowlist",
     )
+
+    const missingQualified = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown>
+    }
+    delete missingQualified.packages["chromium-bidi/zod"]
+    await expect(
+      collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(missingQualified)),
+    ).rejects.toThrow(/zod.*bun\.lock|bun\.lock.*zod/u)
+
+    const cyclic = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown[]>
+    }
+    const qualifiedZod = cyclic.packages["chromium-bidi/zod"]
+    if (qualifiedZod === undefined) throw new Error("test fixture is missing chromium-bidi/zod")
+    qualifiedZod[2] = { dependencies: { "chromium-bidi": "17.0.2" } }
+    await expect(
+      collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(cyclic)),
+    ).rejects.toThrow("cycle")
+
+    const ambiguous = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown>
+    }
+    const rootZod = ambiguous.packages.zod
+    if (rootZod === undefined) throw new Error("test fixture is missing root zod")
+    delete ambiguous.packages.zod
+    ambiguous.packages["other-issuer/zod"] = rootZod
+    await expect(
+      collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(ambiguous)),
+    ).rejects.toThrow("ambiguous")
   })
 
   test("validates generated output against the local official CycloneDX 1.6 schema", async () => {

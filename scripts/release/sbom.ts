@@ -279,17 +279,29 @@ export async function collectPackedJavaScriptInventory(
   }
 
   const records = new Map<string, JavaScriptPackage>()
+  const lockedPackages = parseLockedPackages(lock)
+  const resolvedNodes = new Map<string, string>()
+  const installedNodes = new Map<string, string>()
   const visiting = new Set<string>()
-  const visit = async (name: string, issuer: string = workspaceRoot): Promise<string> => {
+  const visit = async (
+    name: string,
+    requirement: string,
+    issuerDirectory: string = workspaceRoot,
+    issuerNode?: LockedPackage,
+  ): Promise<string> => {
     const packedManifest = packed.get(name)
-    if (packedManifest !== undefined) return `${name}@${packedManifest.version}`
-    const locked = lockedPackage(lock, name)
-    const identity = `${name}@${locked.version}`
-    if (records.has(identity)) return identity
-    if (visiting.has(name)) return identity
-    visiting.add(name)
-    const installed = await resolveInstalledPackage(issuer, workspaceRoot, name)
+    if (packedManifest !== undefined) {
+      assertVersionSatisfies(name, packedManifest.version, requirement)
+      return `${name}@${packedManifest.version}`
+    }
+    const locked = resolveLockedPackage(lockedPackages, name, requirement, issuerNode)
+    const identity = `${locked.name}@${locked.version}`
+    if (visiting.has(locked.key)) {
+      throw new Error(`bun.lock production dependency cycle includes ${locked.key}`)
+    }
+    const installed = await resolveInstalledPackage(issuerDirectory, workspaceRoot, name)
     if (installed === undefined) throw new Error(`Required locked production dependency is missing: ${name}`)
+    const installedRealpath = await realpath(installed)
     const installedManifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8")) as {
       license?: unknown
       name?: unknown
@@ -298,32 +310,50 @@ export async function collectPackedJavaScriptInventory(
     if (installedManifest.name !== name || installedManifest.version !== locked.version) {
       throw new Error(`Installed dependency does not match bun.lock: ${name}`)
     }
-    records.set(identity, {
-      dependencies: [],
-      license: typeof installedManifest.license === "string" ? installedManifest.license : null,
-      name,
-      version: locked.version,
-    })
-    const dependencies = await Promise.all(
-      Object.keys(locked.dependencies).sort().map((dependency) => visit(dependency, installed)),
-    )
-    records.set(identity, {
-      dependencies: [...new Set(dependencies)].sort(),
-      license: typeof installedManifest.license === "string" ? installedManifest.license : null,
-      name,
-      version: locked.version,
-    })
-    visiting.delete(name)
-    return identity
+    const priorInstalled = installedNodes.get(locked.key)
+    if (priorInstalled !== undefined && priorInstalled !== installedRealpath) {
+      throw new Error(`Installed dependency resolution is ambiguous for bun.lock node: ${locked.key}`)
+    }
+    installedNodes.set(locked.key, installedRealpath)
+    const priorIdentity = resolvedNodes.get(locked.key)
+    if (priorIdentity !== undefined) return priorIdentity
+
+    visiting.add(locked.key)
+    try {
+      const dependencies: string[] = []
+      for (const [dependency, dependencyRequirement] of Object.entries(locked.dependencies)) {
+        dependencies.push(await visit(dependency, dependencyRequirement, installed, locked))
+      }
+      const record = {
+        dependencies: [...new Set(dependencies)].sort(),
+        license: typeof installedManifest.license === "string" ? installedManifest.license : null,
+        name: locked.name,
+        version: locked.version,
+      } satisfies JavaScriptPackage
+      const priorRecord = records.get(identity)
+      if (priorRecord !== undefined && JSON.stringify(priorRecord) !== JSON.stringify(record)) {
+        throw new Error(`bun.lock package identity has ambiguous dependency graphs: ${identity}`)
+      }
+      records.set(identity, record)
+      resolvedNodes.set(locked.key, identity)
+      return identity
+    } finally {
+      visiting.delete(locked.key)
+    }
   }
 
   const roots: string[] = []
   for (const manifest of [...packed.values()].sort((left, right) => left.name.localeCompare(right.name))) {
-    const dependencyNames = [
-      ...Object.keys(manifest.dependencies),
-      ...Object.keys(manifest.optionalDependencies),
-    ].sort()
-    const dependencies = await Promise.all(dependencyNames.map((dependency) => visit(dependency)))
+    const dependencyRequirements = {
+      ...manifest.dependencies,
+      ...manifest.optionalDependencies,
+    }
+    const dependencies: string[] = []
+    for (const [dependency, requirement] of Object.entries(dependencyRequirements).sort(([left], [right]) =>
+      left.localeCompare(right),
+    )) {
+      dependencies.push(await visit(dependency, requirement))
+    }
     const identity = `${manifest.name}@${manifest.version}`
     records.set(identity, {
       dependencies: [...new Set(dependencies)].sort(),
@@ -344,6 +374,13 @@ export async function collectPackedJavaScriptInventory(
 interface ParsedBunLock {
   readonly packages: Record<string, unknown>
   readonly workspaces: Record<string, unknown>
+}
+
+interface LockedPackage {
+  readonly dependencies: Readonly<Record<string, string>>
+  readonly key: string
+  readonly name: string
+  readonly version: string
 }
 
 function parseBunLock(text: string): ParsedBunLock {
@@ -414,24 +451,77 @@ function assertPackedManifestMatchesLock(manifest: PackedManifest, lock: ParsedB
   }
 }
 
-function lockedPackage(
-  lock: ParsedBunLock,
+function parseLockedPackages(lock: ParsedBunLock): ReadonlyMap<string, LockedPackage> {
+  const packages = new Map<string, LockedPackage>()
+  for (const [key, value] of Object.entries(lock.packages)) {
+    if (!Array.isArray(value) || typeof value[0] !== "string") {
+      throw new Error(`bun.lock package entry is malformed: ${key}`)
+    }
+    const separator = value[0].lastIndexOf("@")
+    const name = value[0].slice(0, separator)
+    const version = value[0].slice(separator + 1)
+    if (version.startsWith("workspace:")) continue
+    if (
+      separator <= 0 ||
+      !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version) ||
+      (key !== name && !key.endsWith(`/${name}`))
+    ) {
+      throw new Error(`Locked dependency identity is invalid: ${key}`)
+    }
+    const metadata = isRecord(value[2]) ? value[2] : {}
+    packages.set(key, {
+      dependencies: stringMap(metadata.dependencies, `locked dependencies for ${key}`),
+      key,
+      name,
+      version,
+    })
+  }
+  return packages
+}
+
+function resolveLockedPackage(
+  packages: ReadonlyMap<string, LockedPackage>,
   name: string,
-): { readonly dependencies: Readonly<Record<string, string>>; readonly version: string } {
-  const value = lock.packages[name]
-  if (!Array.isArray(value) || typeof value[0] !== "string") {
-    throw new Error(`Required production dependency is missing from bun.lock: ${name}`)
+  requirement: string,
+  issuer?: LockedPackage,
+): LockedPackage {
+  const candidateKeys: string[] = []
+  let current = issuer
+  while (current !== undefined) {
+    candidateKeys.push(`${current.key}/${name}`)
+    const qualifier = lockQualifier(current)
+    if (qualifier === undefined) break
+    current = packages.get(qualifier)
+    if (current === undefined) {
+      throw new Error(`bun.lock issuer ancestry is missing: ${qualifier}`)
+    }
   }
-  const separator = value[0].lastIndexOf("@")
-  const resolvedName = value[0].slice(0, separator)
-  const version = value[0].slice(separator + 1)
-  if (resolvedName !== name || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)) {
-    throw new Error(`Locked dependency identity is invalid: ${name}`)
+  candidateKeys.push(name)
+  for (const key of [...new Set(candidateKeys)]) {
+    const candidate = packages.get(key)
+    if (candidate === undefined) continue
+    if (candidate.name !== name) throw new Error(`bun.lock dependency key has the wrong identity: ${key}`)
+    assertVersionSatisfies(name, candidate.version, requirement)
+    return candidate
   }
-  const metadata = isRecord(value[2]) ? value[2] : {}
-  return {
-    dependencies: stringMap(metadata.dependencies, `locked dependencies for ${name}`),
-    version,
+
+  const matches = [...packages.values()].filter((candidate) => candidate.name === name)
+  if (matches.length > 1) {
+    throw new Error(`Required production dependency is ambiguous in bun.lock: ${name}`)
+  }
+  throw new Error(`Required production dependency cannot be resolved from bun.lock: ${name}`)
+}
+
+function lockQualifier(value: LockedPackage): string | undefined {
+  if (value.key === value.name) return undefined
+  const suffix = `/${value.name}`
+  if (!value.key.endsWith(suffix)) throw new Error(`bun.lock package key is malformed: ${value.key}`)
+  return value.key.slice(0, -suffix.length)
+}
+
+function assertVersionSatisfies(name: string, version: string, requirement: string): void {
+  if (!Bun.semver.satisfies(version, requirement)) {
+    throw new Error(`Locked dependency ${name}@${version} does not satisfy bun.lock requirement ${requirement}`)
   }
 }
 

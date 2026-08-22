@@ -1,4 +1,5 @@
-import { open, lstat, readFile, realpath } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { open, lstat, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 
 import type { ControlPlaneHealth } from "./client.js"
@@ -157,56 +158,136 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
   return marker as unknown as DesktopActivationMarker
 }
 
-export async function writeDesktopActivationMarker(
+interface ActivationWriterHooks {
+  readonly afterTempSynced?: (path: string) => Promise<void>
+  readonly sleep?: (milliseconds: number) => Promise<void>
+}
+
+const productionWriter = createDesktopActivationWriter({})
+
+export function writeDesktopActivationMarker(
   binding: DesktopCertificationBinding,
   health: ControlPlaneHealth,
   now: () => number = Date.now,
 ): Promise<DesktopActivationMarker> {
-  const rootDetails = await lstat(binding.root)
-  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
-    throw new Error("Desktop certification root must be a real directory")
-  }
-  if (await realpath(binding.root) !== binding.root) {
-    throw new Error("Desktop certification root must not be a link or alias")
-  }
-  const marker = buildDesktopActivationMarker(binding, health, now())
-  const path = join(binding.root, "desktop-activation.json")
-  let handle
-  try {
-    handle = await open(path, "wx", 0o600)
-  } catch (error) {
-    if (isRecord(error) && error.code === "EEXIST") {
-      const details = await lstat(path)
-      if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1) {
-        throw new Error("Desktop certification activation marker already exists as an unsafe file")
-      }
-      if (await realpath(path) !== path) {
-        throw new Error("Desktop certification activation marker already exists through an alias")
-      }
-      const existing = parseDesktopActivationMarker(
-        JSON.parse(await readFile(path, "utf8")) as unknown,
-      )
-      if (
-        existing.createdAtUnixMillis < binding.startedAtUnixMillis ||
-        existing.nonce !== marker.nonce ||
-        existing.revision !== marker.revision ||
-        existing.pluginPackageSha256 !== marker.pluginPackageSha256 ||
-        existing.nativePackageSha256 !== marker.nativePackageSha256 ||
-        JSON.stringify(existing.health) !== JSON.stringify(marker.health)
-      ) {
-        throw new Error("Desktop certification activation marker already exists with another binding")
-      }
-      return existing
+  return productionWriter(binding, health, now)
+}
+
+export function createDesktopActivationWriterForTests(
+  hooks: ActivationWriterHooks,
+): typeof writeDesktopActivationMarker {
+  return createDesktopActivationWriter(hooks)
+}
+
+function createDesktopActivationWriter(hooks: ActivationWriterHooks): typeof writeDesktopActivationMarker {
+  return async (binding, health, now = Date.now) => {
+    const rootDetails = await lstat(binding.root)
+    if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+      throw new Error("Desktop certification root must be a real directory")
     }
+    if (await realpath(binding.root) !== binding.root) {
+      throw new Error("Desktop certification root must not be a link or alias")
+    }
+    const marker = buildDesktopActivationMarker(binding, health, now())
+    const path = join(binding.root, "desktop-activation.json")
+    const lockPath = join(binding.root, "desktop-activation.lock")
+    const existing = await existingMarker(path, binding, marker)
+    if (existing !== undefined) return existing
+
+    let lockHandle
+    try {
+      lockHandle = await open(lockPath, "wx", 0o600)
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "EEXIST") throw error
+      const sleep = hooks.sleep ?? Bun.sleep
+      for (let attempt = 0; attempt < 250; attempt += 1) {
+        const published = await existingMarker(path, binding, marker)
+        if (published !== undefined) return published
+        await sleep(20)
+      }
+      throw new Error("Desktop certification activation publication lock did not complete")
+    }
+
+    const temporary = join(binding.root, `.desktop-activation.${randomUUID()}.tmp`)
+    let temporaryHandle
+    try {
+      const published = await existingMarker(path, binding, marker)
+      if (published !== undefined) return published
+      temporaryHandle = await open(temporary, "wx", 0o600)
+      await temporaryHandle.writeFile(`${JSON.stringify(marker)}\n`, "utf8")
+      await temporaryHandle.sync()
+      await temporaryHandle.close()
+      temporaryHandle = undefined
+      await hooks.afterTempSynced?.(temporary)
+      if (await existingMarker(path, binding, marker) !== undefined) {
+        throw new Error("Desktop activation final appeared while the publication lock was held")
+      }
+      await rename(temporary, path)
+      return marker
+    } finally {
+      await cleanupActivationPublication(temporaryHandle, lockHandle, temporary, lockPath)
+    }
+  }
+}
+
+async function cleanupActivationPublication(
+  temporaryHandle: FileHandle | undefined,
+  lockHandle: FileHandle,
+  temporary: string,
+  lockPath: string,
+): Promise<void> {
+  const failures: unknown[] = []
+  for (const close of [
+    temporaryHandle === undefined ? undefined : () => temporaryHandle.close(),
+    () => lockHandle.close(),
+  ]) {
+    if (close === undefined) continue
+    try {
+      await close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  for (const path of [temporary, lockPath]) {
+    try {
+      await unlink(path)
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ENOENT") failures.push(error)
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Desktop activation publication cleanup failed")
+  }
+}
+
+async function existingMarker(
+  path: string,
+  binding: DesktopCertificationBinding,
+  marker: DesktopActivationMarker,
+): Promise<DesktopActivationMarker | undefined> {
+  const details = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined
     throw error
+  })
+  if (details === undefined) return undefined
+  if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1) {
+    throw new Error("Desktop certification activation marker exists as an unsafe file")
   }
-  try {
-    await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8")
-    await handle.sync()
-  } finally {
-    await handle.close()
+  if (await realpath(path) !== path) {
+    throw new Error("Desktop certification activation marker exists through an alias")
   }
-  return marker
+  const existing = parseDesktopActivationMarker(JSON.parse(await readFile(path, "utf8")) as unknown)
+  if (
+    existing.createdAtUnixMillis < binding.startedAtUnixMillis ||
+    existing.nonce !== marker.nonce ||
+    existing.revision !== marker.revision ||
+    existing.pluginPackageSha256 !== marker.pluginPackageSha256 ||
+    existing.nativePackageSha256 !== marker.nativePackageSha256 ||
+    JSON.stringify(existing.health) !== JSON.stringify(marker.health)
+  ) {
+    throw new Error("Desktop certification activation marker exists with another binding")
+  }
+  return existing
 }
 
 function requireExactRecord(

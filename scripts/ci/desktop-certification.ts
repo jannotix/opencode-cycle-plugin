@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join, relative, resolve, sep, win32 } from "node:path"
+import { join, relative, resolve, sep, win32 } from "node:path"
 import { Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -34,6 +34,7 @@ import {
 import { PRODUCT_IDENTITY } from "../product-identity.js"
 import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile } from "../release/verified-file.js"
 import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
+import { prepareReceiptOutput, publishReceiptAtomically } from "./receipt-output.js"
 
 export interface DesktopAsset {
   readonly name: string
@@ -249,6 +250,10 @@ async function main(): Promise<void> {
   const options = parseArguments(Bun.argv.slice(2))
   assertHost(options.platform)
   const root = fileURLToPath(new URL("../../", import.meta.url))
+  const receiptOutput = await prepareReceiptOutput(root, options.output, {
+    basename: `${options.platform}.json`,
+    lane: ["desktop"],
+  })
   const source = await captureCleanSource(root, options.revision)
   const matrix = JSON.parse(
     await readFile(join(root, ".github", "opencode-desktop-assets.json"), "utf8"),
@@ -463,9 +468,11 @@ async function main(): Promise<void> {
       revision: options.revision,
       schemaVersion: 1,
     }
-    await assertSourceUnchanged(root, source, options.revision)
-    await mkdir(dirname(resolve(options.output)), { recursive: true })
-    await writeFile(resolve(options.output), `${JSON.stringify(evidence, null, 2)}\n`, "utf8")
+    await publishReceiptAtomically(
+      receiptOutput,
+      Buffer.from(`${JSON.stringify(evidence, null, 2)}\n`),
+      () => assertSourceUnchanged(root, source, options.revision),
+    )
   } catch (error: unknown) {
     mainError = error
   } finally {

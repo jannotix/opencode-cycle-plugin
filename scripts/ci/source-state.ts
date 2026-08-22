@@ -13,12 +13,46 @@ export interface CleanSourceSnapshot {
 
 const gitProbe: SourceStateProbe = {
   async changes(root) {
-    const output = await git(root, ["status", "--porcelain=v1", "--untracked-files=all"])
-    return output.split(/\r?\n/u).filter((line) => line.length > 0)
+    const output = await git(root, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--ignored=matching",
+    ])
+    return output
+      .split(/\r?\n/u)
+      .filter((line) => line.length > 0)
+      .filter((line) => !allowedIgnoredEntry(line))
   },
   async revision(root) {
     return (await git(root, ["rev-parse", "HEAD"])).trim()
   },
+}
+
+const ALLOWED_IGNORED_ROOTS = [
+  ".bun/",
+  ".superpowers/",
+  ".worktrees/",
+  "candidate/",
+  "docs/specs/",
+  "docs/superpowers/",
+  "node_modules/",
+  "packages/opencode-cycle/dist/",
+  "packages/opencode-cycle/node_modules/",
+  "packages/protocol-contracts/dist/",
+  "packages/protocol-contracts/node_modules/",
+  "target/",
+] as const
+
+const ALLOWED_IGNORED_FILES = new Set([
+  "packages/opencode-cycle/LICENSE",
+  "packages/opencode-cycle/NOTICE",
+])
+
+function allowedIgnoredEntry(line: string): boolean {
+  if (!line.startsWith("!! ")) return false
+  const path = line.slice(3).replaceAll("\\", "/")
+  return ALLOWED_IGNORED_FILES.has(path) || ALLOWED_IGNORED_ROOTS.some((root) => path === root || path.startsWith(root))
 }
 
 export async function captureCleanSource(

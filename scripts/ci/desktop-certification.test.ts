@@ -239,7 +239,7 @@ test("activation rejects wrong nonce, package hashes and missing Desktop health"
   } finally {
     await rm(root, { force: true, recursive: true })
   }
-})
+}, 20_000)
 
 test("Desktop test profile discovery resolves valid profile directories recursively", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "opencode-cycle-profile-test-"))

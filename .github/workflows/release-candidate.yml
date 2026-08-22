@@ -163,11 +163,11 @@ jobs:
           name: ${{ matrix.native }}
           path: candidate/native
       - name: Run real Desktop certification
-        run: bun scripts/ci/desktop-certification.ts --platform ${{ matrix.platform }} --plugin-archive candidate/plugin --native-archive candidate/native --revision ${{ github.sha }} --output candidate/certifications/${{ matrix.platform }}.json
+        run: bun scripts/ci/desktop-certification.ts --platform ${{ matrix.platform }} --plugin-archive candidate/plugin --native-archive candidate/native --revision ${{ github.sha }} --output target/certification/desktop/${{ matrix.platform }}.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: certification-${{ matrix.platform }}
-          path: candidate/certifications/${{ matrix.platform }}.json
+          path: target/certification/desktop/${{ matrix.platform }}.json
           if-no-files-found: error
           retention-days: 14
 
