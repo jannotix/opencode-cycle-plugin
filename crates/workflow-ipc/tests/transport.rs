@@ -48,6 +48,40 @@ async fn concurrent_named_pipe_clients_do_not_cross_deliver() {
 }
 
 #[cfg(windows)]
+#[tokio::test]
+async fn rapid_named_pipe_clients_all_reach_an_accepted_instance() {
+    const CLIENTS: usize = 64;
+    let endpoint = endpoint();
+    let mut listener = LocalListener::bind(&endpoint).unwrap();
+    let server = async {
+        for _ in 0..CLIENTS {
+            let mut stream = listener.accept().await.unwrap();
+            stream.write_all(&[0x5a]).await.unwrap();
+        }
+    };
+    let clients = async {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..CLIENTS {
+            let endpoint = endpoint.clone();
+            tasks.spawn(async move {
+                let mut stream = connect(&endpoint).await.unwrap();
+                let mut challenge = [0_u8; 1];
+                stream.read_exact(&mut challenge).await.unwrap();
+                assert_eq!(challenge, [0x5a]);
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(server, clients);
+    })
+    .await
+    .expect("rapid clients must not starve behind an unaccepted pipe instance");
+}
+
+#[cfg(windows)]
 async fn echo(mut stream: tokio::net::windows::named_pipe::NamedPipeServer) -> std::io::Result<()> {
     let mut length = [0_u8; 1];
     stream.read_exact(&mut length).await?;

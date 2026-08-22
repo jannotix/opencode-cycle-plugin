@@ -14,6 +14,8 @@ export {
   type HistoryOperation,
   type MemoryOperation,
   type PromotionReceipt,
+  type TaskClosureReceipt,
+  type TaskClosureReportInput,
   type WorkflowStartReceipt,
   type WorkflowStartRequest,
 } from "./client.js"
@@ -53,6 +55,11 @@ export interface WorkflowControlPlane {
     workflowId: string,
     plan: import("./client.js").ArchitecturePlanInput,
   ): Promise<void>
+  reportTaskClosure(
+    projectKey: string,
+    workflowId: string,
+    report: import("./client.js").TaskClosureReportInput,
+  ): Promise<import("./client.js").TaskClosureReceipt>
   dispose(): Promise<void>
   health(): Promise<import("./client.js").ControlPlaneHealth>
 }

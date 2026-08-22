@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use workflow_core::{
     ArchitecturePlan, CandidateId, PlannedTask, ProjectId, RepairTarget, RequestRecord,
-    Requirement, TaskId, WorkflowCommand, WorkflowId, WorkflowMode, WorkflowTimestamp,
+    Requirement, TaskId, TaskState, WorkflowCommand, WorkflowId, WorkflowMode, WorkflowTimestamp,
 };
 use workflow_store::{Store, StoreError};
 
@@ -49,6 +49,14 @@ fn plan_is_bound_to_the_persisted_request_and_is_write_once() {
             WorkflowTimestamp::now(),
         )
         .unwrap();
+    store
+        .apply_workflow_command(
+            workflow_id,
+            "intake",
+            WorkflowCommand::CompleteIntake,
+            WorkflowTimestamp::now(),
+        )
+        .unwrap();
     let saved_plan = plan(&request);
     assert!(
         !store
@@ -90,13 +98,20 @@ fn rejected_architecture_is_replanned_as_an_append_only_version() {
             WorkflowTimestamp::now(),
         )
         .unwrap();
+    store
+        .apply_workflow_command(
+            workflow_id,
+            "intake",
+            WorkflowCommand::CompleteIntake,
+            WorkflowTimestamp::now(),
+        )
+        .unwrap();
     let original = plan(&request);
     store
         .save_architecture_once(workflow_id, &original, WorkflowTimestamp::now())
         .unwrap();
     let candidate_id = CandidateId::new();
     for (key, command) in [
-        ("intake", WorkflowCommand::CompleteIntake),
         ("route", WorkflowCommand::Route(WorkflowMode::Full)),
         ("architecture", WorkflowCommand::ArchitectureAccepted),
         ("candidate", WorkflowCommand::CandidateReady(candidate_id)),
@@ -126,5 +141,69 @@ fn rejected_architecture_is_replanned_as_an_append_only_version() {
     assert_eq!(
         store.load_architecture(workflow_id).unwrap(),
         Some(replacement)
+    );
+}
+
+#[test]
+fn duplicate_architecture_save_reconciles_a_partial_legacy_task_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(
+        directory.path().join("workflow.db"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let workflow_id = WorkflowId::new();
+    let request = RequestRecord::new("Original request".to_owned(), vec![]);
+    store
+        .save_request_once(
+            workflow_id,
+            ProjectId::from_stable_key("project"),
+            &request,
+            WorkflowTimestamp::now(),
+        )
+        .unwrap();
+    store
+        .apply_workflow_command(
+            workflow_id,
+            "intake",
+            WorkflowCommand::CompleteIntake,
+            WorkflowTimestamp::now(),
+        )
+        .unwrap();
+    let architecture = plan(&request);
+    let authoritative = architecture.tasks[0].id;
+    store
+        .save_architecture_once(workflow_id, &architecture, WorkflowTimestamp::now())
+        .unwrap();
+
+    let stale = TaskId::new();
+    store
+        .seed_architecture_tasks(
+            workflow_id,
+            &[(authoritative, true), (stale, true)],
+            &[],
+            WorkflowTimestamp::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_task(stale).unwrap().unwrap().state(),
+        TaskState::Ready
+    );
+
+    assert!(
+        store
+            .save_architecture_once(workflow_id, &architecture, WorkflowTimestamp::now())
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_task(stale).unwrap().unwrap().state(),
+        TaskState::Cancelled
+    );
+    assert_eq!(
+        store.load_workflow_tasks(workflow_id).unwrap(),
+        vec![(
+            authoritative,
+            store.load_task(authoritative).unwrap().unwrap()
+        )]
     );
 }

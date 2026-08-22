@@ -29,6 +29,12 @@ impl Store {
             return Err(StoreError::RequestDigestMismatch);
         }
         let plan_json = serde_json::to_string(plan)?;
+        let timestamp = timestamp.to_string();
+        let tasks = plan
+            .tasks
+            .iter()
+            .map(|task| (task.id, task.dependencies.is_empty()))
+            .collect::<Vec<_>>();
         let current: Option<String> = transaction
             .query_row(
                 "SELECT plan_json FROM workflow_architecture WHERE workflow_id = ?1",
@@ -38,7 +44,28 @@ impl Store {
             .optional()?;
         if let Some(current) = current {
             if current == plan_json {
+                crate::tasks::reconcile_architecture_tasks(
+                    &transaction,
+                    workflow_id,
+                    &tasks,
+                    &[],
+                    &timestamp,
+                )?;
+                transaction.commit()?;
                 return Ok(true);
+            }
+            let previous: ArchitecturePlan = serde_json::from_str(&current)?;
+            let previous_ids = previous
+                .tasks
+                .iter()
+                .map(|task| task.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            if plan
+                .tasks
+                .iter()
+                .any(|task| previous_ids.contains(&task.id))
+            {
+                return Err(StoreError::AggregateConflict);
             }
             let state_json: String = transaction.query_row(
                 "SELECT state_json FROM workflows WHERE id = ?1",
@@ -64,7 +91,7 @@ impl Store {
                     plan.request_digest.to_string(),
                     plan.digest().to_string(),
                     plan_json,
-                    timestamp.to_string()
+                    timestamp
                 ],
             )?;
             transaction.execute(
@@ -77,8 +104,16 @@ impl Store {
                     plan.request_digest.to_string(),
                     plan.digest().to_string(),
                     plan_json,
-                    timestamp.to_string()
+                    timestamp
                 ],
+            )?;
+            let superseded = previous_ids.into_iter().collect::<Vec<_>>();
+            crate::tasks::reconcile_architecture_tasks(
+                &transaction,
+                workflow_id,
+                &tasks,
+                &superseded,
+                &timestamp,
             )?;
             transaction.commit()?;
             return Ok(false);
@@ -92,7 +127,7 @@ impl Store {
                 plan.request_digest.to_string(),
                 plan.digest().to_string(),
                 plan_json,
-                timestamp.to_string()
+                timestamp
             ],
         )?;
         transaction.execute(
@@ -104,8 +139,15 @@ impl Store {
                 plan.request_digest.to_string(),
                 plan.digest().to_string(),
                 plan_json,
-                timestamp.to_string()
+                timestamp
             ],
+        )?;
+        crate::tasks::reconcile_architecture_tasks(
+            &transaction,
+            workflow_id,
+            &tasks,
+            &[],
+            &timestamp,
         )?;
         transaction.commit()?;
         Ok(false)

@@ -57,6 +57,18 @@ where
             &challenge,
         )))
         .await?;
+    match channel.receive::<ServerMessage>().await? {
+        ServerMessage::Authenticated { protocol_version }
+            if protocol_version == workflow_core::PROTOCOL_VERSION => {}
+        ServerMessage::Error { code, message, .. } => {
+            return Err(ClientError::Rejected { code, message });
+        }
+        _ => {
+            return Err(ClientError::Protocol(
+                "server did not acknowledge authentication",
+            ));
+        }
+    }
     channel.send(&ClientMessage::Health { request_id }).await?;
     match channel.receive::<ServerMessage>().await? {
         ServerMessage::Health {

@@ -8,9 +8,46 @@ import { fileURLToPath } from "node:url"
 import { Database } from "bun:sqlite"
 
 import { ControlPlaneError, LocalControlPlane } from "../src/client.js"
+import { digest } from "../src/audit-events.js"
 
 const root = fileURLToPath(new URL("../../../", import.meta.url))
 const binary = join(root, "target", "debug", process.platform === "win32" ? "workflowd.exe" : "workflowd")
+
+test("task closure canonical digests match the Rust protocol vectors", () => {
+  const taskId = "018f0000-0000-7000-8000-000000000001"
+  const evidenceId = "018f0000-0000-7000-8000-000000000002"
+  const plan = {
+    assumptions: [],
+    integration_checks: ["Run tests."],
+    request_digest: "11".repeat(32),
+    requirements: [{ acceptance_criteria: ["It works."], id: "REQ-1", statement: "Build it." }],
+    risks: [],
+    tasks: [{
+      acceptance_criteria: ["Task works."],
+      dependencies: [],
+      id: taskId,
+      objective: "Build the task.",
+      requirement_ids: ["REQ-1"],
+      title: "Build",
+      verification_commands: ["rustc --version"],
+      write_scopes: ["src"],
+    }],
+  }
+  const verdict = {
+    criteria: [
+      { criterion_id: `task:${taskId}:acceptance:1`, evidence_ids: [evidenceId], status: "satisfied" },
+      { criterion_id: "requirement:REQ-1:acceptance:1", evidence_ids: [evidenceId], status: "satisfied" },
+    ],
+    decision: "approved",
+    findings: [],
+    repair_target: null,
+    requirements: [{ evidence_ids: [evidenceId], requirement_id: "REQ-1", status: "satisfied" }],
+    revision: "aa".repeat(20),
+    task_id: taskId,
+  }
+  expect(digest(plan)).toBe("d60825d62e94c853f04f6ee0a4e7504e620f727c7ab9bb92073459dd7311c6a1")
+  expect(digest(verdict)).toBe("cd8b4ce8399b464d14f65b816a4b35001e24252758c022c172791f3def3a5b09")
+})
 
 test("plugin starts, authenticates, and validates the real control plane", async () => {
   const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-"))
@@ -537,6 +574,439 @@ test("plugin starts, authenticates, and validates the real control plane", async
     await rm(dataDirectory, { force: true, recursive: true })
   }
 }, 60_000)
+
+test("verified task closure is authoritative, idempotent, dependency-aware, and durable", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-task-closure-"))
+  let controlPlane = new LocalControlPlane({
+    binaryPath: binary,
+    dataDirectory,
+    stopOwnedProcessOnDispose: true,
+  })
+  const projectKey = "task-closure-project"
+  const workflowId = crypto.randomUUID()
+  const rootTaskId = crypto.randomUUID()
+  const dependentTaskId = crypto.randomUUID()
+  try {
+    const repository = join(dataDirectory, "repository")
+    await mkdir(repository)
+    await execGit(repository, ["init"])
+    await execGit(repository, ["config", "user.email", "test@example.invalid"])
+    await execGit(repository, ["config", "user.name", "Test User"])
+    await writeFile(join(repository, "base.txt"), "base\n")
+    await execGit(repository, ["add", "base.txt"])
+    await execGit(repository, ["commit", "-m", "base"])
+    const workflow = await controlPlane.startWorkflow({
+      originalRequest: "Implement and verify two dependency-ordered tasks.",
+      preference: "full",
+      projectKey,
+      workflowId,
+    })
+    const architecture = {
+      assumptions: [],
+      integration_checks: ["Run the integration suite."],
+      request_digest: workflow.requestDigest,
+      requirements: [{
+        acceptance_criteria: ["The implementation is verified."],
+        id: "REQ-1",
+        statement: "Implement the requested behavior.",
+      }],
+      risks: [],
+      tasks: [
+        task(rootTaskId, []),
+        task(dependentTaskId, [rootTaskId]),
+      ],
+    }
+    await controlPlane.submitArchitecture(projectKey, workflowId, architecture)
+    expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
+      tasks: [
+        { state: "pending", taskId: dependentTaskId },
+        { state: "ready", taskId: rootTaskId },
+      ].sort((left, right) => left.taskId.localeCompare(right.taskId)),
+      workflowId,
+    })
+
+    const rootReport = closureReport(architecture, rootTaskId, workflow.requestDigest)
+    const dependentReport = closureReport(architecture, dependentTaskId, workflow.requestDigest)
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, dependentReport),
+    ).rejects.toThrow("task is not ready for closure")
+    await expect(
+      controlPlane.reportTaskClosure("wrong-project", workflowId, rootReport),
+    ).rejects.toThrow("workflow belongs to another project")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, crypto.randomUUID(), rootReport),
+    ).rejects.toThrow("workflow request does not exist")
+
+    const unknownTaskId = crypto.randomUUID()
+    const unknown = closureReport(architecture, unknownTaskId, workflow.requestDigest)
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, unknown),
+    ).rejects.toThrow(/authoritative .*architecture/u)
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        commands: [],
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("deterministic evidence is invalid")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        commands: [
+          ...rootReport.commands,
+          { ...rootReport.commands[0]!, evidence_id: crypto.randomUUID() },
+        ],
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("command coverage is incomplete")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        commands: rootReport.commands.map((command) => ({
+          ...command,
+          exit_code: 1,
+          status: "failed" as const,
+        })),
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("failed or mismatched deterministic evidence")
+    const rejectedVerdict = {
+      ...rootReport.reviewer.verdict,
+      decision: "rejected" as const,
+      findings: [{
+        evidence_ids: [rootReport.commands[0]!.evidence_id],
+        severity: "medium" as const,
+        summary: "The task is incomplete.",
+      }],
+      repair_target: "execution" as const,
+      requirements: rootReport.reviewer.verdict.requirements.map((decision) => ({
+        ...decision,
+        status: "unsatisfied" as const,
+      })),
+    }
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        receipt_id: crypto.randomUUID(),
+        reviewer: { verdict: rejectedVerdict, verdict_digest: digest(rejectedVerdict) },
+      }),
+    ).rejects.toThrow("approved independent review")
+    for (const invalidVerdict of [
+      { ...rootReport.reviewer.verdict, requirements: [] },
+      {
+        ...rootReport.reviewer.verdict,
+        requirements: [
+          ...rootReport.reviewer.verdict.requirements,
+          ...rootReport.reviewer.verdict.requirements,
+        ],
+      },
+      {
+        ...rootReport.reviewer.verdict,
+        requirements: [
+          ...rootReport.reviewer.verdict.requirements,
+          {
+            evidence_ids: [rootReport.commands[0]!.evidence_id],
+            requirement_id: "REQ-UNKNOWN",
+            status: "satisfied" as const,
+          },
+        ],
+      },
+      {
+        ...rootReport.reviewer.verdict,
+        requirements: rootReport.reviewer.verdict.requirements.map((requirement) => ({
+          ...requirement,
+          evidence_ids: [...requirement.evidence_ids, ...requirement.evidence_ids],
+        })),
+      },
+      {
+        ...rootReport.reviewer.verdict,
+        criteria: [
+          ...rootReport.reviewer.verdict.criteria,
+          {
+            criterion_id: "task:unknown:acceptance:1",
+            evidence_ids: [rootReport.commands[0]!.evidence_id],
+            status: "satisfied" as const,
+          },
+        ],
+      },
+      {
+        ...rootReport.reviewer.verdict,
+        criteria: rootReport.reviewer.verdict.criteria.map((criterion) => ({
+          ...criterion,
+          status: "unsatisfied" as const,
+        })),
+      },
+    ]) {
+      await expect(
+        controlPlane.reportTaskClosure(projectKey, workflowId, {
+          ...rootReport,
+          receipt_id: crypto.randomUUID(),
+          reviewer: { verdict: invalidVerdict, verdict_digest: digest(invalidVerdict) },
+        }),
+      ).rejects.toThrow(/coverage/u)
+    }
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        architecture_digest: "not-a-digest",
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("identity or revision binding is invalid")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        changed_paths: ["outside/file.ts"],
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("outside the write scope")
+    const wrongRevisionVerdict = {
+      ...rootReport.reviewer.verdict,
+      revision: "b".repeat(40),
+    }
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        receipt_id: crypto.randomUUID(),
+        reviewer: {
+          verdict: wrongRevisionVerdict,
+          verdict_digest: digest(wrongRevisionVerdict),
+        },
+      }),
+    ).rejects.toThrow("identity or revision binding is invalid")
+
+    expect(await controlPlane.reportTaskClosure(projectKey, workflowId, rootReport)).toMatchObject({
+      duplicate: false,
+      taskId: rootTaskId,
+      taskState: "completed",
+    })
+    expect(await controlPlane.reportTaskClosure(projectKey, workflowId, rootReport)).toMatchObject({
+      duplicate: true,
+      taskId: rootTaskId,
+    })
+    await controlPlane.dispose()
+    controlPlane = new LocalControlPlane({
+      binaryPath: binary,
+      dataDirectory,
+      stopOwnedProcessOnDispose: true,
+    })
+    expect(
+      await controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).toMatchObject({ duplicate: true, taskId: rootTaskId })
+    expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
+      tasks: [
+        { state: "ready", taskId: dependentTaskId },
+        { state: "completed", taskId: rootTaskId },
+      ].sort((left, right) => left.taskId.localeCompare(right.taskId)),
+      workflowId,
+    })
+    expect(
+      await controlPlane.reportTaskClosure(projectKey, workflowId, dependentReport),
+    ).toMatchObject({ taskId: dependentTaskId, taskState: "completed" })
+
+    const worktree = await controlPlane.prepareWorktree(projectKey, repository, workflowId)
+    const verificationPlan = await controlPlane.planVerification(projectKey, workflowId)
+    const candidate = await controlPlane.freezeCandidate(
+      projectKey,
+      workflowId,
+      worktree.baseRevision,
+      verificationPlan.planId,
+      verificationPlan.evidenceIds,
+    )
+    const candidateVerification = await controlPlane.verifyCandidate(
+      projectKey,
+      workflowId,
+      candidate.candidateId,
+      verificationPlan.planId,
+    )
+    expect(candidateVerification.mandatoryPassed).toBeTrue()
+    const candidateReview = (role: "functional_reviewer" | "security_architecture_reviewer") => ({
+      candidate_digest: candidate.candidateDigest,
+      decision: "approved" as const,
+      findings: [],
+      repair_target: null,
+      requirements: [{
+        evidence_ids: verificationPlan.evidenceIds,
+        requirement_id: "REQ-1",
+        status: "satisfied" as const,
+      }],
+      role,
+    })
+    await controlPlane.submitReview(
+      projectKey,
+      workflowId,
+      candidate.candidateId,
+      candidateReview("functional_reviewer"),
+    )
+    await controlPlane.submitReview(
+      projectKey,
+      workflowId,
+      candidate.candidateId,
+      candidateReview("security_architecture_reviewer"),
+    )
+    const repair = await controlPlane.submitArbitration(
+      projectKey,
+      workflowId,
+      candidate.candidateId,
+      {
+        candidate_digest: candidate.candidateDigest,
+        decision: "rejected",
+        findings: [{
+          evidence_ids: verificationPlan.evidenceIds,
+          severity: "medium",
+          summary: "Cross-task integration needs repair.",
+        }],
+        repair_target: "execution",
+        requirements: [{
+          evidence_ids: verificationPlan.evidenceIds,
+          requirement_id: "REQ-1",
+          status: "unsatisfied",
+        }],
+      },
+    )
+    expect(repair.workflowState).toBe("execution")
+    const repairedRoot = closureRevision(rootReport, "d".repeat(40), "e".repeat(64))
+    expect(
+      await controlPlane.reportTaskClosure(projectKey, workflowId, repairedRoot),
+    ).toMatchObject({ duplicate: false, taskId: rootTaskId, taskState: "completed" })
+    await expect(
+      controlPlane.reportTaskClosure(
+        projectKey,
+        workflowId,
+        closureRevision(rootReport, "f".repeat(40), "1".repeat(64)),
+      ),
+    ).rejects.toThrow("idempotency")
+
+    expect(await controlPlane.reportExecution(projectKey, workflowId, "plan_defect")).toBe(
+      "architecture",
+    )
+    await expect(
+      controlPlane.submitArchitecture(projectKey, workflowId, {
+        ...architecture,
+        risks: ["Repaired"],
+      }),
+    ).rejects.toThrow("fresh task identifiers")
+    const replacementId = crypto.randomUUID()
+    const replacement = {
+      ...architecture,
+      risks: ["Repaired"],
+      tasks: [task(replacementId, [])],
+    }
+    await controlPlane.submitArchitecture(projectKey, workflowId, replacement)
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...dependentReport,
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow(/authoritative .*architecture/u)
+    expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
+      tasks: [{ state: "ready", taskId: replacementId }],
+      workflowId,
+    })
+
+    await controlPlane.dispose()
+    controlPlane = new LocalControlPlane({
+      binaryPath: binary,
+      dataDirectory,
+      stopOwnedProcessOnDispose: true,
+    })
+    expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
+      tasks: [{ state: "ready", taskId: replacementId }],
+      workflowId,
+    })
+  } finally {
+    await controlPlane.dispose()
+    await rm(dataDirectory, { force: true, recursive: true })
+  }
+}, 60_000)
+
+function task(id: string, dependencies: readonly string[]) {
+  return {
+    acceptance_criteria: ["The bounded task is verified."],
+    dependencies: [...dependencies],
+    id,
+    objective: "Implement and verify the bounded task.",
+    requirement_ids: ["REQ-1"],
+    title: `Task ${id}`,
+    verification_commands: ["rustc --version"],
+    write_scopes: ["src"],
+  }
+}
+
+function closureReport(
+  architecture: {
+    request_digest: string
+    requirements: readonly { acceptance_criteria: readonly string[]; id: string }[]
+    tasks: readonly ReturnType<typeof task>[]
+  },
+  taskId: string,
+  requestDigest: string,
+) {
+  const planned = architecture.tasks.find((value) => value.id === taskId) ?? task(taskId, [])
+  const evidenceId = crypto.randomUUID()
+  const revision = "a".repeat(40)
+  const verdict = {
+    criteria: [
+      ...planned.acceptance_criteria.map((_criterion, index) => ({
+        criterion_id: `task:${taskId}:acceptance:${index + 1}`,
+        evidence_ids: [evidenceId],
+        status: "satisfied" as const,
+      })),
+      ...architecture.requirements.flatMap((requirement) =>
+        requirement.acceptance_criteria.map((_criterion, index) => ({
+          criterion_id: `requirement:${requirement.id}:acceptance:${index + 1}`,
+          evidence_ids: [evidenceId],
+          status: "satisfied" as const,
+        })),
+      ),
+    ],
+    decision: "approved" as const,
+    findings: [],
+    repair_target: null,
+    requirements: [{
+      evidence_ids: [evidenceId],
+      requirement_id: "REQ-1",
+      status: "satisfied" as const,
+    }],
+    revision,
+    task_id: taskId,
+  }
+  return {
+    architecture_digest: digest(architecture),
+    base_revision: "b".repeat(40),
+    changed_paths: ["src/feature.ts"],
+    commands: [{
+      evidence_id: evidenceId,
+      exit_code: 0,
+      invocation: "rustc --version",
+      output_digest: "c".repeat(64),
+      status: "passed" as const,
+    }],
+    receipt_id: crypto.randomUUID(),
+    request_digest: requestDigest,
+    reviewer: { verdict, verdict_digest: digest(verdict) },
+    submitted_revision: revision,
+    task_id: taskId,
+  }
+}
+
+function closureRevision(
+  report: ReturnType<typeof closureReport>,
+  revision: string,
+  outputDigest: string,
+) {
+  const verdict = { ...report.reviewer.verdict, revision }
+  return {
+    ...report,
+    base_revision: report.submitted_revision,
+    commands: report.commands.map((command) => ({ ...command, output_digest: outputDigest })),
+    receipt_id: crypto.randomUUID(),
+    reviewer: { verdict, verdict_digest: digest(verdict) },
+    submitted_revision: revision,
+  }
+}
 
 function containedIn(path: string, directory: string): boolean {
   const value = normalizeWindowsPath(path)

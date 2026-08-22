@@ -131,8 +131,8 @@ impl LocalListener {
             Some(server) => server,
             None => create_server(&self.path, false, &self.security)?,
         };
-        self.pending = Some(create_server(&self.path, false, &self.security)?);
         server.connect().await?;
+        self.pending = Some(create_server(&self.path, false, &self.security)?);
         Ok(server)
     }
 

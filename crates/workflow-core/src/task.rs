@@ -46,6 +46,7 @@ pub enum TaskCommand {
     VerificationFailed {
         retryable: bool,
     },
+    RepairRequested,
     Block,
     Unblock,
     Cancel,
@@ -126,6 +127,9 @@ impl Task {
                 } else {
                     TaskState::Failed
                 }))
+            }
+            TaskCommand::RepairRequested if self.state == TaskState::Completed => {
+                Ok(self.transition(TaskState::Ready))
             }
             TaskCommand::Block if !self.state.is_terminal() && self.state != TaskState::Blocked => {
                 Ok(self.transition(TaskState::Blocked))

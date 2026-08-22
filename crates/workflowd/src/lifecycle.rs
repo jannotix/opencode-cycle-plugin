@@ -107,6 +107,11 @@ where
         .lock()
         .await
         .verify(&challenge, &response, now_unix_millis()?)?;
+    channel
+        .send(&ServerMessage::Authenticated {
+            protocol_version: report.protocol_version,
+        })
+        .await?;
 
     loop {
         match channel.receive::<ClientMessage>().await? {
@@ -758,6 +763,36 @@ where
                     }
                 }
             }
+            ClientMessage::ReportTaskClosure { report, request_id } => {
+                let workflow_id = report.workflow_id;
+                let task_id = report.task_id;
+                let result = {
+                    let mut locked = store.lock().await;
+                    report_task_closure(&mut locked, &report)
+                };
+                match result {
+                    Ok(applied) => {
+                        channel
+                            .send(&ServerMessage::TaskClosureRecorded {
+                                duplicate: applied.duplicate,
+                                request_id,
+                                task_id,
+                                task_state: task_state(applied.state.state())?,
+                                workflow_id,
+                            })
+                            .await?;
+                    }
+                    Err(message) => {
+                        channel
+                            .send(&ServerMessage::Error {
+                                request_id: Some(request_id),
+                                code: "task_closure_rejected".to_owned(),
+                                message,
+                            })
+                            .await?;
+                    }
+                }
+            }
             ClientMessage::Authenticate(_) => {
                 return Err("connection attempted to authenticate more than once".into());
             }
@@ -955,16 +990,300 @@ fn report_execution(
             workflow_core::WorkflowCommand::ReplanExecution
         }
     };
-    let state = store
+    let applied = store
         .apply_workflow_command(
             workflow_id,
             &format!("{workflow_id}:execution-report:{report_id}"),
             command,
             workflow_core::WorkflowTimestamp::now(),
         )
-        .map_err(|error| error.to_string())?
-        .state;
+        .map_err(|error| error.to_string())?;
+    let state = if outcome == workflow_ipc::ExecutionOutcome::PlanDefect
+        && applied.state.state() == workflow_core::WorkflowState::Repair
+    {
+        store
+            .apply_workflow_command(
+                workflow_id,
+                &format!("{workflow_id}:execution-report:{report_id}:begin-repair"),
+                workflow_core::WorkflowCommand::BeginRepair,
+                workflow_core::WorkflowTimestamp::now(),
+            )
+            .map_err(|error| error.to_string())?
+            .state
+    } else {
+        applied.state
+    };
     workflow_state(state.state())
+}
+
+fn report_task_closure(
+    store: &mut Store,
+    report: &workflow_ipc::protocol::TaskClosureReport,
+) -> Result<workflow_store::TaskApplyResult, String> {
+    use std::collections::BTreeSet;
+    use workflow_ipc::protocol::{TaskClosureCommandStatus, TaskClosureReviewDecision};
+
+    if report.project_key.is_empty()
+        || report.project_key.len() > 32_768
+        || report.project_key.contains('\0')
+    {
+        return Err("task closure project key is invalid".to_owned());
+    }
+    validate_project(
+        store,
+        workflow_core::ProjectId::from_stable_key(&report.project_key),
+        report.workflow_id,
+    )?;
+    let (_, request) = store
+        .load_request(report.workflow_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "workflow request does not exist".to_owned())?;
+    let workflow = store
+        .load_workflow(report.workflow_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "workflow state does not exist".to_owned())?;
+    if !matches!(
+        workflow.state(),
+        workflow_core::WorkflowState::Execution | workflow_core::WorkflowState::QuickExecution
+    ) {
+        return Err("workflow is not in executable task-closure state".to_owned());
+    }
+    let architecture = store
+        .load_architecture(report.workflow_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "workflow architecture does not exist".to_owned())?;
+    if request.digest() != report.request_digest
+        || architecture.request_digest != report.request_digest
+        || architecture.digest() != report.architecture_digest
+    {
+        return Err(
+            "task closure does not bind to the authoritative request and architecture".to_owned(),
+        );
+    }
+    let planned = architecture
+        .tasks
+        .iter()
+        .find(|task| task.id == report.task_id)
+        .ok_or_else(|| "task does not belong to the authoritative architecture".to_owned())?;
+    if !valid_revision(&report.base_revision) || !valid_revision(&report.submitted_revision) {
+        return Err("task closure revision is invalid".to_owned());
+    }
+    let reviewer = &report.reviewer.verdict;
+    if reviewer.task_id != report.task_id || reviewer.revision != report.submitted_revision {
+        return Err("task reviewer verdict has the wrong task or revision binding".to_owned());
+    }
+    let verdict_digest = workflow_core::ContentDigest::of(
+        &serde_json::to_vec(reviewer).map_err(|error| error.to_string())?,
+    );
+    if verdict_digest != report.reviewer.verdict_digest {
+        return Err("task reviewer verdict digest is invalid".to_owned());
+    }
+    if reviewer.decision != TaskClosureReviewDecision::Approved
+        || reviewer.repair_target.is_some()
+        || !reviewer.findings.is_empty()
+    {
+        return Err(
+            "task closure requires an approved independent review without findings".to_owned(),
+        );
+    }
+
+    if report.commands.len() != planned.verification_commands.len() || report.commands.len() > 256 {
+        return Err("task closure command coverage is incomplete".to_owned());
+    }
+    let mut evidence_ids = BTreeSet::new();
+    for (receipt, declared) in report.commands.iter().zip(&planned.verification_commands) {
+        if receipt.invocation != *declared
+            || receipt.invocation.is_empty()
+            || receipt.invocation.len() > 4_096
+            || receipt.exit_code != 0
+            || receipt.status != TaskClosureCommandStatus::Passed
+        {
+            return Err(
+                "task closure contains failed or mismatched deterministic evidence".to_owned(),
+            );
+        }
+        if !evidence_ids.insert(receipt.evidence_id) {
+            return Err("task closure contains duplicate evidence identifiers".to_owned());
+        }
+    }
+
+    if report.changed_paths.len() > 4_096 {
+        return Err("task closure changed-path coverage exceeds its limit".to_owned());
+    }
+    let mut changed_paths = BTreeSet::new();
+    for path in &report.changed_paths {
+        if path.len() > 4_096
+            || !safe_relative(path)
+            || !changed_paths.insert(path.as_str())
+            || !planned
+                .write_scopes
+                .iter()
+                .any(|scope| path == scope || path.starts_with(&format!("{scope}/")))
+        {
+            return Err(
+                "task closure changed paths are invalid or outside the write scope".to_owned(),
+            );
+        }
+    }
+
+    validate_task_review_coverage(planned, &architecture, reviewer, &evidence_ids)?;
+    let tasks: std::collections::BTreeMap<_, _> = store
+        .load_workflow_tasks(report.workflow_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect();
+    let current = tasks
+        .get(&report.task_id)
+        .ok_or_else(|| "task state does not exist".to_owned())?;
+    if current.state() != workflow_core::TaskState::Ready {
+        let payload_digest = closure_payload_digest(report)?;
+        if current.state() == workflow_core::TaskState::Completed {
+            return store
+                .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+                    workflow_id: report.workflow_id,
+                    task_id: report.task_id,
+                    receipt_id: report.receipt_id,
+                    payload_digest,
+                    repair_cycle: workflow.repair_cycles(),
+                    ready_dependents: &[],
+                    timestamp: workflow_core::WorkflowTimestamp::now(),
+                })
+                .map_err(|error| error.to_string());
+        }
+        return Err("task is not ready for closure".to_owned());
+    }
+    if planned.dependencies.iter().any(|dependency| {
+        tasks
+            .get(dependency)
+            .is_none_or(|task| task.state() != workflow_core::TaskState::Completed)
+    }) {
+        return Err("task dependencies are not completed".to_owned());
+    }
+    let ready_dependents = architecture
+        .tasks
+        .iter()
+        .filter(|task| {
+            tasks
+                .get(&task.id)
+                .is_some_and(|state| state.state() == workflow_core::TaskState::Pending)
+                && task.dependencies.iter().all(|dependency| {
+                    *dependency == report.task_id
+                        || tasks.get(dependency).is_some_and(|state| {
+                            state.state() == workflow_core::TaskState::Completed
+                        })
+                })
+        })
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    store
+        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id: report.workflow_id,
+            task_id: report.task_id,
+            receipt_id: report.receipt_id,
+            payload_digest: closure_payload_digest(report)?,
+            repair_cycle: workflow.repair_cycles(),
+            ready_dependents: &ready_dependents,
+            timestamp: workflow_core::WorkflowTimestamp::now(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn validate_task_review_coverage(
+    task: &workflow_core::PlannedTask,
+    architecture: &workflow_core::ArchitecturePlan,
+    verdict: &workflow_ipc::protocol::TaskClosureReviewerVerdict,
+    evidence: &std::collections::BTreeSet<workflow_core::EvidenceId>,
+) -> Result<(), String> {
+    use workflow_ipc::protocol::TaskClosureCoverageStatus;
+    let required: std::collections::BTreeSet<_> = task.requirement_ids.iter().cloned().collect();
+    let mut covered = std::collections::BTreeSet::new();
+    for decision in &verdict.requirements {
+        if decision.status != TaskClosureCoverageStatus::Satisfied
+            || !covered.insert(decision.requirement_id.clone())
+            || !required.contains(&decision.requirement_id)
+            || !valid_coverage_evidence(&decision.evidence_ids, evidence)
+        {
+            return Err("task review requirement coverage is invalid".to_owned());
+        }
+    }
+    if covered != required {
+        return Err("task review requirement coverage is incomplete".to_owned());
+    }
+
+    let mut expected_criteria = std::collections::BTreeSet::new();
+    for index in 0..task.acceptance_criteria.len() {
+        expected_criteria.insert(format!("task:{}:acceptance:{}", task.id, index + 1));
+    }
+    for requirement in architecture
+        .requirements
+        .iter()
+        .filter(|requirement| required.contains(&requirement.id))
+    {
+        for index in 0..requirement.acceptance_criteria.len() {
+            expected_criteria.insert(format!(
+                "requirement:{}:acceptance:{}",
+                requirement.id,
+                index + 1
+            ));
+        }
+    }
+    let mut covered_criteria = std::collections::BTreeSet::new();
+    for decision in &verdict.criteria {
+        if decision.status != TaskClosureCoverageStatus::Satisfied
+            || !covered_criteria.insert(decision.criterion_id.clone())
+            || !expected_criteria.contains(&decision.criterion_id)
+            || !valid_coverage_evidence(&decision.evidence_ids, evidence)
+        {
+            return Err("task review acceptance-criterion coverage is invalid".to_owned());
+        }
+    }
+    if covered_criteria != expected_criteria {
+        return Err("task review acceptance-criterion coverage is incomplete".to_owned());
+    }
+    Ok(())
+}
+
+fn valid_coverage_evidence(
+    values: &[workflow_core::EvidenceId],
+    known: &std::collections::BTreeSet<workflow_core::EvidenceId>,
+) -> bool {
+    !values.is_empty()
+        && values.len() <= 256
+        && values.iter().all(|value| known.contains(value))
+        && values
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == values.len()
+}
+
+fn closure_payload_digest(
+    report: &workflow_ipc::protocol::TaskClosureReport,
+) -> Result<workflow_core::ContentDigest, String> {
+    let mut value = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| "task closure payload serialization failed".to_owned())?
+        .remove("receipt_id");
+    serde_json::to_vec(&value)
+        .map(|value| workflow_core::ContentDigest::of(&value))
+        .map_err(|error| error.to_string())
+}
+
+fn valid_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn task_state(state: workflow_core::TaskState) -> Result<String, String> {
+    serde_json::to_value(state)
+        .map_err(|error| error.to_string())?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "task state serialization failed".to_owned())
 }
 
 fn submit_arbitration(
@@ -1873,6 +2192,23 @@ fn accept_architecture(
         ));
     }
     let timestamp = workflow_core::WorkflowTimestamp::now();
+    let previous = store
+        .load_architecture(workflow_id)
+        .map_err(|error| ("architecture_rejected", error.to_string()))?;
+    if let Some(previous) = previous.as_ref().filter(|previous| *previous != plan) {
+        let previous_ids: std::collections::BTreeSet<_> =
+            previous.tasks.iter().map(|task| task.id).collect();
+        if plan
+            .tasks
+            .iter()
+            .any(|task| previous_ids.contains(&task.id))
+        {
+            return Err((
+                "architecture_rejected",
+                "a repaired architecture must assign fresh task identifiers".to_owned(),
+            ));
+        }
+    }
     store
         .save_architecture_once(workflow_id, plan, timestamp)
         .map_err(|error| ("architecture_rejected", error.to_string()))?;

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use workflow_core::{
     CandidateId, CandidateManifest, ContentDigest, EvidenceId, EvidenceRecord, GoalId,
-    ProtocolEnvelope, ReceiptId, UserRoutingPreference, VerificationPlanId, WorkflowId,
+    ProtocolEnvelope, ReceiptId, TaskId, UserRoutingPreference, VerificationPlanId, WorkflowId,
     WorkflowMode,
 };
 
@@ -65,6 +65,114 @@ pub enum AdmissionOperation {
 pub enum ExecutionOutcome {
     Blocked,
     PlanDefect,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureCommandStatus {
+    Failed,
+    Passed,
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureReviewDecision {
+    Approved,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureCoverageStatus {
+    Satisfied,
+    Unsatisfied,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureFindingSeverity {
+    Critical,
+    High,
+    Info,
+    Low,
+    Medium,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureRepairTarget {
+    Architecture,
+    Execution,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureCommandReceipt {
+    pub evidence_id: EvidenceId,
+    pub exit_code: i32,
+    pub invocation: String,
+    pub output_digest: ContentDigest,
+    pub status: TaskClosureCommandStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureReviewerReceipt {
+    pub verdict: TaskClosureReviewerVerdict,
+    pub verdict_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureRequirementDecision {
+    pub evidence_ids: Vec<EvidenceId>,
+    pub requirement_id: String,
+    pub status: TaskClosureCoverageStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureCriterionDecision {
+    pub criterion_id: String,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub status: TaskClosureCoverageStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureFinding {
+    pub evidence_ids: Vec<EvidenceId>,
+    pub severity: TaskClosureFindingSeverity,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureReviewerVerdict {
+    pub criteria: Vec<TaskClosureCriterionDecision>,
+    pub decision: TaskClosureReviewDecision,
+    pub findings: Vec<TaskClosureFinding>,
+    pub repair_target: Option<TaskClosureRepairTarget>,
+    pub requirements: Vec<TaskClosureRequirementDecision>,
+    pub revision: String,
+    pub task_id: TaskId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClosureReport {
+    pub architecture_digest: ContentDigest,
+    pub base_revision: String,
+    pub changed_paths: Vec<String>,
+    pub commands: Vec<TaskClosureCommandReceipt>,
+    pub project_key: String,
+    pub receipt_id: ReceiptId,
+    pub request_digest: ContentDigest,
+    pub reviewer: TaskClosureReviewerReceipt,
+    pub submitted_revision: String,
+    pub task_id: TaskId,
+    pub workflow_id: WorkflowId,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -213,6 +321,10 @@ pub enum ClientMessage {
         request_id: u64,
         workflow_id: WorkflowId,
     },
+    ReportTaskClosure {
+        report: Box<TaskClosureReport>,
+        request_id: u64,
+    },
     Request(IpcRequest),
     SubmitReview {
         candidate_id: CandidateId,
@@ -253,6 +365,9 @@ pub enum ServerMessage {
         request_id: u64,
         workflow_id: WorkflowId,
         workflow_state: String,
+    },
+    Authenticated {
+        protocol_version: u16,
     },
     Challenge(Challenge),
     CandidateFrozen {
@@ -308,6 +423,13 @@ pub enum ServerMessage {
         request_id: u64,
         workflow_id: WorkflowId,
         workflow_state: String,
+    },
+    TaskClosureRecorded {
+        duplicate: bool,
+        request_id: u64,
+        task_id: TaskId,
+        task_state: String,
+        workflow_id: WorkflowId,
     },
     VerificationCompleted {
         candidate_id: CandidateId,

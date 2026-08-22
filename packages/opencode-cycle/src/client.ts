@@ -9,6 +9,7 @@ import { createRequire } from "node:module"
 
 import type { ReviewVerdictInput } from "./orchestration/reviewers.js"
 import type { ArbiterVerdictInput } from "./orchestration/arbiter.js"
+import type { TaskReviewVerdict } from "./orchestration/task-review.js"
 
 const AUTH_DOMAIN = Buffer.from("opencode-cycle-ipc-auth-v1")
 const MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -289,6 +290,34 @@ export interface ArchitecturePlanInput {
     readonly verification_commands: readonly string[]
     readonly write_scopes: readonly string[]
   }[]
+}
+
+export interface TaskClosureReportInput {
+  readonly architecture_digest: string
+  readonly base_revision: string
+  readonly changed_paths: readonly string[]
+  readonly commands: readonly {
+    readonly evidence_id: string
+    readonly exit_code: number
+    readonly invocation: string
+    readonly output_digest: string
+    readonly status: "failed" | "passed" | "timeout"
+  }[]
+  readonly receipt_id: string
+  readonly request_digest: string
+  readonly reviewer: {
+    readonly verdict: TaskReviewVerdict
+    readonly verdict_digest: string
+  }
+  readonly submitted_revision: string
+  readonly task_id: string
+}
+
+export interface TaskClosureReceipt {
+  readonly duplicate: boolean
+  readonly taskId: string
+  readonly taskState: "completed"
+  readonly workflowId: string
 }
 
 export class ControlPlaneError extends Error {
@@ -1147,10 +1176,36 @@ export class LocalControlPlane {
     return data.workflow_state
   }
 
+  async reportTaskClosure(
+    projectKey: string,
+    workflowId: string,
+    report: TaskClosureReportInput,
+  ): Promise<TaskClosureReceipt> {
+    await this.health()
+    validateTaskClosureReport(projectKey, workflowId, report)
+    const data = await this.#exchange(18, "report_task_closure", "task_closure_recorded", {
+      report: { ...report, project_key: projectKey, workflow_id: workflowId },
+    })
+    if (
+      data.workflow_id !== workflowId ||
+      data.task_id !== report.task_id ||
+      data.task_state !== "completed" ||
+      typeof data.duplicate !== "boolean"
+    ) {
+      throw new ControlPlaneError("workflowd returned a malformed task closure receipt")
+    }
+    return {
+      duplicate: data.duplicate,
+      taskId: report.task_id,
+      taskState: "completed",
+      workflowId,
+    }
+  }
+
   async #query(secret: Buffer): Promise<ControlPlaneHealth> {
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(encodeFrame({ data: { request_id: 1 }, type: "health" }))
+      await writeJson(socket, { data: { request_id: 1 }, type: "health" })
       const healthMessage = asRecord(await readJson(socket, decoder))
       if (healthMessage.type !== "health") {
         throw new ControlPlaneError("workflowd returned an unexpected health response")
@@ -1180,7 +1235,7 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(encodeFrame({ data: { ...data, request_id: requestId }, type: requestType }))
+      await writeJson(socket, { data: { ...data, request_id: requestId }, type: requestType })
       const message = asRecord(await readJson(socket, decoder, timeoutMillis))
       if (message.type === "error") {
         const error = asRecord(message.data)
@@ -1211,12 +1266,18 @@ export class LocalControlPlane {
         throw new ControlPlaneError("workflowd did not send an authentication challenge")
       }
       const challenge = parseChallenge(challengeMessage.data)
-      socket.write(
-        encodeFrame({
-          data: { mac: calculateMac(secret, challenge), nonce: challenge.nonce },
-          type: "authenticate",
-        }),
-      )
+      await writeJson(socket, {
+        data: { mac: calculateMac(secret, challenge), nonce: challenge.nonce },
+        type: "authenticate",
+      })
+      const authenticated = asRecord(await readJson(socket, decoder))
+      if (authenticated.type !== "authenticated") {
+        throw new ControlPlaneError("workflowd did not acknowledge authentication")
+      }
+      const data = asRecord(authenticated.data)
+      if (data.protocol_version !== this.#expectedProtocolVersion) {
+        throw new ControlPlaneError("workflowd authentication protocol version mismatch")
+      }
       return { decoder, socket }
     } catch (error) {
       socket.destroy()
@@ -1322,6 +1383,15 @@ function encodeFrame(value: unknown): Buffer {
   return frame
 }
 
+function writeJson(socket: Socket, value: unknown): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.write(encodeFrame(value), (error) => {
+      if (error === null || error === undefined) resolve()
+      else reject(error)
+    })
+  })
+}
+
 class FrameDecoder {
   #buffer = Buffer.alloc(0)
 
@@ -1351,6 +1421,10 @@ function readJson(
   timeoutMillis = 10_000,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    if (socket.destroyed || socket.readableEnded) {
+      reject(new ControlPlaneError("workflowd disconnected before responding"))
+      return
+    }
     const cleanup = () => {
       clearTimeout(timeout)
       socket.off("data", onData)
@@ -1446,6 +1520,54 @@ function asNodeError(value: unknown): NodeJS.ErrnoException {
 
 const SHA256 = /^[0-9a-f]{64}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+
+function validateTaskClosureReport(
+  projectKey: string,
+  workflowId: string,
+  report: TaskClosureReportInput,
+): void {
+  const revision = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u
+  if (
+    !projectKey ||
+    Buffer.byteLength(projectKey) > 32_768 ||
+    !UUID.test(workflowId) ||
+    !UUID.test(report.task_id) ||
+    !UUID.test(report.receipt_id) ||
+    !SHA256.test(report.architecture_digest) ||
+    !SHA256.test(report.request_digest) ||
+    !revision.test(report.base_revision) ||
+    !revision.test(report.submitted_revision) ||
+    report.reviewer.verdict.task_id !== report.task_id ||
+    report.reviewer.verdict.revision !== report.submitted_revision ||
+    !SHA256.test(report.reviewer.verdict_digest)
+  ) {
+    throw new ControlPlaneError("task closure identity or revision binding is invalid")
+  }
+  if (
+    report.commands.length === 0 ||
+    report.commands.length > 256 ||
+    report.commands.some(
+      (command) =>
+        !UUID.test(command.evidence_id) ||
+        !SHA256.test(command.output_digest) ||
+        !Number.isSafeInteger(command.exit_code) ||
+        !command.invocation ||
+        Buffer.byteLength(command.invocation) > 4_096,
+    ) ||
+    new Set(report.commands.map((command) => command.evidence_id)).size !== report.commands.length
+  ) {
+    throw new ControlPlaneError("task closure deterministic evidence is invalid")
+  }
+  if (
+    report.changed_paths.length > 4_096 ||
+    report.changed_paths.some(
+      (path) => !path || Buffer.byteLength(path) > 4_096 || path.includes("\0"),
+    ) ||
+    new Set(report.changed_paths).size !== report.changed_paths.length
+  ) {
+    throw new ControlPlaneError("task closure changed-path evidence is invalid")
+  }
+}
 
 function parseCandidateManifest(value: unknown): CandidateManifestInput {
   const manifest = asRecord(value)

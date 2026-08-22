@@ -306,7 +306,7 @@ impl Workflow {
                 Ok(self.transition(previous))
             }
             WorkflowCommand::ReplanExecution if self.state == WorkflowState::Execution => {
-                Ok(self.transition(WorkflowState::Architecture))
+                self.reject(RepairTarget::Architecture)
             }
             _ => Err(TransitionError::InvalidTransition),
         }

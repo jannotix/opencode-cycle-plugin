@@ -24,6 +24,7 @@ for (const mode of ["full", "quick"] as const) {
   const launchedVariants = new Map<string, string>()
   const controller = new AbortController()
   const childSignals: (AbortSignal | undefined)[] = []
+  const taskClosures: unknown[] = []
   const client = {
     session: {
       async create(options: { body: { title: string }; signal?: AbortSignal }) {
@@ -172,6 +173,15 @@ for (const mode of ["full", "quick"] as const) {
     async reportExecution() {
       throw new Error("Execution reporting was not expected")
     },
+    async reportTaskClosure(_projectKey: string, _workflowId: string, report: unknown) {
+      taskClosures.push(report)
+      return {
+        duplicate: false,
+        taskId: (report as { task_id: string }).task_id,
+        taskState: "completed",
+        workflowId: _workflowId,
+      }
+    },
     async submitArchitecture() {},
     async submitArbitration() {
       return {
@@ -258,6 +268,17 @@ for (const mode of ["full", "quick"] as const) {
     expect(architectPrompts[1]).toContain("at least one write scope")
     expect(executorRuns).toBe(3)
     expect(taskReviewRuns).toBe(3)
+    expect(taskClosures).toHaveLength(2)
+    expect(taskClosures[0]).toMatchObject({
+      architecture_digest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      commands: [
+        expect.objectContaining({ exit_code: 0, invocation: "rustc --version", status: "passed" }),
+      ],
+      reviewer: {
+        verdict: expect.objectContaining({ decision: "approved" }),
+        verdict_digest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+    })
     expect(arbiterRuns).toBe(2)
     expect(verificationAttestations).toHaveLength(2)
     expect(verificationAttestations[0]).toEqual([

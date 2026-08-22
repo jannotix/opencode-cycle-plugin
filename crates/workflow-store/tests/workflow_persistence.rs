@@ -2,7 +2,8 @@ use std::{num::NonZeroUsize, path::Path};
 
 use tempfile::TempDir;
 use workflow_core::{
-    TaskCommand, TaskId, TaskState, WorkflowCommand, WorkflowId, WorkflowState, WorkflowTimestamp,
+    ContentDigest, ReceiptId, TaskCommand, TaskId, TaskState, WorkflowCommand, WorkflowId,
+    WorkflowState, WorkflowTimestamp,
 };
 use workflow_store::{Store, StoreError};
 
@@ -169,4 +170,186 @@ fn keys_and_task_identifiers_cannot_cross_aggregate_boundaries() {
         ),
         Err(StoreError::IdempotencyConflict)
     ));
+}
+
+#[test]
+fn verified_task_closure_is_atomic_payload_bound_and_advances_dependents() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("workflow.db");
+    let workflow_id = WorkflowId::new();
+    let root = TaskId::new();
+    let dependent = TaskId::new();
+    let receipt_id = ReceiptId::new();
+    let payload_digest = ContentDigest::of(b"closure-payload");
+    let timestamp = WorkflowTimestamp::now();
+    let mut store = open(&path);
+    store
+        .apply_workflow_command(
+            workflow_id,
+            "workflow",
+            WorkflowCommand::CompleteIntake,
+            timestamp,
+        )
+        .unwrap();
+
+    store
+        .seed_architecture_tasks(
+            workflow_id,
+            &[(root, true), (dependent, false)],
+            &[],
+            timestamp,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_task(root).unwrap().unwrap().state(),
+        TaskState::Ready
+    );
+    assert_eq!(
+        store.load_task(dependent).unwrap().unwrap().state(),
+        TaskState::Pending
+    );
+
+    let completed = store
+        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id,
+            payload_digest,
+            repair_cycle: 0,
+            ready_dependents: &[dependent],
+            timestamp,
+        })
+        .unwrap();
+    assert!(!completed.duplicate);
+    assert_eq!(completed.state.state(), TaskState::Completed);
+    assert_eq!(
+        store.load_task(dependent).unwrap().unwrap().state(),
+        TaskState::Ready
+    );
+    let event_count: u32 = store
+        .writer()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE aggregate_type = 'task'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let duplicate = store
+        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id,
+            payload_digest,
+            repair_cycle: 0,
+            ready_dependents: &[dependent],
+            timestamp,
+        })
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.state.state(), TaskState::Completed);
+    let duplicate_event_count: u32 = store
+        .writer()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE aggregate_type = 'task'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(duplicate_event_count, event_count);
+
+    let semantic_duplicate = store
+        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id: ReceiptId::new(),
+            payload_digest,
+            repair_cycle: 0,
+            ready_dependents: &[dependent],
+            timestamp,
+        })
+        .unwrap();
+    assert!(semantic_duplicate.duplicate);
+    assert_eq!(semantic_duplicate.state.state(), TaskState::Completed);
+
+    assert!(matches!(
+        store.complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id,
+            payload_digest: ContentDigest::of(b"different-payload"),
+            repair_cycle: 0,
+            ready_dependents: &[dependent],
+            timestamp,
+        }),
+        Err(StoreError::IdempotencyConflict)
+    ));
+
+    let repaired = store
+        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id: ReceiptId::new(),
+            payload_digest: ContentDigest::of(b"later-repair-payload"),
+            repair_cycle: 1,
+            ready_dependents: &[],
+            timestamp,
+        })
+        .unwrap();
+    assert!(!repaired.duplicate);
+    assert_eq!(repaired.state.state(), TaskState::Completed);
+    assert!(repaired.events.iter().any(|event| matches!(
+        event,
+        workflow_core::TaskEvent::StateChanged {
+            from: TaskState::Completed,
+            to: TaskState::Ready
+        }
+    )));
+    assert!(matches!(
+        store.complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+            workflow_id,
+            task_id: root,
+            receipt_id: ReceiptId::new(),
+            payload_digest: ContentDigest::of(b"same-cycle-altered-payload"),
+            repair_cycle: 1,
+            ready_dependents: &[],
+            timestamp,
+        }),
+        Err(StoreError::IdempotencyConflict)
+    ));
+}
+
+#[test]
+fn architecture_task_reseed_cancels_only_superseded_nonterminal_tasks() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("workflow.db");
+    let workflow_id = WorkflowId::new();
+    let old = TaskId::new();
+    let replacement = TaskId::new();
+    let timestamp = WorkflowTimestamp::now();
+    let mut store = open(&path);
+    store
+        .apply_workflow_command(
+            workflow_id,
+            "workflow",
+            WorkflowCommand::CompleteIntake,
+            timestamp,
+        )
+        .unwrap();
+    store
+        .seed_architecture_tasks(workflow_id, &[(old, true)], &[], timestamp)
+        .unwrap();
+    store
+        .seed_architecture_tasks(workflow_id, &[(replacement, true)], &[], timestamp)
+        .unwrap();
+    assert_eq!(
+        store.load_task(old).unwrap().unwrap().state(),
+        TaskState::Cancelled
+    );
+    assert_eq!(
+        store.load_task(replacement).unwrap().unwrap().state(),
+        TaskState::Ready
+    );
 }

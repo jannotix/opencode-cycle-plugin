@@ -1,4 +1,5 @@
 import type { PluginInput } from "@opencode-ai/plugin"
+import { randomUUID } from "node:crypto"
 
 import type { RoleModels, RoleVariants } from "../agent.js"
 import { digest, observation } from "../audit-events.js"
@@ -440,6 +441,26 @@ async function finalizeSubmittedTask(
         .join("; ") || "requirements unsatisfied"}`,
     }
   }
+  await controlPlane.reportTaskClosure(input.projectKey, input.workflowId, {
+    architecture_digest: digest(plan),
+    base_revision: result.baseRevision,
+    changed_paths: result.changedPaths,
+    commands: verification.commands.map((command) => ({
+      evidence_id: command.id,
+      exit_code: command.exitCode ?? -1,
+      invocation: command.invocation,
+      output_digest: command.outputDigest,
+      status: command.status,
+    })),
+    receipt_id: randomUUID(),
+    request_digest: input.requestDigest,
+    reviewer: {
+      verdict: review.verdict,
+      verdict_digest: digest(review.verdict),
+    },
+    submitted_revision: result.revision,
+    task_id: result.taskId,
+  })
   return { ...result, status: "completed" }
 }
 

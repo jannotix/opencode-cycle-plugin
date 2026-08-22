@@ -200,3 +200,74 @@ fn task_completion_requires_successful_mandatory_verification_and_reviewer_appro
         }
     }
 }
+
+#[test]
+fn execution_replan_consumes_an_architecture_repair_cycle() {
+    let mut workflow = Workflow::default();
+    workflow.apply(WorkflowCommand::CompleteIntake).unwrap();
+    workflow
+        .apply(WorkflowCommand::Route(WorkflowMode::Full))
+        .unwrap();
+    workflow
+        .apply(WorkflowCommand::ArchitectureAccepted)
+        .unwrap();
+
+    let events = workflow.apply(WorkflowCommand::ReplanExecution).unwrap();
+    assert_eq!(workflow.state(), WorkflowState::Repair);
+    assert_eq!(workflow.repair_cycles(), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        workflow_core::WorkflowEvent::RepairCycleConsumed {
+            cycle: 1,
+            maximum: 5
+        }
+    )));
+    workflow.apply(WorkflowCommand::BeginRepair).unwrap();
+    assert_eq!(workflow.state(), WorkflowState::Architecture);
+}
+
+#[test]
+fn execution_replan_exhausts_the_same_bounded_repair_budget() {
+    let mut workflow = Workflow::default();
+    workflow.apply(WorkflowCommand::CompleteIntake).unwrap();
+    workflow
+        .apply(WorkflowCommand::Route(WorkflowMode::Full))
+        .unwrap();
+    workflow
+        .apply(WorkflowCommand::ArchitectureAccepted)
+        .unwrap();
+
+    for cycle in 1..=5 {
+        workflow.apply(WorkflowCommand::ReplanExecution).unwrap();
+        assert_eq!(workflow.repair_cycles(), cycle);
+        if cycle < 5 {
+            assert_eq!(workflow.state(), WorkflowState::Repair);
+            workflow.apply(WorkflowCommand::BeginRepair).unwrap();
+            workflow
+                .apply(WorkflowCommand::ArchitectureAccepted)
+                .unwrap();
+        }
+    }
+    assert_eq!(workflow.state(), WorkflowState::Blocked);
+}
+
+#[test]
+fn completed_task_reopens_only_through_an_explicit_repair_command() {
+    let mut task = Task::new();
+    for command in [
+        TaskCommand::DependenciesSatisfied,
+        TaskCommand::Lease,
+        TaskCommand::Start,
+        TaskCommand::SubmitCandidate,
+        TaskCommand::VerificationPassed {
+            mandatory_gates_passed: true,
+            reviewer_approved: true,
+        },
+    ] {
+        task.apply(command).unwrap();
+    }
+    assert_eq!(task.state(), TaskState::Completed);
+    assert!(task.apply(TaskCommand::Lease).is_err());
+    task.apply(TaskCommand::RepairRequested).unwrap();
+    assert_eq!(task.state(), TaskState::Ready);
+}

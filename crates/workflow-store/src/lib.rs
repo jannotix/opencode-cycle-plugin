@@ -17,7 +17,7 @@ pub use candidates::{CandidateFilePayload, StoredCandidate};
 pub use goals::{GoalApplyResult, GoalPlanRecord};
 pub use leases::LeaseAcquisition;
 pub use paths::{DataPaths, PathError, Platform, ProjectIdentity};
-pub use tasks::TaskApplyResult;
+pub use tasks::{TaskApplyResult, VerifiedTaskClosure};
 pub use workflows::WorkflowApplyResult;
 
 use std::{
