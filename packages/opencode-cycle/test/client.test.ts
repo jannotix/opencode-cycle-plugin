@@ -13,6 +13,10 @@ import {
 
 function frame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value))
+  return framePayload(payload)
+}
+
+function framePayload(payload: Buffer): Buffer {
   const result = Buffer.alloc(4 + payload.length)
   result.writeUInt32BE(payload.length)
   payload.copy(result, 4)
@@ -133,6 +137,171 @@ test("a phase read is armed before a synchronous response to its write", async (
     reader.dispose()
     socket.destroy()
   }
+})
+
+test("a valid phase response followed by an oversized frame rejects the whole chunk", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  const oversized = Buffer.alloc(4)
+  oversized.writeUInt32BE(MAX_IPC_FRAME_BYTES + 1)
+  installSynchronousWrite(socket, () => {
+    socket.emit(
+      "data",
+      Buffer.concat([frame({ data: { request_id: 1 }, type: "health" }), oversized]),
+    )
+  })
+
+  const failure = await phase(reader, { type: "health" }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toBe("workflowd sent an invalid IPC frame size")
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("a valid phase response followed by malformed JSON rejects the whole chunk", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  installSynchronousWrite(socket, () => {
+    socket.emit(
+      "data",
+      Buffer.concat([
+        frame({ data: { request_id: 1 }, type: "health" }),
+        framePayload(Buffer.from("{")),
+      ]),
+    )
+  })
+
+  const failure = await phase(reader, { type: "health" }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(SyntaxError)
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("a valid phase response followed by another frame is a protocol-order violation", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  installSynchronousWrite(socket, () => {
+    socket.emit(
+      "data",
+      Buffer.concat([
+        frame({ data: { request_id: 1 }, type: "health" }),
+        frame({ data: { request_id: 2 }, type: "health" }),
+      ]),
+    )
+  })
+
+  const failure = await phase(reader, { type: "health" }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toBe(
+    "workflowd sent more than one IPC frame for a protocol phase",
+  )
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("a valid phase response followed by partial trailing data rejects the whole chunk", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  const trailing = frame({ data: { request_id: 2 }, type: "health" })
+  installSynchronousWrite(socket, () => {
+    socket.emit(
+      "data",
+      Buffer.concat([
+        frame({ data: { request_id: 1 }, type: "health" }),
+        trailing.subarray(0, 3),
+      ]),
+    )
+  })
+
+  const failure = await phase(reader, { type: "health" }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toBe(
+    "workflowd sent more than one IPC frame for a protocol phase",
+  )
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("a fragmented single phase response commits only after its final chunk", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  const response = { data: { request_id: 1 }, type: "health" }
+  const encoded = frame(response)
+  installSynchronousWrite(socket, () => {
+    socket.emit("data", encoded.subarray(0, 7))
+    socket.emit("data", encoded.subarray(7))
+  })
+
+  try {
+    await expect(phase(reader, { type: "health" })).resolves.toEqual(response)
+  } finally {
+    reader.dispose()
+    socket.destroy()
+  }
+})
+
+test("a passive pending read is not published before a queue-overflow tail is validated", async () => {
+  const socket = new Socket()
+  const reader = readerWithLimits(socket, { maxQueuedBytes: 1_024, maxQueuedFrames: 3 })
+  const pending = reader.read()
+  socket.emit(
+    "data",
+    Buffer.concat([
+      frame({ id: 0 }),
+      frame({ id: 1 }),
+      frame({ id: 2 }),
+      frame({ id: 3 }),
+      frame({ id: 4 }),
+    ]),
+  )
+
+  const failure = await pending.catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toBe("workflowd exceeded the queued IPC frame limit")
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("a passive pending read is not published before an aggregate-byte overflow tail", async () => {
+  const socket = new Socket()
+  const queuedFirst = frame({ value: "first" })
+  const queuedSecond = frame({ value: "second" })
+  const reader = readerWithLimits(socket, {
+    maxQueuedBytes: queuedFirst.length + queuedSecond.length - 1,
+    maxQueuedFrames: 3,
+  })
+  const pending = reader.read()
+  socket.emit("data", Buffer.concat([frame({ id: 0 }), queuedFirst, queuedSecond]))
+
+  const failure = await pending.catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toBe("workflowd exceeded the queued IPC byte limit")
+  expect(await reader.read().catch((error: unknown) => error)).toBe(failure)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
+})
+
+test("partial IPC data queued before a protocol phase is rejected without writing", async () => {
+  const socket = new Socket()
+  const reader = new IpcFrameReader(socket)
+  const premature = frame({ data: { protocol_version: 1 }, type: "authenticated" })
+  let writes = 0
+  installSynchronousWrite(socket, () => {
+    writes += 1
+  })
+  socket.emit("data", premature.subarray(0, 3))
+
+  await expect(phase(reader, { type: "authenticate" })).rejects.toThrow(
+    "workflowd sent an IPC frame before the client initiated the protocol phase",
+  )
+  expect(writes).toBe(0)
+  expectReaderListenersDetached(socket)
+  socket.destroy()
 })
 
 test("fragmented and coalesced frames remain ordered", async () => {

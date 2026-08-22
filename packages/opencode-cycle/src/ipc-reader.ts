@@ -23,6 +23,7 @@ export interface IpcConnectOptions {
 }
 
 interface PendingRead {
+  readonly kind: "passive" | "phase"
   readonly reject: (error: Error) => void
   readonly resolve: (message: unknown) => void
   readonly timeout: ReturnType<typeof setTimeout>
@@ -31,6 +32,17 @@ interface PendingRead {
 interface QueuedFrame {
   readonly encodedBytes: number
   readonly message: unknown
+}
+
+interface DecodeBudget {
+  readonly maxQueuedBytes: number
+  readonly maxQueuedFrames: number
+  readonly pendingKind: "none" | PendingRead["kind"]
+}
+
+interface StagedDecode {
+  readonly frames: readonly QueuedFrame[]
+  readonly residue: Buffer
 }
 
 type ReadOutcome =
@@ -53,28 +65,29 @@ export class IpcFrameReader {
 
   readonly #onData = (chunk: Buffer): void => {
     try {
-      this.#decoder.feed(chunk, (frame) => {
-        if (this.#terminalError !== undefined) return false
-        const pending = this.#pendingRead
-        if (pending === undefined) {
-          const queuedBytes = this.#queuedBytes + frame.encodedBytes
-          if (queuedBytes > this.#limits.maxQueuedBytes) {
-            this.#terminate(this.#errorFactory("workflowd exceeded the queued IPC byte limit"))
-            return false
-          }
-          if (this.#messages.length >= this.#limits.maxQueuedFrames) {
-            this.#terminate(this.#errorFactory("workflowd exceeded the queued IPC frame limit"))
-            return false
-          }
-          this.#messages.push(frame)
-          this.#queuedBytes = queuedBytes
-        } else {
-          this.#pendingRead = undefined
-          clearTimeout(pending.timeout)
-          pending.resolve(frame.message)
-        }
-        return true
+      const pending = this.#pendingRead
+      const staged = this.#decoder.stage(chunk, {
+        maxQueuedBytes: this.#limits.maxQueuedBytes - this.#queuedBytes,
+        maxQueuedFrames: this.#limits.maxQueuedFrames - this.#messages.length,
+        pendingKind: pending?.kind ?? "none",
       })
+      this.#decoder.commit(staged)
+      if (staged.frames.length === 0) return
+
+      const queueStart = pending === undefined ? 0 : 1
+      for (let index = queueStart; index < staged.frames.length; index += 1) {
+        const frame = staged.frames[index]
+        if (frame === undefined) continue
+        this.#messages.push(frame)
+        this.#queuedBytes += frame.encodedBytes
+      }
+      if (pending !== undefined) {
+        const response = staged.frames[0]
+        if (response === undefined) return
+        this.#pendingRead = undefined
+        clearTimeout(pending.timeout)
+        pending.resolve(response.message)
+      }
     } catch (error) {
       this.#terminate(error instanceof Error ? error : new Error(String(error)))
     }
@@ -122,7 +135,7 @@ export class IpcFrameReader {
     if (this.#pendingRead !== undefined) {
       return Promise.reject(this.#errorFactory("concurrent workflowd reads are not supported"))
     }
-    return this.#waitForFrame(timeoutMillis)
+    return this.#waitForFrame(timeoutMillis, "passive")
   }
 
   async writeAndRead(frame: Buffer, timeoutMillis = 10_000): Promise<unknown> {
@@ -153,23 +166,23 @@ export class IpcFrameReader {
     if (this.#pendingRead !== undefined) {
       throw this.#errorFactory("concurrent workflowd reads are not supported")
     }
-    if (this.#messages.length !== 0) {
+    if (this.#messages.length !== 0 || this.#decoder.bufferedBytes !== 0) {
       const error = this.#errorFactory(
         "workflowd sent an IPC frame before the client initiated the protocol phase",
       )
       this.#terminate(error)
       throw error
     }
-    return this.#waitForFrame(timeoutMillis)
+    return this.#waitForFrame(timeoutMillis, "phase")
   }
 
-  #waitForFrame(timeoutMillis: number): Promise<unknown> {
+  #waitForFrame(timeoutMillis: number, kind: PendingRead["kind"]): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         if (this.#pendingRead?.timeout !== timeout) return
         this.#terminate(this.#errorFactory("workflowd response timed out"))
       }, timeoutMillis)
-      this.#pendingRead = { reject, resolve, timeout }
+      this.#pendingRead = { kind, reject, resolve, timeout }
     })
   }
 
@@ -253,7 +266,7 @@ function waitForConnect(
 
 class FrameDecoder {
   readonly #errorFactory: ErrorFactory
-  #buffer = Buffer.alloc(0)
+  #buffer: Buffer = Buffer.alloc(0)
 
   constructor(errorFactory: ErrorFactory) {
     this.#errorFactory = errorFactory
@@ -263,27 +276,61 @@ class FrameDecoder {
     this.#buffer = Buffer.alloc(0)
   }
 
-  feed(chunk: Buffer, onFrame: (frame: QueuedFrame) => boolean): void {
-    this.#buffer = Buffer.concat([this.#buffer, chunk])
-    while (this.#buffer.length >= 4) {
-      const length = this.#buffer.readUInt32BE(0)
+  get bufferedBytes(): number {
+    return this.#buffer.length
+  }
+
+  commit(staged: StagedDecode): void {
+    this.#buffer = staged.residue
+  }
+
+  stage(chunk: Buffer, budget: DecodeBudget): StagedDecode {
+    const source = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk])
+    const frames: QueuedFrame[] = []
+    let offset = 0
+    let stagedQueuedBytes = 0
+    let stagedQueuedFrames = 0
+    while (source.length - offset >= 4) {
+      const length = source.readUInt32BE(offset)
       if (length === 0 || length > MAX_IPC_FRAME_BYTES) {
         throw this.#errorFactory("workflowd sent an invalid IPC frame size")
       }
-      if (this.#buffer.length < 4 + length) break
-      const payload = this.#buffer.subarray(4, 4 + length)
-      this.#buffer = this.#buffer.subarray(4 + length)
-      if (
-        !onFrame({
-          encodedBytes: 4 + length,
-          message: JSON.parse(payload.toString("utf8")),
-        })
-      ) {
-        return
+      const encodedBytes = 4 + length
+      if (source.length - offset < encodedBytes) break
+      const payload = source.subarray(offset + 4, offset + encodedBytes)
+      const deliversPending = budget.pendingKind !== "none" && frames.length === 0
+      if (!deliversPending && budget.pendingKind !== "phase") {
+        if (stagedQueuedBytes + encodedBytes > budget.maxQueuedBytes) {
+          throw this.#errorFactory("workflowd exceeded the queued IPC byte limit")
+        }
+        if (stagedQueuedFrames >= budget.maxQueuedFrames) {
+          throw this.#errorFactory("workflowd exceeded the queued IPC frame limit")
+        }
       }
+      const message = JSON.parse(payload.toString("utf8"))
+      if (!deliversPending && budget.pendingKind === "phase") {
+        throw this.#errorFactory("workflowd sent more than one IPC frame for a protocol phase")
+      }
+      if (!deliversPending) {
+        stagedQueuedBytes += encodedBytes
+        stagedQueuedFrames += 1
+      }
+      frames.push({ encodedBytes, message })
+      offset += encodedBytes
     }
-    if (this.#buffer.length > MAX_IPC_FRAME_BYTES + 4) {
+    const residueView = source.subarray(offset)
+    if (residueView.length > MAX_IPC_FRAME_BYTES + 4) {
       throw this.#errorFactory("workflowd exceeded the IPC buffer limit")
     }
+    if (budget.pendingKind === "phase" && frames.length !== 0 && residueView.length !== 0) {
+      throw this.#errorFactory("workflowd sent more than one IPC frame for a protocol phase")
+    }
+    const residue =
+      residueView.length === 0
+        ? Buffer.alloc(0)
+        : offset === 0
+          ? source
+          : Buffer.from(residueView)
+    return { frames, residue }
   }
 }
