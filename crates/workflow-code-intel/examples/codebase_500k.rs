@@ -23,6 +23,8 @@ use workflow_core::ProjectId;
 const DEFAULT_SOURCE_FILES: u64 = 500_100;
 const DEFAULT_IGNORED_FILES: u64 = 20_000;
 const FILES_PER_PARTITION: u64 = 1_000;
+const GENERATION_WORKERS_PER_CPU: usize = 16;
+const MAX_GENERATION_WORKERS: usize = 128;
 const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const EXTENSIONS: &[&str] = &[
     "ts", "tsx", "py", "rs", "go", "java", "kt", "cs", "c", "cpp", "php", "rb", "swift", "dart",
@@ -362,11 +364,21 @@ fn value(arguments: &[String], index: usize) -> &str {
 }
 
 fn generate_corpus(root: &Path, source_files: u64, ignored_files: u64) -> u64 {
-    let partitions = source_files.div_ceil(FILES_PER_PARTITION);
     let available_workers = thread::available_parallelism()
         .map(NonZeroUsize::get)
         .unwrap_or(1);
     let worker_count = generation_worker_count(source_files, available_workers);
+    generate_corpus_with_workers(root, source_files, ignored_files, worker_count)
+}
+
+fn generate_corpus_with_workers(
+    root: &Path,
+    source_files: u64,
+    ignored_files: u64,
+    worker_count: usize,
+) -> u64 {
+    let partitions = source_files.div_ceil(FILES_PER_PARTITION);
+    assert!(worker_count > 0, "generation worker count must be positive");
     let next_partition = AtomicU64::new(0);
     let generated_bytes = AtomicU64::new(0);
     thread::scope(|scope| {
@@ -415,7 +427,11 @@ fn generate_corpus(root: &Path, source_files: u64, ignored_files: u64) -> u64 {
 
 fn generation_worker_count(source_files: u64, available_workers: usize) -> usize {
     let partitions = source_files.div_ceil(FILES_PER_PARTITION);
-    usize::try_from(partitions.min(u64::try_from(available_workers.min(16)).unwrap()))
+    let io_workers = available_workers
+        .max(1)
+        .saturating_mul(GENERATION_WORKERS_PER_CPU)
+        .min(MAX_GENERATION_WORKERS);
+    usize::try_from(partitions.min(u64::try_from(io_workers).unwrap()))
         .unwrap()
         .max(1)
 }
@@ -521,10 +537,62 @@ mod tests {
 
     #[test]
     fn generation_parallelism_is_bounded_by_partitions_and_available_workers() {
-        assert_eq!(generation_worker_count(500_100, 8), 8);
+        assert_eq!(generation_worker_count(500_100, 8), 128);
         assert_eq!(generation_worker_count(1_001, 8), 2);
         assert_eq!(generation_worker_count(1, 8), 1);
-        assert_eq!(generation_worker_count(500_100, 32), 16);
+        assert_eq!(generation_worker_count(500_100, 1), 16);
+        assert_eq!(generation_worker_count(500_100, 32), 128);
+    }
+
+    #[test]
+    fn parallel_generation_is_byte_identical_to_single_worker_generation() {
+        fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+            let mut found = BTreeMap::new();
+            let mut directories = vec![root.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if path.is_dir() {
+                        directories.push(path);
+                    } else {
+                        let relative = path
+                            .strip_prefix(root)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .replace('\\', "/");
+                        found.insert(relative, fs::read(path).unwrap());
+                    }
+                }
+            }
+            found
+        }
+
+        let single = tempfile::tempdir().unwrap();
+        let parallel = tempfile::tempdir().unwrap();
+        let source_files = FILES_PER_PARTITION + 1;
+        let ignored_files = 7;
+        let single_bytes =
+            generate_corpus_with_workers(single.path(), source_files, ignored_files, 1);
+        let parallel_bytes =
+            generate_corpus_with_workers(parallel.path(), source_files, ignored_files, 2);
+        let single_files = files(single.path());
+        let parallel_files = files(parallel.path());
+
+        assert_eq!(single_bytes, parallel_bytes);
+        assert_eq!(single_files, parallel_files);
+        assert_eq!(
+            single_files.len(),
+            usize::try_from(source_files + ignored_files + 1).unwrap()
+        );
+        assert_eq!(single_files[".gitignore"], b"vendor/\n");
+        let final_extension =
+            EXTENSIONS[usize::try_from(FILES_PER_PARTITION % EXTENSIONS.len() as u64).unwrap()];
+        assert_eq!(
+            single_files[&format!("src/partition-000001/file-000001000.{final_extension}")],
+            fixture(final_extension)
+        );
     }
 
     #[test]
