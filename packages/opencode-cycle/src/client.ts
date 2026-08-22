@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomUUID } from "node:crypto"
 import { constants } from "node:fs"
 import { access, readFile } from "node:fs/promises"
-import { createConnection, type Socket } from "node:net"
+import type { Socket } from "node:net"
 import { join, posix, win32 } from "node:path"
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { once } from "node:events"
@@ -10,9 +10,9 @@ import { createRequire } from "node:module"
 import type { ReviewVerdictInput } from "./orchestration/reviewers.js"
 import type { ArbiterVerdictInput } from "./orchestration/arbiter.js"
 import type { TaskReviewVerdict } from "./orchestration/task-review.js"
+import { connectIpcSocket, MAX_IPC_FRAME_BYTES, type IpcFrameReader } from "./ipc-reader.js"
 
 const AUTH_DOMAIN = Buffer.from("opencode-cycle-ipc-auth-v1")
-const MAX_FRAME_BYTES = 8 * 1024 * 1024
 const CANDIDATE_OPERATION_TIMEOUT_MILLIS = 30 * 60_000
 const VERIFICATION_RESPONSE_TIMEOUT_MILLIS = 24 * 60 * 60_000
 const HEALTH_WAIT_MS = 15_000
@@ -1256,10 +1256,11 @@ export class LocalControlPlane {
     }
   }
 
-  async #connect(secret: Buffer): Promise<{ decoder: FrameDecoder; socket: Socket }> {
+  async #connect(secret: Buffer): Promise<{ decoder: IpcFrameReader; socket: Socket }> {
     const endpoint = this.#endpoint || namedPipePath(endpointId(secret))
-    const socket = await connectSocket(endpoint)
-    const decoder = new FrameDecoder()
+    const { reader: decoder, socket } = await connectIpcSocket(endpoint, {
+      errorFactory: (message) => new ControlPlaneError(message),
+    })
     try {
       const challengeMessage = asRecord(await readJson(socket, decoder))
       if (challengeMessage.type !== "challenge") {
@@ -1349,27 +1350,9 @@ function namedPipePath(identifier: string): string {
   return `\\\\.\\pipe\\opencode-cycle-${identifier}`
 }
 
-function connectSocket(endpoint: string): Promise<Socket> {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(endpoint)
-    const timeout = setTimeout(() => {
-      socket.destroy()
-      reject(new ControlPlaneError("local IPC connection timed out"))
-    }, 1_000)
-    socket.once("connect", () => {
-      clearTimeout(timeout)
-      resolve(socket)
-    })
-    socket.once("error", (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-  })
-}
-
 function encodeFrame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value))
-  if (payload.length === 0 || payload.length > MAX_FRAME_BYTES) {
+  if (payload.length === 0 || payload.length > MAX_IPC_FRAME_BYTES) {
     throw new ControlPlaneError("local IPC frame size is invalid")
   }
   const frame = Buffer.allocUnsafe(4 + payload.length)
@@ -1387,73 +1370,12 @@ function writeJson(socket: Socket, value: unknown): Promise<void> {
   })
 }
 
-class FrameDecoder {
-  #buffer = Buffer.alloc(0)
-
-  feed(chunk: Buffer): unknown[] {
-    this.#buffer = Buffer.concat([this.#buffer, chunk])
-    const messages: unknown[] = []
-    while (this.#buffer.length >= 4) {
-      const length = this.#buffer.readUInt32BE(0)
-      if (length === 0 || length > MAX_FRAME_BYTES) {
-        throw new ControlPlaneError("workflowd sent an invalid IPC frame size")
-      }
-      if (this.#buffer.length < 4 + length) break
-      const payload = this.#buffer.subarray(4, 4 + length)
-      this.#buffer = this.#buffer.subarray(4 + length)
-      messages.push(JSON.parse(payload.toString("utf8")))
-    }
-    if (this.#buffer.length > MAX_FRAME_BYTES + 4) {
-      throw new ControlPlaneError("workflowd exceeded the IPC buffer limit")
-    }
-    return messages
-  }
-}
-
 function readJson(
-  socket: Socket,
-  decoder: FrameDecoder,
+  _socket: Socket,
+  decoder: IpcFrameReader,
   timeoutMillis = 10_000,
 ): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    if (socket.destroyed || socket.readableEnded) {
-      reject(new ControlPlaneError("workflowd disconnected before responding"))
-      return
-    }
-    const cleanup = () => {
-      clearTimeout(timeout)
-      socket.off("data", onData)
-      socket.off("error", onError)
-      socket.off("close", onClose)
-    }
-    const onData = (chunk: Buffer) => {
-      try {
-        const [message] = decoder.feed(chunk)
-        if (message !== undefined) {
-          cleanup()
-          resolve(message)
-        }
-      } catch (error) {
-        cleanup()
-        reject(error)
-      }
-    }
-    const onError = (error: Error) => {
-      cleanup()
-      reject(error)
-    }
-    const onClose = () => {
-      cleanup()
-      reject(new ControlPlaneError("workflowd disconnected before responding"))
-    }
-    const timeout = setTimeout(() => {
-      cleanup()
-      reject(new ControlPlaneError("workflowd response timed out"))
-    }, timeoutMillis)
-    socket.on("data", onData)
-    socket.once("error", onError)
-    socket.once("close", onClose)
-  })
+  return decoder.read(timeoutMillis)
 }
 
 interface Challenge {
