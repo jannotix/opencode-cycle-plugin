@@ -68,6 +68,7 @@ Desktop.ini
 # Packaging
 dist/
 artifacts/
+candidate/
 packages/opencode-cycle/LICENSE
 packages/opencode-cycle/NOTICE
 *.map

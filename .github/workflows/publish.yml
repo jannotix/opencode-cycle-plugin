@@ -41,8 +41,10 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Download the sealed candidate
         env:
+          CANDIDATE_ARTIFACT: opencode-cycle-${{ inputs.version }}-release-candidate
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "${{ inputs.release_candidate_run_id }}" --repo "$GITHUB_REPOSITORY" --name "opencode-cycle-${{ inputs.version }}-release-candidate" --dir candidate
+          RUN_ID: ${{ inputs.release_candidate_run_id }}
+        run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CANDIDATE_ARTIFACT" --dir candidate
       - name: Verify candidate origin, contents and publication order
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,7 +83,7 @@ jobs:
           gh release create "v$VERSION" \
             candidate/artifacts/* \
             candidate/certifications/*.json \
-            candidate/certifications/scale/*.json \
+            "candidate/opencode-cycle-$VERSION.cdx.json" \
             candidate/release-manifest.json \
             candidate/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \

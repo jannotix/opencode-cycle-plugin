@@ -1,14 +1,17 @@
-import { access, readFile, readdir, writeFile } from "node:fs/promises"
+import { access, readFile, realpath, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { createRequire } from "node:module"
 
-import { NATIVE_PACKAGE_NAMES, PRODUCT_IDENTITY } from "../product-identity.js"
+import { PRODUCT_IDENTITY } from "../product-identity.js"
+import { inspectTarGz } from "../packaging/tar-archive.js"
 import {
   assertArtifactInventoryMatchesManifest,
   readReleaseManifest,
   type ReleaseArtifact,
-  verifyArtifactDirectory,
 } from "./release-manifest.js"
+import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile } from "./verified-file.js"
 
 export interface CargoMetadata {
   readonly packages: readonly {
@@ -59,6 +62,7 @@ interface BomDependency {
 }
 
 export interface CycloneDxBom {
+  readonly $schema: "http://cyclonedx.org/schema/bom-1.6.schema.json"
   readonly bomFormat: "CycloneDX"
   readonly components: readonly BomComponent[]
   readonly dependencies: readonly BomDependency[]
@@ -154,6 +158,7 @@ export function buildCycloneDxBom(
   dependencies.sort((left, right) => left.ref.localeCompare(right.ref))
 
   return {
+    $schema: "http://cyclonedx.org/schema/bom-1.6.schema.json",
     bomFormat: "CycloneDX",
     components,
     dependencies,
@@ -206,7 +211,9 @@ export async function collectJavaScriptInventory(
     const dependencies: string[] = []
     for (const name of dependencyNames) {
       const target = await resolveInstalledPackage(directory, workspaceRoot, name)
-      if (target === undefined) continue
+      if (target === undefined) {
+        throw new Error(`Required production dependency is missing: ${name}`)
+      }
       const targetManifest = JSON.parse(await readFile(join(target, "package.json"), "utf8")) as {
         name?: unknown
         version?: unknown
@@ -229,9 +236,233 @@ export async function collectJavaScriptInventory(
   )
 }
 
+interface PackedManifest {
+  readonly dependencies: Readonly<Record<string, string>>
+  readonly license: string
+  readonly name: string
+  readonly optionalDependencies: Readonly<Record<string, string>>
+  readonly version: string
+}
+
+export async function collectPackedJavaScriptInventory(
+  workspaceRoot: string,
+  artifacts: readonly VerifiedFile[],
+  releaseVersion: string,
+  lockText: string,
+): Promise<{ packages: JavaScriptPackage[]; roots: string[] }> {
+  const lock = parseBunLock(lockText)
+  const expectedNames = new Map([
+    [`opencode-cycle-${releaseVersion}.tgz`, PRODUCT_IDENTITY.mainPackage],
+    [`opencode-cycle-native-linux-x64-${releaseVersion}.tgz`, "@opencode-cycle/native-linux-x64"],
+    [`opencode-cycle-native-win32-x64-${releaseVersion}.tgz`, "@opencode-cycle/native-win32-x64"],
+  ])
+  if (artifacts.length !== expectedNames.size) {
+    throw new Error("Packed JavaScript artifact set is incomplete")
+  }
+  const packed = new Map<string, PackedManifest>()
+  for (const artifact of artifacts) {
+    const expectedName = expectedNames.get(artifact.name)
+    if (expectedName === undefined) throw new Error(`Packed JavaScript artifact is unsupported: ${artifact.name}`)
+    const entries = inspectTarGz(artifact.content)
+    const manifests = entries.filter((entry) => entry.name === "package/package.json")
+    if (manifests.length !== 1) {
+      throw new Error(`Packed artifact must contain exactly one package manifest: ${artifact.name}`)
+    }
+    const manifest = parsePackedManifest(manifests[0]?.content)
+    if (manifest.name !== expectedName || manifest.version !== releaseVersion) {
+      throw new Error(`Packed artifact identity does not match its allowlist: ${artifact.name}`)
+    }
+    assertPackedManifestAllowlist(manifest)
+    assertPackedManifestMatchesLock(manifest, lock)
+    if (packed.has(manifest.name)) throw new Error(`Packed package identity is duplicated: ${manifest.name}`)
+    packed.set(manifest.name, manifest)
+  }
+
+  const records = new Map<string, JavaScriptPackage>()
+  const visiting = new Set<string>()
+  const visit = async (name: string, issuer: string = workspaceRoot): Promise<string> => {
+    const packedManifest = packed.get(name)
+    if (packedManifest !== undefined) return `${name}@${packedManifest.version}`
+    const locked = lockedPackage(lock, name)
+    const identity = `${name}@${locked.version}`
+    if (records.has(identity)) return identity
+    if (visiting.has(name)) return identity
+    visiting.add(name)
+    const installed = await resolveInstalledPackage(issuer, workspaceRoot, name)
+    if (installed === undefined) throw new Error(`Required locked production dependency is missing: ${name}`)
+    const installedManifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8")) as {
+      license?: unknown
+      name?: unknown
+      version?: unknown
+    }
+    if (installedManifest.name !== name || installedManifest.version !== locked.version) {
+      throw new Error(`Installed dependency does not match bun.lock: ${name}`)
+    }
+    records.set(identity, {
+      dependencies: [],
+      license: typeof installedManifest.license === "string" ? installedManifest.license : null,
+      name,
+      version: locked.version,
+    })
+    const dependencies = await Promise.all(
+      Object.keys(locked.dependencies).sort().map((dependency) => visit(dependency, installed)),
+    )
+    records.set(identity, {
+      dependencies: [...new Set(dependencies)].sort(),
+      license: typeof installedManifest.license === "string" ? installedManifest.license : null,
+      name,
+      version: locked.version,
+    })
+    visiting.delete(name)
+    return identity
+  }
+
+  const roots: string[] = []
+  for (const manifest of [...packed.values()].sort((left, right) => left.name.localeCompare(right.name))) {
+    const dependencyNames = [
+      ...Object.keys(manifest.dependencies),
+      ...Object.keys(manifest.optionalDependencies),
+    ].sort()
+    const dependencies = await Promise.all(dependencyNames.map((dependency) => visit(dependency)))
+    const identity = `${manifest.name}@${manifest.version}`
+    records.set(identity, {
+      dependencies: [...new Set(dependencies)].sort(),
+      license: manifest.license,
+      name: manifest.name,
+      version: manifest.version,
+    })
+    roots.push(identity)
+  }
+  return {
+    packages: [...records.values()].sort((left, right) =>
+      `${left.name}@${left.version}`.localeCompare(`${right.name}@${right.version}`),
+    ),
+    roots: roots.sort(),
+  }
+}
+
+interface ParsedBunLock {
+  readonly packages: Record<string, unknown>
+  readonly workspaces: Record<string, unknown>
+}
+
+function parseBunLock(text: string): ParsedBunLock {
+  const value = Bun.JSONC.parse(text) as unknown
+  if (!isRecord(value) || !isRecord(value.packages) || !isRecord(value.workspaces)) {
+    throw new Error("bun.lock is malformed")
+  }
+  return value as unknown as ParsedBunLock
+}
+
+function parsePackedManifest(content: Uint8Array | undefined): PackedManifest {
+  if (content === undefined) throw new Error("Packed package manifest is missing")
+  const value = JSON.parse(Buffer.from(content).toString("utf8")) as unknown
+  if (
+    !isRecord(value) ||
+    typeof value.name !== "string" ||
+    typeof value.version !== "string" ||
+    typeof value.license !== "string"
+  ) {
+    throw new Error("Packed package manifest identity is invalid")
+  }
+  return {
+    dependencies: stringMap(value.dependencies, "packed dependencies"),
+    license: value.license,
+    name: value.name,
+    optionalDependencies: stringMap(value.optionalDependencies, "packed optional dependencies"),
+    version: value.version,
+  }
+}
+
+function assertPackedManifestAllowlist(manifest: PackedManifest): void {
+  const dependencies = manifest.name === PRODUCT_IDENTITY.mainPackage
+    ? {
+        "@opencode-ai/plugin": "1.18.21",
+        "@opencode-ai/sdk": "1.18.21",
+        "puppeteer-core": "25.6.0",
+      }
+    : {}
+  const optionalDependencies = manifest.name === PRODUCT_IDENTITY.mainPackage
+    ? {
+        "@opencode-cycle/native-linux-x64": "1.0.0",
+        "@opencode-cycle/native-win32-x64": "1.0.0",
+      }
+    : {}
+  if (
+    manifest.license !== "FSL-1.1-MIT" ||
+    JSON.stringify(manifest.dependencies) !== JSON.stringify(dependencies) ||
+    JSON.stringify(manifest.optionalDependencies) !== JSON.stringify(optionalDependencies)
+  ) {
+    throw new Error(`Packed package dependencies are outside the production allowlist: ${manifest.name}`)
+  }
+}
+
+function assertPackedManifestMatchesLock(manifest: PackedManifest, lock: ParsedBunLock): void {
+  const workspace = Object.values(lock.workspaces).find(
+    (candidate) => isRecord(candidate) && candidate.name === manifest.name,
+  )
+  if (!isRecord(workspace) || workspace.version !== manifest.version) {
+    throw new Error(`Packed package is missing from bun.lock workspaces: ${manifest.name}`)
+  }
+  if (
+    JSON.stringify(stringMap(workspace.dependencies, "locked workspace dependencies")) !==
+      JSON.stringify(manifest.dependencies) ||
+    JSON.stringify(stringMap(workspace.optionalDependencies, "locked workspace optional dependencies")) !==
+      JSON.stringify(manifest.optionalDependencies)
+  ) {
+    throw new Error(`Packed package dependencies do not match bun.lock: ${manifest.name}`)
+  }
+}
+
+function lockedPackage(
+  lock: ParsedBunLock,
+  name: string,
+): { readonly dependencies: Readonly<Record<string, string>>; readonly version: string } {
+  const value = lock.packages[name]
+  if (!Array.isArray(value) || typeof value[0] !== "string") {
+    throw new Error(`Required production dependency is missing from bun.lock: ${name}`)
+  }
+  const separator = value[0].lastIndexOf("@")
+  const resolvedName = value[0].slice(0, separator)
+  const version = value[0].slice(separator + 1)
+  if (resolvedName !== name || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)) {
+    throw new Error(`Locked dependency identity is invalid: ${name}`)
+  }
+  const metadata = isRecord(value[2]) ? value[2] : {}
+  return {
+    dependencies: stringMap(metadata.dependencies, `locked dependencies for ${name}`),
+    version,
+  }
+}
+
+function stringMap(value: unknown, label: string): Readonly<Record<string, string>> {
+  if (value === undefined) return {}
+  if (!isRecord(value) || Object.values(value).some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be a string map`)
+  }
+  return Object.fromEntries(
+    Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
+  ) as Record<string, string>
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
 async function main(): Promise<void> {
   const argumentsMap = parseArguments(Bun.argv.slice(2))
   const root = fileURLToPath(new URL("../../", import.meta.url))
+  const manifest = await readReleaseManifest(argumentsMap.manifest)
+  const verifiedArtifacts = await readVerifiedFileDirectory(argumentsMap.artifactsDirectory)
+  const artifactInventory = verifiedArtifacts.map(({ name, sha256, size }) => ({ name, sha256, size }))
+  assertArtifactInventoryMatchesManifest(artifactInventory, manifest.artifacts)
+  const lock = await readVerifiedRegularFile(join(root, "bun.lock"), { maxBytes: 10 * 1024 * 1024 })
+  const javascriptInventory = await collectPackedJavaScriptInventory(
+    root,
+    verifiedArtifacts,
+    manifest.version,
+    lock.content.toString("utf8"),
+  )
   const cargoOutput = Bun.spawnSync(["cargo", "metadata", "--format-version", "1", "--locked"], {
     cwd: root,
     stderr: "inherit",
@@ -241,34 +472,77 @@ async function main(): Promise<void> {
   const cargoRoot = cargo.packages.find((item) => item.name === "workflowd")?.id
   if (cargoRoot === undefined) throw new Error("workflowd is missing from Cargo metadata")
 
-  const packageDirectories = [
-    join(root, "packages", PRODUCT_IDENTITY.mainPackage),
-    ...NATIVE_PACKAGE_NAMES.map((name) =>
-      join(root, "packages", name.slice(name.lastIndexOf("/") + 1)),
-    ),
-  ]
-  const javascript = await collectJavaScriptInventory(root, packageDirectories)
-  const roots = await Promise.all(
-    packageDirectories.map(async (directory) => {
-      const manifest = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as {
-        name: string
-        version: string
-      }
-      return `${manifest.name}@${manifest.version}`
-    }),
-  )
-  const manifest = await readReleaseManifest(argumentsMap.manifest)
-  const verifiedArtifacts = await verifyArtifactDirectory(
-    argumentsMap.artifactsDirectory,
-    manifest.artifacts,
-  )
   const artifacts = verifiedArtifacts.map((artifact) => ({
     digest: artifact.sha256,
     name: artifact.name,
     size: artifact.size,
   }))
-  const bom = buildCycloneDxBom(cargo, cargoRoot, javascript, roots, artifacts, manifest.artifacts)
+  const bom = buildCycloneDxBom(
+    cargo,
+    cargoRoot,
+    javascriptInventory.packages,
+    javascriptInventory.roots,
+    artifacts,
+    manifest.artifacts,
+  )
+  await validateCycloneDxBom(bom)
   await writeFile(resolve(argumentsMap.output), `${JSON.stringify(bom, null, 2)}\n`, "utf8")
+}
+
+interface JsonValidator {
+  (value: unknown): boolean
+  readonly errors?: readonly { readonly instancePath: string; readonly message?: string }[] | null
+}
+
+interface JsonSchemaCompiler {
+  addFormat(name: string, format: RegExp): void
+  addSchema(schema: object): void
+  compile(schema: object): JsonValidator
+}
+
+interface JsonSchemaCompilerConstructor {
+  new(options: { readonly allErrors: boolean; readonly strict: boolean }): JsonSchemaCompiler
+}
+
+const require = createRequire(import.meta.url)
+const Ajv = require("ajv") as JsonSchemaCompilerConstructor
+const addFormats = require("ajv-formats") as (compiler: JsonSchemaCompiler) => void
+
+let schemaValidator: Promise<JsonValidator> | undefined
+
+export async function validateCycloneDxBom(bom: unknown): Promise<void> {
+  if (!isRecord(bom) || bom.bomFormat !== "CycloneDX" || bom.specVersion !== "1.6") {
+    throw new Error("CycloneDX 1.6 schema validation failed: identity is not exact")
+  }
+  schemaValidator ??= (async () => {
+    const schemaRoot = join(import.meta.dir, "schema")
+    const [schema, spdx, jsf] = await Promise.all(
+      [
+        ["bom-1.6.schema.json", "a45bb932df5a0469dd9e50534bbf755cb62e562187d2ade54a6d2156885e7810"],
+        ["spdx.schema.json", "4538b2231bd5196c9c6de17ffc5d8e17423b2533bd73704ac1bd8ae960407a6b"],
+        ["jsf-0.82.schema.json", "a8a19aefb25c8b868326e44fe40d1923d5b5c72c1975f31dd1e4d11b08732105"],
+      ].map(async ([name, expectedDigest]) => {
+        const content = await readFile(join(schemaRoot, name as string))
+        const digest = createHash("sha256").update(content).digest("hex")
+        if (digest !== expectedDigest) throw new Error(`Vendored CycloneDX schema digest changed: ${name}`)
+        return JSON.parse(content.toString("utf8")) as object
+      }),
+    )
+    if (schema === undefined || spdx === undefined || jsf === undefined) {
+      throw new Error("CycloneDX 1.6 local schema set is incomplete")
+    }
+    const ajv = new Ajv({ allErrors: true, strict: false })
+    addFormats(ajv)
+    ajv.addFormat("idn-email", /^[^\s@]+@[^\s@]+$/u)
+    ajv.addFormat("iri-reference", /^\S*$/u)
+    ajv.addSchema(spdx)
+    ajv.addSchema(jsf)
+    return ajv.compile(schema)
+  })()
+  const validate = await schemaValidator
+  if (!validate(bom)) {
+    throw new Error(`CycloneDX 1.6 schema validation failed: ${validate.errors?.map((item) => `${item.instancePath} ${item.message}`).join("; ")}`)
+  }
 }
 
 function component(
@@ -314,8 +588,8 @@ async function resolveInstalledPackage(
   workspaceRoot: string,
   name: string,
 ): Promise<string | undefined> {
-  let current = issuer
-  const boundary = resolve(workspaceRoot)
+  let current = await realpath(issuer)
+  const boundary = await realpath(workspaceRoot)
   while (true) {
     const candidate = join(current, "node_modules", ...name.split("/"))
     if (await exists(join(candidate, "package.json"))) return candidate

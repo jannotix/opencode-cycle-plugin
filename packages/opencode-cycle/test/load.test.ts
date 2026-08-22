@@ -697,9 +697,9 @@ test("records successful native registration for Desktop certification", async (
   }
   try {
     const hooks = await OpenCodeCycle(input as never, { dataDirectory, hostVersion: "1.18.16" })
-    expect(await readFile(join(dataDirectory, "desktop-activation.log"), "utf8")).toBe(
-      "Cycle for OpenCode activated\n",
-    )
+    expect(
+      await readFile(join(dataDirectory, "desktop-activation.json"), "utf8").catch(() => undefined),
+    ).toBeUndefined()
 
     await hooks.config?.({ agent: {}, command: {} } as never)
 
@@ -713,9 +713,9 @@ test("records successful native registration for Desktop certification", async (
         },
       },
     ])
-    expect(await readFile(join(dataDirectory, "desktop-activation.log"), "utf8")).toBe(
-      "Cycle for OpenCode activated\n",
-    )
+    expect(
+      await readFile(join(dataDirectory, "desktop-activation.json"), "utf8").catch(() => undefined),
+    ).toBeUndefined()
   } finally {
     await rm(dataDirectory, { force: true, recursive: true })
   }

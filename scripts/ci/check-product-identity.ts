@@ -82,6 +82,11 @@ const BINARY_EXTENSIONS = new Set([
   "webp",
 ])
 const FILE_READ_CONCURRENCY = 8
+const VENDORED_THIRD_PARTY_SCHEMA_PATHS = new Set([
+  "scripts/release/schema/bom-1.6.schema.json",
+  "scripts/release/schema/jsf-0.82.schema.json",
+  "scripts/release/schema/spdx.schema.json",
+])
 
 async function filesBelow(root: string, directory = ""): Promise<string[]> {
   const entries = await readdir(join(root, directory), { withFileTypes: true })
@@ -205,7 +210,9 @@ export async function auditProductIdentity(
       if (!pathSet.has(path)) findings.push(`${path}: approved compatibility path is missing`)
     }
   }
-  const scannedPaths = paths.filter((path) => !isKnownBinaryPath(path))
+  const scannedPaths = paths.filter(
+    (path) => !isKnownBinaryPath(path) && !VENDORED_THIRD_PARTY_SCHEMA_PATHS.has(path),
+  )
   for (const fileFindings of await mapBounded(scannedPaths, (path) => auditFile(root, path))) {
     findings.push(...fileFindings)
   }

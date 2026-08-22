@@ -18,6 +18,7 @@ permissions:
 
 env:
   BUN_VERSION: 1.3.14
+  CANDIDATE_VERSION: ${{ inputs.version }}
   RUST_VERSION: 1.97.1
 
 jobs:
@@ -45,7 +46,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Verify candidate version
         shell: bash
-        run: test "$(bun -p "require('./packages/opencode-cycle/package.json').version")" = "${{ inputs.version }}"
+        run: bun scripts/release/validate-version.ts --version "$CANDIDATE_VERSION"
       - name: Run static source gate
         run: bun run check
       - name: Run Bun test suite
@@ -162,11 +163,11 @@ jobs:
           name: ${{ matrix.native }}
           path: candidate/native
       - name: Run real Desktop certification
-        run: bun scripts/ci/desktop-certification.ts --platform ${{ matrix.platform }} --plugin-archive candidate/plugin --native-archive candidate/native --revision ${{ github.sha }} --output candidate/certification/${{ matrix.platform }}.json
+        run: bun scripts/ci/desktop-certification.ts --platform ${{ matrix.platform }} --plugin-archive candidate/plugin --native-archive candidate/native --revision ${{ github.sha }} --output candidate/certifications/${{ matrix.platform }}.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: certification-${{ matrix.platform }}
-          path: candidate/certification/${{ matrix.platform }}.json
+          path: candidate/certifications/${{ matrix.platform }}.json
           if-no-files-found: error
           retention-days: 14
 
@@ -262,9 +263,9 @@ jobs:
           name: repeatability-certification
           path: candidate/certifications
       - name: Bind artifacts to certification evidence
-        run: bun scripts/release/release-manifest.ts --artifacts-directory candidate/artifacts --certifications-directory candidate/certifications --revision ${{ github.sha }} --version ${{ inputs.version }} --output candidate/release-manifest.json
+        run: bun scripts/release/release-manifest.ts --artifacts-directory candidate/artifacts --certifications-directory candidate/certifications --revision ${{ github.sha }} --version "$CANDIDATE_VERSION" --output candidate/release-manifest.json
       - name: Generate CycloneDX 1.6 SBOM from the manifest allowlist
-        run: bun scripts/release/sbom.ts --artifacts-directory candidate/artifacts --manifest candidate/release-manifest.json --output candidate/opencode-cycle-${{ inputs.version }}.cdx.json
+        run: bun scripts/release/sbom.ts --artifacts-directory candidate/artifacts --manifest candidate/release-manifest.json --output "candidate/opencode-cycle-$CANDIDATE_VERSION.cdx.json"
       - name: Generate release checksums
         run: bun scripts/release/checksums.ts --directory candidate --manifest candidate/release-manifest.json --output candidate/SHA256SUMS
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a

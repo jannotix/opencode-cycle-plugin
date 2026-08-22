@@ -16,6 +16,7 @@
         "@types/node": "26.2.0",
         "json-schema-to-typescript": "15.0.4",
         "typescript": "7.0.2",
+        "yaml": "2.9.0",
       },
     },
     "packages/native-linux-x64": {

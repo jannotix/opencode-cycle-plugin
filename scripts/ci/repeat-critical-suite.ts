@@ -2,6 +2,8 @@ import { writeFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 import { mkdir } from "node:fs/promises"
 
+import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
+
 interface IterationResult {
   readonly durationMs: number
 }
@@ -76,7 +78,7 @@ export function buildCriticalResult(
 async function main(): Promise<void> {
   const options = parseArguments(Bun.argv.slice(2))
   const root = resolve(import.meta.dir, "../..")
-  const revision = await sourceRevision(root)
+  const source = await captureCleanSource(root)
   const results: IterationResult[] = []
   let failure: unknown
   for (let iteration = 1; iteration <= options.iterations; iteration += 1) {
@@ -93,7 +95,8 @@ async function main(): Promise<void> {
       break
     }
   }
-  const result = buildCriticalResult(options.iterations, results, revision)
+  await assertSourceUnchanged(root, source)
+  const result = buildCriticalResult(options.iterations, results, source.revision)
   const output = resolve(options.output)
   await mkdir(dirname(output), { recursive: true })
   await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8")
@@ -103,29 +106,6 @@ async function main(): Promise<void> {
       failure === undefined ? undefined : { cause: failure },
     )
   }
-}
-
-async function sourceRevision(root: string): Promise<string> {
-  const child = Bun.spawn(["git", "rev-parse", "HEAD"], {
-    cwd: root,
-    stderr: "pipe",
-    stdout: "pipe",
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) throw new Error(`Cannot resolve critical suite revision: ${stderr.trim()}`)
-  const revision = stdout.trim()
-  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(revision)) {
-    throw new Error("Critical suite revision must be a full Git object ID")
-  }
-  const expected = process.env.CYCLE_RELEASE_REVISION
-  if (expected !== undefined && expected !== revision) {
-    throw new Error("Critical suite revision does not match CYCLE_RELEASE_REVISION")
-  }
-  return revision
 }
 
 function parseArguments(argumentsList: readonly string[]): { iterations: number; output: string } {

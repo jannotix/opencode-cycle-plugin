@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 
 import { PRODUCT_IDENTITY } from "../product-identity.js"
+import { inspectTarGz } from "./tar-archive.js"
 
 const NON_PRODUCTION_PATH =
   /(?:^|\/)(?:(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|[^/]*(?:\.(?:test|spec)(?:\.|$)|_(?:test|spec)_)[^/]*)|\.map$/iu
@@ -35,9 +36,7 @@ export async function packagePlugin(root: string, output: string): Promise<Plugi
     if ((await digest(archive)) !== (await digest(join(comparison, comparisonName)))) {
       throw new Error("Plugin package is not reproducible from identical inputs")
     }
-    const listing = (await run(["tar", "-tf", archive], resolvedRoot))
-      .split(/\r?\n/u)
-      .filter(Boolean)
+    const listing = inspectTarGz(await readFile(archive)).map((entry) => entry.name)
     validatePluginListing(listing, sourceModules)
     const checksum = await digest(archive)
     await writeFile(`${archive}.sha256`, `${checksum}  ${basename(archive)}\n`, "utf8")
@@ -61,6 +60,10 @@ export function validatePluginListing(
   listing: readonly string[],
   sourceModules: readonly string[],
 ): void {
+  const unique = new Set(listing)
+  if (unique.size !== listing.length) {
+    throw new Error("Plugin package contains a duplicate archive member")
+  }
   const forbiddenPath = listing.find(isNonProductionPath)
   if (forbiddenPath !== undefined) {
     throw new Error(`Plugin package contains non-production file ${forbiddenPath}`)
@@ -74,11 +77,12 @@ export function validatePluginListing(
   ].sort()
   const actual = [...listing].sort()
   const unexpected = actual.find((path) => !expected.includes(path))
-  if (unexpected !== undefined) {
-    throw new Error(`Plugin package contains non-production file ${unexpected}`)
-  }
+  if (unexpected !== undefined) throw new Error(`Plugin package contains non-production file ${unexpected}`)
   const missing = expected.find((path) => !actual.includes(path))
   if (missing !== undefined) throw new Error(`Plugin package is missing ${missing}`)
+  if (actual.length !== expected.length || actual.some((path, index) => path !== expected[index])) {
+    throw new Error("Plugin package members do not equal the unique sorted production allowlist")
+  }
 }
 
 export function validatePluginSourceModules(sourceModules: readonly string[]): void {

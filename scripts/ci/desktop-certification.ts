@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto"
+import { randomBytes } from "node:crypto"
 import { createWriteStream } from "node:fs"
 import {
   chmod,
   copyFile,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -18,11 +19,21 @@ import { pipeline } from "node:stream/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import {
+  parseDesktopActivationMarker,
+  type DesktopActivationMarker,
+  type DesktopCertificationBinding,
+} from "../../packages/opencode-cycle/src/certification.js"
+
+import {
   CERTIFIED_PLATFORMS,
+  DESKTOP_ASSET_METADATA,
   DESKTOP_ASSET_NAMES,
+  OPENCODE_DESKTOP_VERSION,
   type CertifiedPlatform,
 } from "../release/release-manifest.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
+import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile } from "../release/verified-file.js"
+import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
 
 export interface DesktopAsset {
   readonly name: string
@@ -41,6 +52,15 @@ interface WindowsProtocolRegistration {
   readonly command?: string
   readonly existed: boolean
 }
+
+type DesktopAuthenticity =
+  | {
+      readonly applicationSigner: string
+      readonly installerSigner: string
+      readonly method: "authenticode"
+      readonly status: "verified"
+    }
+  | { readonly method: "sha256"; readonly status: "verified" }
 
 export const SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS = CERTIFIED_PLATFORMS
 
@@ -63,7 +83,7 @@ export function validateDesktopAsset(
 }
 
 export function validateDesktopAssetMatrix(matrix: DesktopAssetMatrix): void {
-  if (!/^\d+\.\d+\.\d+$/u.test(matrix.version)) {
+  if (matrix.version !== OPENCODE_DESKTOP_VERSION) {
     throw new Error("Desktop asset matrix version is invalid")
   }
   if (matrix.release !== `https://github.com/anomalyco/opencode/releases/tag/v${matrix.version}`) {
@@ -78,6 +98,14 @@ export function validateDesktopAssetMatrix(matrix: DesktopAssetMatrix): void {
   }
   for (const platform of SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS) {
     validateDesktopAsset(platform, matrix.assets[platform], matrix.version)
+    const expected = DESKTOP_ASSET_METADATA[platform]
+    if (
+      matrix.assets[platform].name !== expected.name ||
+      matrix.assets[platform].sha256 !== expected.sha256 ||
+      matrix.assets[platform].size !== expected.size
+    ) {
+      throw new Error(`${platform} Desktop asset metadata does not match the official release`)
+    }
   }
 }
 
@@ -105,21 +133,57 @@ export function certificationEnvironment(
   root: string,
   platform: CertifiedPlatform,
   inherited: NodeJS.ProcessEnv,
+  certification?: Pick<DesktopCertificationBinding, "nonce" | "root">,
 ): NodeJS.ProcessEnv {
   const isolated = resolve(root)
+  const allowed = [
+    "CI",
+    "ComSpec",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "GITHUB_ACTIONS",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "LOGNAME",
+    "NUMBER_OF_PROCESSORS",
+    "PATHEXT",
+    "PATH",
+    "Path",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "PROCESSOR_ARCHITECTURE",
+    "SHELL",
+    "SystemRoot",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "USER",
+    "USERNAME",
+    "WAYLAND_DISPLAY",
+    "WINDIR",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+  ] as const
+  const base: NodeJS.ProcessEnv = {}
+  for (const name of allowed) {
+    const value = inherited[name]
+    if (value !== undefined) base[name] = value
+  }
   return {
-    ...inherited,
+    ...base,
     PATH:
-      inherited.PATH ??
-      (process.platform === "linux"
+      inherited.PATH ?? inherited.Path ??
+      (platform === "linux-x64"
         ? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         : ""),
     APPDATA: join(isolated, "appdata"),
     HOME: join(isolated, "home"),
-    HOMEDRIVE: process.platform === "win32" && win32.parse(isolated).root !== ""
+    HOMEDRIVE: platform === "windows-x64" && win32.parse(isolated).root !== ""
       ? win32.parse(isolated).root.replace(/\\$/u, "")
-      : inherited.HOMEDRIVE,
-    HOMEPATH: process.platform === "win32" ? join(isolated, "home").replace(/^[A-Za-z]:/u, "") : inherited.HOMEPATH,
+      : undefined,
+    HOMEPATH: platform === "windows-x64" ? join(isolated, "home").replace(/^[A-Za-z]:/u, "") : undefined,
     LOCALAPPDATA: join(isolated, "localappdata"),
     OPENCODE_DISABLE_AUTOUPDATE: "true",
     USERPROFILE: join(isolated, "home"),
@@ -127,6 +191,12 @@ export function certificationEnvironment(
     XDG_CONFIG_HOME: join(isolated, "xdg", "config"),
     XDG_DATA_HOME: join(isolated, "xdg", "data"),
     XDG_STATE_HOME: join(isolated, "xdg", "state"),
+    ...(certification === undefined
+      ? {}
+      : {
+          CYCLE_CERTIFICATION_NONCE: certification.nonce,
+          CYCLE_CERTIFICATION_ROOT: certification.root,
+        }),
     ...(platform === "windows-x64" ? { OPENCODE_TEST_ONBOARDING: "1" } : {}),
   }
 }
@@ -179,6 +249,7 @@ async function main(): Promise<void> {
   const options = parseArguments(Bun.argv.slice(2))
   assertHost(options.platform)
   const root = fileURLToPath(new URL("../../", import.meta.url))
+  const source = await captureCleanSource(root, options.revision)
   const matrix = JSON.parse(
     await readFile(join(root, ".github", "opencode-desktop-assets.json"), "utf8"),
   ) as DesktopAssetMatrix
@@ -189,15 +260,35 @@ async function main(): Promise<void> {
 
   // Linux AF_UNIX paths must stay under SUN_LEN, so the scratch prefix is short.
   const scratch = await mkdtemp(join(tmpdir(), "occ-"))
+  const certificationRoot = join(scratch, "certification")
+  const certificationNonce = randomBytes(32).toString("hex")
+  const certificationStartedAt = Date.now()
+  await mkdir(certificationRoot)
   const debugProfile = process.env.CYCLE_CERT_DEBUG_PROFILE === "1"
   const keepScratch = process.env.CYCLE_CERT_KEEP_SCRATCH === "1"
   if (debugProfile) {
     console.error(`Desktop certification scratch root: ${scratch}`)
   }
-  const environment = certificationEnvironment(scratch, options.platform, process.env)
+  const pluginInput = await archiveFile(options.pluginArchive)
+  const nativeInput = await archiveFile(options.nativeArchive)
+  const pluginArchive = join(scratch, `plugin-${pluginInput.name}`)
+  const nativeArchive = join(scratch, `native-${nativeInput.name}`)
+  await Promise.all([
+    writeFile(pluginArchive, pluginInput.content, { flag: "wx", mode: 0o600 }),
+    writeFile(nativeArchive, nativeInput.content, { flag: "wx", mode: 0o600 }),
+  ])
+  const pluginPackageSha256 = pluginInput.sha256
+  const nativePackageSha256 = nativeInput.sha256
+  const certification: DesktopCertificationBinding = {
+    nativePackageSha256,
+    nonce: certificationNonce,
+    pluginPackageSha256,
+    revision: options.revision,
+    root: certificationRoot,
+    startedAtUnixMillis: certificationStartedAt,
+  }
+  const environment = certificationEnvironment(scratch, options.platform, process.env, certification)
   const assetPath = join(scratch, asset.name)
-  const pluginArchive = await archivePath(options.pluginArchive)
-  const nativeArchive = await archivePath(options.nativeArchive)
   let desktopProcess: Bun.Subprocess | undefined
   let desktopProfile: string | undefined
   let windowsProtocol: WindowsProtocolRegistration | undefined
@@ -251,7 +342,12 @@ async function main(): Promise<void> {
       plugin: [
         [
           pathToFileURL(join(installedPlugin, "dist", "index.js")).href,
-          { binaryPath: nativeExecutable, dataDirectory, hostVersion: matrix.version },
+          {
+            binaryPath: nativeExecutable,
+            certification,
+            dataDirectory,
+            hostVersion: matrix.version,
+          },
         ],
       ],
     }
@@ -272,6 +368,7 @@ async function main(): Promise<void> {
           options.platform,
           dataDirectory,
           matrix.version,
+          certification,
         )
       }),
     )
@@ -319,9 +416,9 @@ async function main(): Promise<void> {
         options.platform,
         dataDirectory,
         matrix.version,
+        certification,
       )
     }
-    const activationRoots = activationScanRoots(dataDirectory, desktopProfile, environment)
     const withDesktopLogs = async <T>(operation: () => Promise<T>): Promise<T> => {
       try {
         return await operation()
@@ -334,62 +431,39 @@ async function main(): Promise<void> {
       }
     }
     await withDesktopLogs(() => waitForProcess(launchedDesktop, 2_000))
-    const activation = await withDesktopLogs(() => waitForActivation(activationRoots, 120_000))
-    const runtimeDataDirectory = defaultCycleDataDirectory(options.platform, environment, dataDirectory)
-    const healthDirectories = [...new Set([dataDirectory, runtimeDataDirectory])]
-
-    const client = await import(pathToFileURL(join(installedPlugin, "dist", "client.js")).href)
-    let health: {
-      product_version: string
-      protocol_version: number
-      schema_mode: string
-      schema_version: number
-    } | undefined
-    let lastHealthError: unknown
-    for (const directory of healthDirectories) {
-      const controlPlane = new client.LocalControlPlane({
-        binaryPath: nativeExecutable,
-        dataDirectory: directory,
-        stopOwnedProcessOnDispose: true,
-      })
-      try {
-        health = await controlPlane.health()
-        await controlPlane.dispose()
-        break
-      } catch (error) {
-        lastHealthError = error
-        await controlPlane.dispose().catch(() => undefined)
-      }
-    }
-    if (health === undefined) {
-      throw lastHealthError instanceof Error ? lastHealthError : new Error(String(lastHealthError))
-    }
-    if (health.protocol_version !== 1 || health.schema_version !== 17) {
-      throw new Error("Desktop certification received an incompatible control-plane health response")
-    }
+    const activation = await withDesktopLogs(() =>
+      waitForDesktopActivation(certificationRoot, certification, 120_000),
+    )
 
     const evidence = {
+      activationCreatedAtUnixMillis: activation.marker.createdAtUnixMillis,
       activationLogSha256: activation.digest,
       activationMarker: PRODUCT_IDENTITY.activationMarker,
+      activationNativePackageSha256: activation.marker.nativePackageSha256,
+      activationNonce: activation.marker.nonce,
+      activationPluginPackageSha256: activation.marker.pluginPackageSha256,
+      activationRevision: activation.marker.revision,
       controlPlane: {
-        productVersion: health.product_version,
-        protocolVersion: health.protocol_version,
-        schemaMode: health.schema_mode,
-        schemaVersion: health.schema_version,
+        productVersion: activation.marker.health.productVersion,
+        protocolVersion: activation.marker.health.protocolVersion,
+        schemaMode: activation.marker.health.schemaMode,
+        schemaVersion: activation.marker.health.schemaVersion,
       },
       desktop: {
         asset: asset.name,
         authenticity: desktop.authenticity,
-        profileIsolation: "official-test-profile",
+        profileIsolation: "fresh-isolated-certification-root",
         sha256: asset.sha256,
+        size: asset.size,
         version: matrix.version,
       },
-      nativePackageSha256: await sha256(nativeArchive),
+      nativePackageSha256,
       platform: options.platform,
-      pluginPackageSha256: await sha256(pluginArchive),
+      pluginPackageSha256,
       revision: options.revision,
       schemaVersion: 1,
     }
+    await assertSourceUnchanged(root, source, options.revision)
     await mkdir(dirname(resolve(options.output)), { recursive: true })
     await writeFile(resolve(options.output), `${JSON.stringify(evidence, null, 2)}\n`, "utf8")
   } catch (error: unknown) {
@@ -422,6 +496,7 @@ async function installPackedPluginTree(
   platform: CertifiedPlatform,
   dataDirectory: string,
   hostVersion: string,
+  certification: DesktopCertificationBinding,
 ): Promise<void> {
   const installRoot = join(configDirectory, "opencode-cycle")
   const nativeBinary = platform === "windows-x64" ? "workflowd.exe" : "workflowd"
@@ -439,6 +514,7 @@ const binaryPath = fileURLToPath(new URL("../opencode-cycle/bin/${nativeBinary}"
 export default async function OpenCodeCyclePlugin(input) {
   return OpenCodeCycle(input, {
     binaryPath,
+    certification: ${JSON.stringify(certification)},
     dataDirectory: ${JSON.stringify(dataDirectory)},
     hostVersion: ${JSON.stringify(hostVersion)},
   })
@@ -519,7 +595,7 @@ export async function fetchDesktopAsset(
       }
       await pipeline(
         Readable.fromWeb(response.body as never),
-        createWriteStream(destination, { flags: "wx" }),
+        createWriteStream(destination, { flags: "wx", mode: 0o600 }),
       )
       await verifyDesktopAssetFile(asset, destination)
       return
@@ -537,16 +613,17 @@ export async function stageDesktopAsset(
   source?: string,
 ): Promise<void> {
   if (source === undefined) return fetchDesktopAsset(asset, destination)
-  await copyFile(resolve(source), destination)
+  const verified = await readVerifiedRegularFile(source, { maxBytes: asset.size })
+  await writeFile(destination, verified.content, { flag: "wx", mode: 0o600 })
   await verifyDesktopAssetFile(asset, destination)
 }
 
 async function verifyDesktopAssetFile(asset: DesktopAsset, path: string): Promise<void> {
-  const details = await stat(path)
-  if (details.size !== asset.size) {
+  const verified = await readVerifiedRegularFile(path, { maxBytes: asset.size })
+  if (verified.size !== asset.size) {
     throw new Error("Desktop asset size does not match the certified release")
   }
-  if ((await sha256(path)) !== asset.sha256) {
+  if (verified.sha256 !== asset.sha256) {
     throw new Error("Desktop asset digest does not match the certified release")
   }
 }
@@ -556,7 +633,7 @@ async function prepareDesktop(
   asset: string,
   scratch: string,
   environment: NodeJS.ProcessEnv,
-): Promise<{ authenticity: string; launch: string[] }> {
+): Promise<{ authenticity: DesktopAuthenticity; launch: string[] }> {
   if (platform === "windows-x64") {
     const signature = await run(
       [
@@ -588,8 +665,18 @@ async function prepareDesktop(
       scratch,
       windowsPowerShellEnvironment({ ...environment, OWF_CERT_ASSET: extraction.executable }),
     )
+    const installerSigner = signature.trim()
+    const applicationSigner = applicationSignature.trim()
+    if (installerSigner.length === 0 || applicationSigner.length === 0) {
+      throw new Error("Windows Desktop Authenticode signer subject is empty")
+    }
     return {
-      authenticity: `Installer and application Authenticode Valid: ${signature.trim()}; ${applicationSignature.trim()}`,
+      authenticity: {
+        applicationSigner,
+        installerSigner,
+        method: "authenticode",
+        status: "verified",
+      },
       launch: [extraction.executable],
     }
   }
@@ -603,61 +690,62 @@ async function prepareDesktop(
       launchArguments.push("--no-sandbox")
     }
     return {
-      authenticity: "Official GitHub release SHA-256 verified",
+      authenticity: { method: "sha256", status: "verified" },
       launch: launchArguments,
     }
   }
   throw new Error(`Unsupported Desktop certification platform: ${platform}`)
 }
 
-function defaultCycleDataDirectory(
-  platform: CertifiedPlatform,
-  environment: NodeJS.ProcessEnv,
-  fallback: string,
-): string {
-  if (platform === "windows-x64" && environment.LOCALAPPDATA) {
-    return join(environment.LOCALAPPDATA, "OpenCode Cycle")
-  }
-  if (environment.XDG_DATA_HOME) return join(environment.XDG_DATA_HOME, "opencode-cycle")
-  return fallback
-}
-
 export function activationScanRoots(
   dataDirectory: string,
-  desktopProfile: string,
-  environment: NodeJS.ProcessEnv,
+  _desktopProfile: string,
+  _environment: NodeJS.ProcessEnv,
 ): readonly string[] {
-  const optional: string[] = []
-  if (environment.LOCALAPPDATA) optional.push(join(environment.LOCALAPPDATA, "OpenCode Cycle"))
-  if (environment.XDG_DATA_HOME) optional.push(join(environment.XDG_DATA_HOME, "opencode-cycle"))
-  if (environment.HOME) optional.push(join(environment.HOME, ".local", "share", "opencode-cycle"))
-  if (process.env.HOME) {
-    optional.push(join(process.env.HOME, ".local", "share", "opencode-cycle"))
-  }
-  optional.push(join("/root", ".local", "share", "opencode-cycle"))
-  return [
-    dataDirectory,
-    ...optional,
-    join(desktopProfile, "desktop"),
-    join(desktopProfile, "data"),
-    join(desktopProfile, "state"),
-  ]
+  return [dataDirectory]
 }
 
-async function waitForActivation(roots: readonly string[], timeout: number): Promise<{ digest: string }> {
-  const deadline = Date.now() + timeout
-  const direct = roots.map((root) => join(root, "desktop-activation.log"))
-  while (Date.now() < deadline) {
-    const candidates = [...direct, ...(await Promise.all(roots.map(findFiles))).flat()]
-    for (const path of candidates) {
-      const details = await stat(path).catch(() => undefined)
-      if (details === undefined || details.size > 10 * 1024 * 1024) continue
-      const content = await readFile(path).catch(() => undefined)
-      if (content?.includes(Buffer.from(PRODUCT_IDENTITY.activationMarker))) {
-        return { digest: createHash("sha256").update(content).digest("hex") }
+export async function waitForDesktopActivation(
+  root: string,
+  binding: DesktopCertificationBinding,
+  timeout: number,
+  dependencies: { readonly now?: () => number; readonly sleep?: (milliseconds: number) => Promise<void> } = {},
+): Promise<{ digest: string; marker: DesktopActivationMarker }> {
+  if (resolve(root) !== binding.root) {
+    throw new Error("Desktop activation root does not match the certification binding")
+  }
+  const now = dependencies.now ?? Date.now
+  const sleep = dependencies.sleep ?? Bun.sleep
+  const deadline = now() + timeout
+  const path = join(root, "desktop-activation.json")
+  while (now() < deadline) {
+    const present = await lstat(path).then(
+      () => true,
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return false
+        throw error
+      },
+    )
+    if (present) {
+      const file = await readVerifiedRegularFile(path, { maxBytes: 64 * 1024, root })
+      const marker = parseDesktopActivationMarker(JSON.parse(file.content.toString("utf8")) as unknown)
+      if (
+        marker.nonce !== binding.nonce ||
+        marker.revision !== binding.revision ||
+        marker.pluginPackageSha256 !== binding.pluginPackageSha256 ||
+        marker.nativePackageSha256 !== binding.nativePackageSha256
+      ) {
+        throw new Error("Desktop activation marker does not match the run nonce, revision and packages")
       }
+      if (
+        marker.createdAtUnixMillis < binding.startedAtUnixMillis ||
+        marker.createdAtUnixMillis > now() + 5_000
+      ) {
+        throw new Error("Desktop activation marker time is outside the isolated certification run")
+      }
+      return { digest: file.sha256, marker }
     }
-    await Bun.sleep(1_000)
+    await sleep(1_000)
   }
   throw new Error("OpenCode Desktop did not activate the installed Cycle plugin")
 }
@@ -794,20 +882,6 @@ async function isLikelyProfileDirectory(path: string): Promise<boolean> {
   return false
 }
 
-async function findFiles(root: string): Promise<string[]> {
-  const output: string[] = []
-  const queue = [root]
-  while (queue.length > 0) {
-    const directory = queue.shift() as string
-    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
-      const path = join(directory, entry.name)
-      if (entry.isDirectory()) queue.push(path)
-      else if (entry.isFile()) output.push(path)
-    }
-  }
-  return output
-}
-
 async function waitForProcess(process: Bun.Subprocess, duration: number): Promise<void> {
   const exited = await Promise.race([process.exited.then(() => true), Bun.sleep(duration).then(() => false)])
   if (exited) throw new Error("OpenCode Desktop exited before project activation")
@@ -842,9 +916,7 @@ async function run(command: readonly string[], cwd: string, environment: NodeJS.
     : ""
   const pathSegments = [
     environment.PATH,
-    process.env.PATH,
     platformPath,
-    process.platform === "win32" ? process.env.Path : undefined,
   ].flatMap((value) =>
     typeof value === "string" && value.trim().length > 0
       ? value.split(process.platform === "win32" ? ";" : ":")
@@ -852,7 +924,6 @@ async function run(command: readonly string[], cwd: string, environment: NodeJS.
   )
   const dedupedPath = [...new Set(pathSegments.filter(Boolean))]
   const commandEnvironment = {
-    ...process.env,
     ...environment,
     PATH: dedupedPath.join(process.platform === "win32" ? ";" : ":"),
   }
@@ -862,10 +933,6 @@ async function run(command: readonly string[], cwd: string, environment: NodeJS.
   return output
 }
 
-async function sha256(path: string): Promise<string> {
-  return createHash("sha256").update(await readFile(path)).digest("hex")
-}
-
 async function exists(path: string): Promise<boolean> {
   return stat(path).then(
     () => true,
@@ -873,16 +940,19 @@ async function exists(path: string): Promise<boolean> {
   )
 }
 
-async function archivePath(path: string): Promise<string> {
+async function archiveFile(path: string): Promise<VerifiedFile> {
   const resolved = resolve(path)
-  const details = await stat(resolved)
-  if (details.isFile() && resolved.endsWith(".tgz")) return resolved
+  const details = await lstat(resolved)
+  if (details.isSymbolicLink()) throw new Error(`Package archive path must not be a link: ${path}`)
+  if (details.isFile() && resolved.endsWith(".tgz")) {
+    return readVerifiedRegularFile(resolved)
+  }
   if (!details.isDirectory()) throw new Error(`Package archive path is invalid: ${path}`)
-  const archives = (await readdir(resolved))
-    .filter((name) => name.endsWith(".tgz"))
-    .map((name) => join(resolved, name))
-  if (archives.length !== 1) throw new Error(`Expected exactly one package archive in ${path}`)
-  return archives[0] as string
+  const files = await readVerifiedFileDirectory(resolved)
+  if (files.length !== 1 || !files[0]?.name.endsWith(".tgz")) {
+    throw new Error(`Expected exactly one direct package archive and no extra material in ${path}`)
+  }
+  return files[0]
 }
 
 function assertHost(platform: CertifiedPlatform): void {

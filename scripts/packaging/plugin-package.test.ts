@@ -62,6 +62,21 @@ test("plugin package accepts the exact production module allowlist", () => {
   ).not.toThrow()
 })
 
+test("plugin package rejects duplicate archive members", () => {
+  expect(() =>
+    validatePluginListing(
+      [
+        "package/LICENSE",
+        "package/NOTICE",
+        "package/dist/index.js",
+        "package/dist/index.js",
+        "package/package.json",
+      ],
+      ["index.js"],
+    ),
+  ).toThrow("duplicate")
+})
+
 const nonProductionModules = [
   "feature.test.js",
   "feature.spec.js",

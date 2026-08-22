@@ -5,6 +5,10 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import {
+  buildDesktopActivationMarker,
+  type DesktopCertificationBinding,
+} from "../../packages/opencode-cycle/src/certification.js"
+import {
   activationScanRoots,
   certificationEnvironment,
   isDesktopHarnessPath,
@@ -16,6 +20,7 @@ import {
   terminateDesktopProcess,
   validateDesktopAsset,
   validateDesktopAssetMatrix,
+  waitForDesktopActivation,
   windowsDesktopExtraction,
   windowsPowerShellEnvironment,
   windowsPowerShellPath,
@@ -103,20 +108,30 @@ test("Desktop asset matrix is the exact official OpenCode 1.18.21 Windows/Linux 
   ).toThrow("platform set")
 })
 
-test("certification uses an isolated Desktop and OpenCode profile", () => {
+test("certification uses platform-specific isolated Desktop profiles", () => {
   const root = join(tmpdir(), "certification")
-  const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
-  const environment = certificationEnvironment(root, platform, {
-    PATH: "safe-path",
-  })
+  for (const platform of ["windows-x64", "linux-x64"] as const) {
+    const environment = certificationEnvironment(root, platform, {
+      OPENAI_API_KEY: "must-not-leak",
+      OPENCODE_CONFIG: "C:\\private\\opencode.json",
+      OPENCODE_MODEL: "private/model",
+      PATH: "safe-path",
+      SystemRoot: "C:\\Windows",
+    })
 
-  expect(environment.APPDATA).toBe(join(root, "appdata"))
-  expect(environment.LOCALAPPDATA).toBe(join(root, "localappdata"))
-  expect(environment.XDG_CONFIG_HOME).toBe(join(root, "xdg", "config"))
-  expect(environment.USERPROFILE).toBe(join(root, "home"))
-  expect(environment.PATH).toBe("safe-path")
-  expect(environment.OPENCODE_DISABLE_AUTOUPDATE).toBe("true")
-  expect(environment.OPENCODE_TEST_ONBOARDING).toBe("1")
+    expect(environment.APPDATA).toBe(join(root, "appdata"))
+    expect(environment.LOCALAPPDATA).toBe(join(root, "localappdata"))
+    expect(environment.XDG_CONFIG_HOME).toBe(join(root, "xdg", "config"))
+    expect(environment.USERPROFILE).toBe(join(root, "home"))
+    expect(environment.PATH).toBe("safe-path")
+    expect(environment.OPENCODE_DISABLE_AUTOUPDATE).toBe("true")
+    expect(environment.OPENCODE_TEST_ONBOARDING).toBe(
+      platform === "windows-x64" ? "1" : undefined,
+    )
+    expect(environment.OPENAI_API_KEY).toBeUndefined()
+    expect(environment.OPENCODE_CONFIG).toBeUndefined()
+    expect(environment.OPENCODE_MODEL).toBeUndefined()
+  }
 })
 
 test("certification scratch directories are not treated as Desktop test profiles", () => {
@@ -127,12 +142,103 @@ test("certification scratch directories are not treated as Desktop test profiles
   expect(isDesktopHarnessPath(join(tmpdir(), "opencode-onboarding-certified"), scratch)).toBe(false)
 })
 
-test("activation scan includes the isolated default Cycle data directory", () => {
+test("activation evidence is confined to one freshly created certification root", () => {
   const root = join(tmpdir(), "certification")
   const environment = certificationEnvironment(root, "windows-x64", { PATH: "safe-path" })
   const roots = activationScanRoots(join(root, "workflow-data"), join(root, "profile"), environment)
-  expect(roots).toContain(join(root, "localappdata", "OpenCode Cycle"))
-  expect(roots).toContain(join(root, "xdg", "data", "opencode-cycle"))
+  expect(roots).toEqual([join(root, "workflow-data")])
+  expect(roots.join(" ")).not.toContain(process.env.HOME ?? "owner-home-not-set")
+  expect(roots).not.toContain(join("/root", ".local", "share", "opencode-cycle"))
+})
+
+test("stale owner markers cannot satisfy the fresh certification root", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "cycle-cert-stale-owner-"))
+  const root = join(temporary, "certification")
+  const owner = join(temporary, "owner-home")
+  const binding: DesktopCertificationBinding = {
+    nativePackageSha256: "d".repeat(64),
+    nonce: "b".repeat(64),
+    pluginPackageSha256: "c".repeat(64),
+    revision: "a".repeat(40),
+    root,
+    startedAtUnixMillis: 1_700_000_000_000,
+  }
+  let clock = binding.startedAtUnixMillis
+  try {
+    await Promise.all([mkdir(root), mkdir(owner)])
+    const stale = buildDesktopActivationMarker(binding, {
+      product_version: "1.0.0",
+      protocol_version: 1,
+      schema_mode: "read_write",
+      schema_version: 17,
+    }, clock)
+    await writeFile(join(owner, "desktop-activation.json"), JSON.stringify(stale))
+    await expect(
+      waitForDesktopActivation(root, binding, 2_000, {
+        now: () => clock,
+        sleep: async (milliseconds) => {
+          clock += milliseconds
+        },
+      }),
+    ).rejects.toThrow("did not activate")
+  } finally {
+    await rm(temporary, { force: true, recursive: true })
+  }
+})
+
+test("activation rejects wrong nonce, package hashes and missing Desktop health", async () => {
+  const cases = [
+    { nonce: "e".repeat(64) },
+    { pluginPackageSha256: "e".repeat(64) },
+    { nativePackageSha256: "e".repeat(64) },
+  ]
+  for (const change of cases) {
+    const root = await mkdtemp(join(tmpdir(), "cycle-cert-wrong-binding-"))
+    const binding: DesktopCertificationBinding = {
+      nativePackageSha256: "d".repeat(64),
+      nonce: "b".repeat(64),
+      pluginPackageSha256: "c".repeat(64),
+      revision: "a".repeat(40),
+      root,
+      startedAtUnixMillis: Date.now(),
+    }
+    try {
+      const marker = buildDesktopActivationMarker({ ...binding, ...change }, {
+        product_version: "1.0.0",
+        protocol_version: 1,
+        schema_mode: "read_write",
+        schema_version: 17,
+      }, binding.startedAtUnixMillis)
+      await writeFile(join(root, "desktop-activation.json"), JSON.stringify(marker))
+      await expect(waitForDesktopActivation(root, binding, 10)).rejects.toThrow("does not match")
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  }
+
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-no-health-"))
+  const binding: DesktopCertificationBinding = {
+    nativePackageSha256: "d".repeat(64),
+    nonce: "b".repeat(64),
+    pluginPackageSha256: "c".repeat(64),
+    revision: "a".repeat(40),
+    root,
+    startedAtUnixMillis: Date.now(),
+  }
+  try {
+    await writeFile(join(root, "desktop-activation.json"), JSON.stringify({
+      createdAtUnixMillis: binding.startedAtUnixMillis,
+      nativePackageSha256: binding.nativePackageSha256,
+      nonce: binding.nonce,
+      pluginPackageSha256: binding.pluginPackageSha256,
+      revision: binding.revision,
+      schemaVersion: 1,
+      type: "opencode-cycle-desktop-activation",
+    }))
+    await expect(waitForDesktopActivation(root, binding, 10)).rejects.toThrow("missing or unknown")
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
 })
 
 test("Desktop test profile discovery resolves valid profile directories recursively", async () => {

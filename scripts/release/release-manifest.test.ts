@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
@@ -9,6 +9,7 @@ import {
   CERTIFIED_PLATFORMS,
   classifyCertificationEvidence,
   DECLARED_DESKTOP_PLATFORMS,
+  verifyArtifactDirectory,
 } from "./release-manifest.js"
 
 const revision = "c".repeat(40)
@@ -57,30 +58,47 @@ function manifestCertifications() {
 
 function certificationEvidence(targetRevision = revision): Record<string, unknown>[] {
   const pluginPackageSha256 = digest(expectedArtifactContents.get(`opencode-cycle-${version}.tgz`) as string)
-  const desktop = (platform: "linux-x64" | "windows-x64", nativeName: string) => ({
+  const desktop = (platform: "linux-x64" | "windows-x64", nativeName: string) => {
+    const nativePackageSha256 = digest(expectedArtifactContents.get(nativeName) as string)
+    return {
+    activationCreatedAtUnixMillis: 1_700_000_000_100,
     activationLogSha256: "7".repeat(64),
     activationMarker: "Cycle for OpenCode activated",
+    activationNativePackageSha256: nativePackageSha256,
+    activationNonce: "9".repeat(64),
+    activationPluginPackageSha256: pluginPackageSha256,
+    activationRevision: targetRevision,
     controlPlane: {
       productVersion: "1.0.0",
       protocolVersion: 1,
-      schemaMode: "current",
+      schemaMode: "read_write",
       schemaVersion: 17,
     },
     desktop: {
       asset: platform === "windows-x64"
         ? "opencode-desktop-win-x64.exe"
         : "opencode-desktop-linux-x86_64.AppImage",
-      authenticity: "fixture",
-      profileIsolation: "official-test-profile",
-      sha256: "8".repeat(64),
+      authenticity: platform === "windows-x64"
+        ? {
+            applicationSigner: "CN=OpenCode",
+            installerSigner: "CN=OpenCode",
+            method: "authenticode",
+            status: "verified",
+          }
+        : { method: "sha256", status: "verified" },
+      profileIsolation: "fresh-isolated-certification-root",
+      sha256: platform === "windows-x64"
+        ? "3bd1a81d8fcb377a6bda60a9abf8d412aca1c9c702218ddbbdf7c7b09deaa739"
+        : "fb384fc4f030aca8624d775b8757cafa39b5871fc0eddeecebb128f25ed649d8",
+      size: platform === "windows-x64" ? 126_209_592 : 158_944_115,
       version: "1.18.21",
     },
-    nativePackageSha256: digest(expectedArtifactContents.get(nativeName) as string),
+    nativePackageSha256,
     platform,
     pluginPackageSha256,
     revision: targetRevision,
     schemaVersion: 1,
-  })
+  }}
   return [
     desktop("linux-x64", `opencode-cycle-native-linux-x64-${version}.tgz`),
     desktop("windows-x64", `opencode-cycle-native-win32-x64-${version}.tgz`),
@@ -202,7 +220,45 @@ describe("release manifest", () => {
     artifacts.set(`duplicate/opencode-cycle-${version}.tgz`, "duplicate")
     const result = await runManifestFixture({ artifacts })
     expect(result.exitCode).not.toBe(0)
-    expect(result.stderr).toContain("Duplicate artifact")
+    expect(result.stderr).toMatch(/directory|nested|Duplicate artifact/)
+  })
+
+  test("rejects a hard-linked artifact even when its bytes match the manifest", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "opencode-cycle-hardlink-artifact-"))
+    const root = join(temporary, "artifacts")
+    try {
+      await mkdir(root)
+      const artifacts = manifestArtifacts()
+      for (const artifact of artifacts) {
+        const content = expectedArtifactContents.get(artifact.name) as string
+        if (artifact.name === `opencode-cycle-${version}.tgz`) {
+          const outside = join(temporary, "outside-plugin.tgz")
+          await writeFile(outside, content)
+          await link(outside, join(root, artifact.name))
+        } else {
+          await writeFile(join(root, artifact.name), content)
+        }
+      }
+      await expect(verifyArtifactDirectory(root, artifacts)).rejects.toThrow("hard link")
+    } finally {
+      await rm(temporary, { force: true, recursive: true })
+    }
+  })
+
+  test("rejects an artifact root that is a symlink or junction", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "opencode-cycle-linked-root-"))
+    const target = join(temporary, "target")
+    const linked = join(temporary, "linked")
+    try {
+      await mkdir(target)
+      for (const [name, content] of expectedArtifactContents) {
+        await writeFile(join(target, name), content)
+      }
+      await symlink(target, linked, process.platform === "win32" ? "junction" : "dir")
+      await expect(verifyArtifactDirectory(linked, manifestArtifacts())).rejects.toThrow(/link|alias|root/)
+    } finally {
+      await rm(temporary, { force: true, recursive: true })
+    }
   })
 
   test("rejects missing Desktop receipts and failed scale or repeatability receipts", async () => {
@@ -282,19 +338,28 @@ describe("release manifest", () => {
     ).toThrow("failed")
   })
 
-  test("Release Candidate directly depends on every source, package, platform and stress gate", async () => {
-    const workflow = await Bun.file(resolve(import.meta.dir, "../../.github/workflows/release-candidate.yml")).text()
-    expect(workflow).toContain(
-      "needs: [quality, security, plugin, native, desktop, repeatability, scale]",
-    )
-    expect(workflow).toContain("  repeatability:\n")
-    expect(workflow).toContain("run: bun run test:repeat-critical")
-    expect(workflow).toContain("run: bun run test:scale:500k")
-    expect(workflow.toLowerCase()).not.toContain("darwin")
-    expect(workflow.toLowerCase()).not.toContain("macos")
-    expect(workflow).not.toContain("npm publish")
-    const actionReferences = [...workflow.matchAll(/uses:\s+\S+@([^\s]+)/gu)].map((match) => match[1])
-    expect(actionReferences.length).toBeGreaterThan(0)
-    expect(actionReferences.every((reference) => /^[0-9a-f]{40}$/u.test(reference as string))).toBeTrue()
+  test("Desktop receipt schema is exact and bound to official assets, activation and health", () => {
+    const evidence = certificationEvidence()[0] as Record<string, unknown>
+    const desktop = evidence.desktop as Record<string, unknown>
+    const controlPlane = evidence.controlPlane as Record<string, unknown>
+    const mutations: unknown[] = [
+      { ...evidence, unexpected: true },
+      { ...evidence, activationNonce: "not-a-nonce" },
+      { ...evidence, activationRevision: otherRevision },
+      { ...evidence, activationPluginPackageSha256: "f".repeat(64) },
+      { ...evidence, activationNativePackageSha256: "e".repeat(64) },
+      { ...evidence, controlPlane: { ...controlPlane, productVersion: "9.9.9" } },
+      { ...evidence, controlPlane: { ...controlPlane, schemaMode: "safe_read_only" } },
+      { ...evidence, desktop: { ...desktop, version: "1.18.20" } },
+      { ...evidence, desktop: { ...desktop, sha256: "f".repeat(64) } },
+      { ...evidence, desktop: { ...desktop, size: 1 } },
+      { ...evidence, desktop: { ...desktop, profileIsolation: "owner-profile" } },
+      { ...evidence, desktop: { ...desktop, authenticity: undefined } },
+      { ...evidence, desktop: { ...desktop, unexpected: true } },
+    ]
+    for (const mutation of mutations) {
+      expect(() => classifyCertificationEvidence(mutation)).toThrow()
+    }
   })
+
 })

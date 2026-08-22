@@ -16,7 +16,7 @@ const supportedClient = () => ({
 })
 
 test("enables certified hosts without safe mode", () => {
-  expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.16", "1.18.18", "1.18.21"])
+  expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.16", "1.18.18"])
   expect(MINIMUM_HOST_VERSION).toBe("1.18.16")
   for (const version of CERTIFIED_HOST_VERSIONS) {
     const result = negotiateCapabilities(supportedClient(), version)
@@ -37,7 +37,7 @@ test("enables certified hosts without safe mode", () => {
 })
 
 test("newer 1.x Desktop updates stay active when required capabilities exist", () => {
-  for (const version of ["1.18.17", "1.18.19", "1.18.20", "1.19.0"]) {
+  for (const version of ["1.18.17", "1.18.19", "1.18.20", "1.18.21", "1.19.0"]) {
     const result = negotiateCapabilities(supportedClient(), version)
     expect(result.safeMode).toBeFalse()
     expect(result.certified).toBeFalse()

@@ -1,12 +1,15 @@
-import { createHash } from "node:crypto"
-import { readFile, writeFile } from "node:fs/promises"
+import { writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 
 import { PRODUCT_IDENTITY, SHIPPED_NATIVE_PACKAGE_NAMES } from "../product-identity.js"
+import { inspectTarGz } from "../packaging/tar-archive.js"
 import {
+  assertArtifactInventoryMatchesManifest,
+  readReleaseManifest,
   REQUIRED_CERTIFIED_PLATFORMS,
   QUALITY_EVIDENCE_NAMES,
 } from "./release-manifest.js"
+import { readVerifiedFileDirectory } from "./verified-file.js"
 
 const PACKAGE_NAMES = [
   ...SHIPPED_NATIVE_PACKAGE_NAMES,
@@ -56,22 +59,20 @@ export function buildPublicationPlan(
 async function main(): Promise<void> {
   const options = parseArguments(Bun.argv.slice(2))
   const candidate = resolve(options.candidate)
-  const manifest = JSON.parse(
-    await readFile(join(candidate, "release-manifest.json"), "utf8"),
-  ) as PublicationManifest
+  const manifest = await readReleaseManifest(join(candidate, "release-manifest.json"))
   const archives = buildPublicationPlan(manifest, options.version, options.revision)
+  const verifiedArtifacts = await readVerifiedFileDirectory(join(candidate, "artifacts"))
+  assertArtifactInventoryMatchesManifest(
+    verifiedArtifacts.map(({ name, sha256, size }) => ({ name, sha256, size })),
+    manifest.artifacts,
+  )
   for (const [index, archive] of archives.entries()) {
-    const path = join(candidate, "artifacts", archive)
-    const content = await readFile(path)
+    const file = verifiedArtifacts.find((artifact) => artifact.name === archive)
     const recorded = manifest.artifacts.find((item) => item.name === archive)
-    if (
-      recorded === undefined ||
-      recorded.size !== content.byteLength ||
-      recorded.sha256 !== createHash("sha256").update(content).digest("hex")
-    ) {
+    if (file === undefined || recorded === undefined) {
       throw new Error(`Release artifact identity does not match: ${archive}`)
     }
-    const packageManifest = await packedManifest(path)
+    const packageManifest = packedManifest(file.content)
     if (packageManifest.name !== PACKAGE_NAMES[index] || packageManifest.version !== options.version) {
       throw new Error(`Packed package identity does not match: ${archive}`)
     }
@@ -83,14 +84,13 @@ async function main(): Promise<void> {
   )
 }
 
-async function packedManifest(path: string): Promise<{ name?: unknown; version?: unknown }> {
-  const process = Bun.spawn(["tar", "-xOf", path, "package/package.json"], {
-    stderr: "inherit",
-    stdout: "pipe",
-  })
-  const output = await new Response(process.stdout).text()
-  if ((await process.exited) !== 0) throw new Error(`Cannot read packed manifest: ${path}`)
-  return JSON.parse(output) as { name?: unknown; version?: unknown }
+function packedManifest(content: Uint8Array): { name?: unknown; version?: unknown } {
+  const manifests = inspectTarGz(content).filter((entry) => entry.name === "package/package.json")
+  if (manifests.length !== 1) throw new Error("Packed artifact must contain exactly one package manifest")
+  return JSON.parse(manifests[0]?.content.toString("utf8") ?? "null") as {
+    name?: unknown
+    version?: unknown
+  }
 }
 
 function archiveName(packageName: string, version: string): string {

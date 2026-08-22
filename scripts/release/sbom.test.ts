@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join, resolve } from "node:path"
+import { gzipSync } from "node:zlib"
 
-import { buildCycloneDxBom, type CargoMetadata, type JavaScriptPackage } from "./sbom.js"
+import {
+  buildCycloneDxBom,
+  collectJavaScriptInventory,
+  collectPackedJavaScriptInventory,
+  validateCycloneDxBom,
+  type CargoMetadata,
+  type JavaScriptPackage,
+} from "./sbom.js"
+import type { VerifiedFile } from "./verified-file.js"
 
 describe("release SBOM", () => {
   test("includes only production-reachable Rust and JavaScript dependencies", () => {
@@ -87,6 +100,80 @@ describe("release SBOM", () => {
       ),
     ).toThrow("manifest artifact allowlist")
   })
+
+  test("missing required JavaScript dependencies fail instead of disappearing from the SBOM", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cycle-sbom-missing-dependency-"))
+    const packageRoot = join(root, "package")
+    try {
+      await mkdir(packageRoot)
+      await writeFile(
+        join(packageRoot, "package.json"),
+        JSON.stringify({
+          dependencies: { "missing-production-package": "1.0.0" },
+          license: "MIT",
+          name: "root-package",
+          version: "1.0.0",
+        }),
+      )
+      await expect(collectJavaScriptInventory(root, [packageRoot])).rejects.toThrow(
+        "missing-production-package",
+      )
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  test("derives release package roots from verified tar manifests and cross-checks bun.lock", async () => {
+    const root = resolve(import.meta.dir, "../..")
+    const version = "1.0.0"
+    const packed = await Promise.all(
+      [
+        ["opencode-cycle", `opencode-cycle-${version}.tgz`],
+        ["native-linux-x64", `opencode-cycle-native-linux-x64-${version}.tgz`],
+        ["native-win32-x64", `opencode-cycle-native-win32-x64-${version}.tgz`],
+      ].map(async ([directory, name]) => {
+        const manifest = await readFile(join(root, "packages", directory as string, "package.json"))
+        return verifiedTar(name as string, manifest)
+      }),
+    )
+    const lock = await readFile(join(root, "bun.lock"), "utf8")
+    const inventory = await collectPackedJavaScriptInventory(root, packed, version, lock)
+    expect(inventory.roots).toEqual([
+      "@opencode-cycle/native-linux-x64@1.0.0",
+      "@opencode-cycle/native-win32-x64@1.0.0",
+      "opencode-cycle@1.0.0",
+    ])
+    expect(inventory.packages.map((item) => `${item.name}@${item.version}`)).toContain(
+      "@opencode-ai/sdk@1.18.21",
+    )
+
+    const plugin = JSON.parse(
+      await readFile(join(root, "packages", "opencode-cycle", "package.json"), "utf8"),
+    ) as Record<string, unknown>
+    plugin.dependencies = { "@opencode-ai/plugin": "1.18.21", "puppeteer-core": "25.6.0" }
+    const missingSdk = packed.map((artifact) =>
+      artifact.name.startsWith("opencode-cycle-1.0.0")
+        ? verifiedTar(artifact.name, Buffer.from(JSON.stringify(plugin)))
+        : artifact,
+    )
+    await expect(collectPackedJavaScriptInventory(root, missingSdk, version, lock)).rejects.toThrow(
+      "allowlist",
+    )
+  })
+
+  test("validates generated output against the local official CycloneDX 1.6 schema", async () => {
+    const bom = buildCycloneDxBom(
+      { packages: [packageRecord("root", "0.1.0", "MIT")], resolve: { nodes: [], root: null } },
+      "root@0.1.0",
+      [],
+      [],
+      [],
+    )
+    await expect(validateCycloneDxBom(bom)).resolves.toBeUndefined()
+    await expect(validateCycloneDxBom({ ...bom, specVersion: "1.5" })).rejects.toThrow(
+      "CycloneDX 1.6",
+    )
+  })
 })
 
 function packageRecord(name: string, version: string, license: string) {
@@ -97,4 +184,42 @@ function packageRecord(name: string, version: string, license: string) {
     source: "registry+https://github.com/rust-lang/crates.io-index",
     version,
   }
+}
+
+function verifiedTar(name: string, manifest: Buffer): VerifiedFile {
+  const content = tarGz([["package/package.json", manifest]])
+  return {
+    content,
+    name,
+    path: join("C:\\verified", name),
+    sha256: createHash("sha256").update(content).digest("hex"),
+    size: content.byteLength,
+  }
+}
+
+function tarGz(entries: readonly (readonly [string, Buffer])[]): Buffer {
+  const blocks: Buffer[] = []
+  for (const [name, content] of entries) {
+    const header = Buffer.alloc(512)
+    header.write(name, 0, 100, "utf8")
+    writeOctal(header, 0o644, 100, 8)
+    writeOctal(header, 0, 108, 8)
+    writeOctal(header, 0, 116, 8)
+    writeOctal(header, content.byteLength, 124, 12)
+    writeOctal(header, 0, 136, 12)
+    header.fill(0x20, 148, 156)
+    header[156] = "0".charCodeAt(0)
+    header.write("ustar\0", 257, 6, "ascii")
+    header.write("00", 263, 2, "ascii")
+    let checksum = 0
+    for (const byte of header) checksum += byte
+    header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, 8, "ascii")
+    blocks.push(header, content, Buffer.alloc((512 - (content.byteLength % 512)) % 512))
+  }
+  blocks.push(Buffer.alloc(1024))
+  return gzipSync(Buffer.concat(blocks))
+}
+
+function writeOctal(buffer: Buffer, value: number, offset: number, length: number): void {
+  buffer.write(`${value.toString(8).padStart(length - 1, "0")}\0`, offset, length, "ascii")
 }

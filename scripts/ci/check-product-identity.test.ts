@@ -158,3 +158,17 @@ test("identity audit skips known binary files and accepts normal Unicode text", 
     await rm(root, { force: true, recursive: true })
   }
 })
+
+test("identity audit excludes only the exact vendored third-party schema paths", async () => {
+  const root = await fixture({
+    "scripts/release/schema/bom-1.6.schema.json": `third-party ${legacyCommand}`,
+    "scripts/release/schema/not-vendored.schema.json": `unreviewed ${legacyCommand}`,
+  })
+  try {
+    await expect(auditProductIdentity(root)).resolves.toEqual([
+      `scripts/release/schema/not-vendored.schema.json: ${legacyCommand}`,
+    ])
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})

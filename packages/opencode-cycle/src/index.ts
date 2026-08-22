@@ -1,4 +1,3 @@
-import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import type { Config, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
@@ -26,6 +25,10 @@ import {
 } from "./capabilities.js"
 import { parseCycleCommand, registerCycleCommand } from "./commands.js"
 import {
+  certificationBindingFromOptions,
+  writeDesktopActivationMarker,
+} from "./certification.js"
+import {
   LocalControlPlane,
   resolveDataDirectory,
   type AdmissionReceipt,
@@ -52,20 +55,6 @@ import { cycleRoleTool } from "./cycle-role-tool.js"
 import { cycleControlTool } from "./cycle-tool.js"
 
 const PRODUCT_VERSION = "1.0.0"
-
-async function recordDesktopActivation(dataDirectory: string | undefined): Promise<void> {
-  try {
-    const activationDirectory = dataDirectory ?? resolveDataDirectory(process.platform, process.env)
-    await mkdir(activationDirectory, { recursive: true })
-    await writeFile(
-      join(activationDirectory, "desktop-activation.log"),
-      `${PRODUCT_NAME} activated\n`,
-      "utf8",
-    )
-  } catch {
-    // Live and certification hosts still proceed if the marker cannot be written.
-  }
-}
 
 function optionString(options: PluginOptions | undefined, key: string): string | undefined {
   const value = options?.[key]
@@ -188,6 +177,10 @@ const OpenCodeCycle: Plugin = async (input, options) => {
     ...(binaryPath === undefined ? {} : { binaryPath }),
     ...(dataDirectory === undefined ? {} : { dataDirectory }),
   })
+  const certificationBinding = certificationBindingFromOptions(pluginOptions, process.env)
+  if (certificationBinding !== undefined) {
+    await writeDesktopActivationMarker(certificationBinding, await controlPlane.health())
+  }
   const projectKey = input.project?.id ?? input.directory ?? "unknown-project"
   const workflowSessions = new Set<string>()
   const workflows = new Map<string, string>()
@@ -648,7 +641,6 @@ const OpenCodeCycle: Plugin = async (input, options) => {
         : effectiveRoleVariants()[role],
   })
 
-  await recordDesktopActivation(dataDirectory)
   return {
     tool: {
       [CYCLE_TOOL_NAMES.control]: cycleControlTool(controlPlane, projectKey, setupInspector),
@@ -718,7 +710,6 @@ const OpenCodeCycle: Plugin = async (input, options) => {
             },
           })
           .catch(() => undefined)
-        await recordDesktopActivation(dataDirectory)
       } catch (error) {
         await logSetupFailure(input, error)
       }

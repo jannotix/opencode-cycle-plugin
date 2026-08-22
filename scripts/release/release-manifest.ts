@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto"
-import { readFile, readdir, writeFile } from "node:fs/promises"
-import { basename, relative, resolve, sep } from "node:path"
+import { writeFile } from "node:fs/promises"
+import { basename, resolve } from "node:path"
 
 import { NATIVE_PACKAGE_NAMES, PRODUCT_IDENTITY } from "../product-identity.js"
+import { readVerifiedFileDirectory, readVerifiedRegularFile } from "./verified-file.js"
 
 export const REQUIRED_CERTIFIED_PLATFORMS = ["linux-x64", "windows-x64"] as const
 export const DECLARED_DESKTOP_PLATFORMS = REQUIRED_CERTIFIED_PLATFORMS
@@ -14,9 +14,24 @@ export type CertifiedPlatform = (typeof DECLARED_DESKTOP_PLATFORMS)[number]
 export type CertificationStatus = "certified"
 export type QualityEvidenceName = (typeof QUALITY_EVIDENCE_NAMES)[number]
 
+export const OPENCODE_DESKTOP_VERSION = "1.18.21" as const
+export const DESKTOP_ASSET_METADATA = {
+  "linux-x64": {
+    name: "opencode-desktop-linux-x86_64.AppImage",
+    sha256: "fb384fc4f030aca8624d775b8757cafa39b5871fc0eddeecebb128f25ed649d8",
+    size: 158_944_115,
+  },
+  "windows-x64": {
+    name: "opencode-desktop-win-x64.exe",
+    sha256: "3bd1a81d8fcb377a6bda60a9abf8d412aca1c9c702218ddbbdf7c7b09deaa739",
+    size: 126_209_592,
+  },
+} as const satisfies Readonly<
+  Record<CertifiedPlatform, { readonly name: string; readonly sha256: string; readonly size: number }>
+>
 export const DESKTOP_ASSET_NAMES: Readonly<Record<CertifiedPlatform, string>> = {
-  "linux-x64": "opencode-desktop-linux-x86_64.AppImage",
-  "windows-x64": "opencode-desktop-win-x64.exe",
+  "linux-x64": DESKTOP_ASSET_METADATA["linux-x64"].name,
+  "windows-x64": DESKTOP_ASSET_METADATA["windows-x64"].name,
 }
 
 const NATIVE_PACKAGE_BY_PLATFORM: Readonly<Record<CertifiedPlatform, string>> = {
@@ -168,25 +183,76 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       throw new Error("Desktop certification has an invalid platform")
     }
     const platform = evidence.platform as CertifiedPlatform
+    requireExactKeys(
+      evidence,
+      [
+        "activationCreatedAtUnixMillis",
+        "activationLogSha256",
+        "activationMarker",
+        "activationNativePackageSha256",
+        "activationNonce",
+        "activationPluginPackageSha256",
+        "activationRevision",
+        "controlPlane",
+        "desktop",
+        "nativePackageSha256",
+        "platform",
+        "pluginPackageSha256",
+        "revision",
+        "schemaVersion",
+      ],
+      "Desktop certification",
+    )
+    const controlPlane = requireExactRecord(
+      evidence.controlPlane,
+      ["productVersion", "protocolVersion", "schemaMode", "schemaVersion"],
+      "Desktop control-plane health",
+    )
+    const desktop = requireExactRecord(
+      evidence.desktop,
+      ["asset", "authenticity", "profileIsolation", "sha256", "size", "version"],
+      "Desktop asset evidence",
+    )
+    const asset = DESKTOP_ASSET_METADATA[platform]
     if (
       evidence.activationMarker !== PRODUCT_IDENTITY.activationMarker ||
       typeof evidence.activationLogSha256 !== "string" ||
-      !isRecord(evidence.controlPlane) ||
-      evidence.controlPlane.protocolVersion !== 1 ||
-      evidence.controlPlane.schemaVersion !== 17 ||
-      !isRecord(evidence.desktop) ||
-      evidence.desktop.asset !== DESKTOP_ASSET_NAMES[platform] ||
-      typeof evidence.desktop.version !== "string" ||
-      typeof evidence.desktop.sha256 !== "string" ||
+      typeof evidence.activationNonce !== "string" ||
+      typeof evidence.activationRevision !== "string" ||
+      typeof evidence.activationPluginPackageSha256 !== "string" ||
+      typeof evidence.activationNativePackageSha256 !== "string" ||
+      typeof evidence.activationCreatedAtUnixMillis !== "number" ||
+      !Number.isSafeInteger(evidence.activationCreatedAtUnixMillis) ||
+      evidence.activationCreatedAtUnixMillis < 1 ||
+      controlPlane.productVersion !== "1.0.0" ||
+      controlPlane.protocolVersion !== 1 ||
+      controlPlane.schemaMode !== "read_write" ||
+      controlPlane.schemaVersion !== 17 ||
+      desktop.asset !== asset.name ||
+      desktop.version !== OPENCODE_DESKTOP_VERSION ||
+      desktop.sha256 !== asset.sha256 ||
+      desktop.size !== asset.size ||
+      desktop.profileIsolation !== "fresh-isolated-certification-root" ||
       typeof evidence.nativePackageSha256 !== "string" ||
       typeof evidence.pluginPackageSha256 !== "string"
     ) {
       throw new Error("Desktop certification is incomplete")
     }
     validateDigest(evidence.activationLogSha256)
-    validateDigest(evidence.desktop.sha256)
+    validateDigest(evidence.activationNonce)
+    validateRevision(evidence.activationRevision)
+    validateDigest(evidence.activationPluginPackageSha256)
+    validateDigest(evidence.activationNativePackageSha256)
     validateDigest(evidence.nativePackageSha256)
     validateDigest(evidence.pluginPackageSha256)
+    if (
+      evidence.activationRevision !== evidence.revision ||
+      evidence.activationPluginPackageSha256 !== evidence.pluginPackageSha256 ||
+      evidence.activationNativePackageSha256 !== evidence.nativePackageSha256
+    ) {
+      throw new Error("Desktop activation binding does not match the receipt")
+    }
+    validateDesktopAuthenticity(platform, desktop.authenticity)
     return {
       kind: "desktop",
       nativePackageSha256: evidence.nativePackageSha256,
@@ -255,25 +321,21 @@ export interface CreateReleaseManifestOptions {
 }
 
 export async function createReleaseManifest(options: CreateReleaseManifestOptions): Promise<ReleaseManifest> {
-  const artifactsDirectory = resolve(options.artifactsDirectory)
-  const artifactPaths = await collectFiles(artifactsDirectory)
-  assertDirectUniqueArtifacts(artifactsDirectory, artifactPaths)
-  const artifacts = await Promise.all(artifactPaths.map(readArtifact))
+  const artifactFiles = await readVerifiedFileDirectory(options.artifactsDirectory)
+  const artifacts = artifactFiles.map(({ name, sha256, size }) => ({ name, sha256, size }))
 
-  const certificationsDirectory = resolve(options.certificationsDirectory)
-  const certificationPaths = await collectFiles(certificationsDirectory)
-  const unsupported = certificationPaths.find((path) => !path.endsWith(".json"))
+  const certificationFiles = await readVerifiedFileDirectory(options.certificationsDirectory)
+  const unsupported = certificationFiles.find((file) => !file.name.endsWith(".json"))
   if (unsupported !== undefined) {
-    throw new Error(`Unsupported certification material: ${relative(certificationsDirectory, unsupported)}`)
+    throw new Error(`Unsupported certification material: ${unsupported.name}`)
   }
   const classified = await Promise.all(
-    certificationPaths.map(async (path) => {
-      const content = await readFile(path)
-      const classification = classifyCertificationEvidence(JSON.parse(content.toString("utf8")) as unknown)
+    certificationFiles.map(async (file) => {
+      const classification = classifyCertificationEvidence(JSON.parse(file.content.toString("utf8")) as unknown)
       if (classification.revision !== options.revision) {
-        throw new Error(`Certification revision does not match: ${basename(path)}`)
+        throw new Error(`Certification revision does not match: ${file.name}`)
       }
-      return { evidenceSha256: sha256(content), ...classification }
+      return { evidenceSha256: file.sha256, ...classification }
     }),
   )
   const artifactsByName = new Map(artifacts.map((artifact) => [artifact.name, artifact]))
@@ -316,7 +378,8 @@ export async function createReleaseManifest(options: CreateReleaseManifestOption
 }
 
 export async function readReleaseManifest(path: string): Promise<ReleaseManifest> {
-  const value = JSON.parse(await readFile(resolve(path), "utf8")) as unknown
+  const file = await readVerifiedRegularFile(path, { maxBytes: 5 * 1024 * 1024 })
+  const value = JSON.parse(file.content.toString("utf8")) as unknown
   if (
     !isRecord(value) ||
     value.product !== PRODUCT_IDENTITY.product ||
@@ -336,10 +399,8 @@ export async function verifyArtifactDirectory(
   directory: string,
   manifestArtifacts: readonly ReleaseArtifact[],
 ): Promise<ReleaseArtifact[]> {
-  const root = resolve(directory)
-  const paths = await collectFiles(root)
-  assertDirectUniqueArtifacts(root, paths)
-  const artifacts = await Promise.all(paths.map(readArtifact))
+  const files = await readVerifiedFileDirectory(directory)
+  const artifacts = files.map(({ name, sha256, size }) => ({ name, sha256, size }))
   assertArtifactInventoryMatchesManifest(artifacts, manifestArtifacts)
   return artifacts.sort((left, right) => left.name.localeCompare(right.name))
 }
@@ -368,36 +429,6 @@ export function assertArtifactInventoryMatchesManifest(
 
 async function main(): Promise<void> {
   await createReleaseManifest(parseArguments(Bun.argv.slice(2)))
-}
-
-async function collectFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true })
-  const paths: string[] = []
-  for (const entry of entries) {
-    const path = resolve(directory, entry.name)
-    if (entry.isDirectory()) paths.push(...(await collectFiles(path)))
-    else if (entry.isFile()) paths.push(path)
-    else throw new Error(`Release material must be a regular file: ${path}`)
-  }
-  return paths.sort()
-}
-
-function assertDirectUniqueArtifacts(root: string, paths: readonly string[]): void {
-  const names = new Set<string>()
-  for (const path of paths) {
-    const name = basename(path)
-    if (names.has(name)) throw new Error(`Duplicate artifact: ${name}`)
-    names.add(name)
-  }
-  for (const path of paths) {
-    const relativePath = relative(root, path).split(sep).join("/")
-    if (relativePath !== basename(path)) throw new Error(`Artifact must be a direct file: ${relativePath}`)
-  }
-}
-
-async function readArtifact(path: string): Promise<ReleaseArtifact> {
-  const content = await readFile(path)
-  return { name: basename(path), sha256: sha256(content), size: content.byteLength }
 }
 
 function archiveName(packageName: string, version: string): string {
@@ -456,6 +487,53 @@ function requireExactSet(actual: readonly string[], expected: readonly string[],
   }
 }
 
+function requireExactRecord(
+  value: unknown,
+  keys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${label} must be an object`)
+  requireExactKeys(value, keys, label)
+  return value
+}
+
+function requireExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new Error(`${label} has missing or unknown fields`)
+  }
+}
+
+function validateDesktopAuthenticity(platform: CertifiedPlatform, value: unknown): void {
+  if (platform === "linux-x64") {
+    const authenticity = requireExactRecord(value, ["method", "status"], "Desktop authenticity")
+    if (authenticity.method !== "sha256" || authenticity.status !== "verified") {
+      throw new Error("Linux Desktop authenticity is invalid")
+    }
+    return
+  }
+  const authenticity = requireExactRecord(
+    value,
+    ["applicationSigner", "installerSigner", "method", "status"],
+    "Desktop authenticity",
+  )
+  if (
+    authenticity.method !== "authenticode" ||
+    authenticity.status !== "verified" ||
+    typeof authenticity.applicationSigner !== "string" ||
+    authenticity.applicationSigner.trim().length === 0 ||
+    typeof authenticity.installerSigner !== "string" ||
+    authenticity.installerSigner.trim().length === 0
+  ) {
+    throw new Error("Windows Desktop authenticity is invalid")
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -499,10 +577,6 @@ function parseArguments(argumentsList: readonly string[]): CreateReleaseManifest
     revision: options.get("revision") as string,
     version: options.get("version") as string,
   }
-}
-
-function sha256(content: Uint8Array): string {
-  return createHash("sha256").update(content).digest("hex")
 }
 
 function validateDigest(value: string): void {

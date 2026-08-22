@@ -113,7 +113,7 @@ struct TimingResults {
 
 fn main() {
     let options = options();
-    let revision = source_revision();
+    let source = source_snapshot();
     let total_started = Instant::now();
     let output = options.output.clone();
     let temporary = tempfile::tempdir().expect("benchmark temporary directory must be available");
@@ -288,7 +288,7 @@ fn main() {
             renamed_found,
         },
         passed,
-        revision,
+        revision: source.revision.clone(),
         resources,
         schema_version: 1,
         timings_ms: TimingResults {
@@ -302,6 +302,7 @@ fn main() {
             total: total_time.as_millis(),
         },
     };
+    assert_source_unchanged(&source);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).expect("benchmark result directory must be created");
     }
@@ -322,32 +323,91 @@ fn main() {
     }
 }
 
-fn source_revision() -> String {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceSnapshot {
+    revision: String,
+}
+
+fn source_snapshot() -> SourceSnapshot {
+    let revision = git_output(&["rev-parse", "HEAD"]);
+    let changes = git_output(&["status", "--porcelain=v1", "--untracked-files=all"]);
+    validate_source_snapshot(
+        revision.trim(),
+        &changes,
+        std::env::var("CYCLE_RELEASE_REVISION").ok().as_deref(),
+    )
+    .unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn assert_source_unchanged(before: &SourceSnapshot) {
+    let revision = git_output(&["rev-parse", "HEAD"]);
+    let changes = git_output(&["status", "--porcelain=v1", "--untracked-files=all"]);
+    validate_source_unchanged(
+        before,
+        revision.trim(),
+        &changes,
+        std::env::var("CYCLE_RELEASE_REVISION").ok().as_deref(),
+    )
+    .unwrap_or_else(|message| panic!("{message}"));
+}
+
+fn git_output(arguments: &[&str]) -> String {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(arguments)
         .current_dir(repository)
         .output()
-        .expect("release revision must be resolved with git");
+        .expect("release source state must be resolved with git");
     assert!(
         output.status.success(),
-        "release revision must be resolved with git"
+        "release source state must be resolved with git"
     );
-    let revision = String::from_utf8(output.stdout)
-        .expect("release revision must be UTF-8")
-        .trim()
-        .to_owned();
-    assert!(
-        valid_revision(&revision),
-        "release revision must be a full Git object ID"
-    );
-    if let Ok(expected) = std::env::var("CYCLE_RELEASE_REVISION") {
-        assert_eq!(
-            revision, expected,
-            "release revision does not match CYCLE_RELEASE_REVISION"
+    String::from_utf8(output.stdout).expect("release source state must be UTF-8")
+}
+
+fn validate_source_snapshot(
+    revision: &str,
+    changes: &str,
+    claimed_revision: Option<&str>,
+) -> Result<SourceSnapshot, String> {
+    if !valid_revision(revision) {
+        return Err("release revision must be a full Git object ID".to_owned());
+    }
+    if claimed_revision.is_some_and(|claimed| claimed != revision) {
+        return Err("claimed release revision does not match full HEAD".to_owned());
+    }
+    if !changes.trim().is_empty() {
+        return Err(format!(
+            "release source is dirty before the workload: {}",
+            changes.trim().replace('\n', ", ")
+        ));
+    }
+    Ok(SourceSnapshot {
+        revision: revision.to_owned(),
+    })
+}
+
+fn validate_source_unchanged(
+    before: &SourceSnapshot,
+    revision: &str,
+    changes: &str,
+    claimed_revision: Option<&str>,
+) -> Result<(), String> {
+    if revision != before.revision {
+        return Err("release source revision changed during the workload".to_owned());
+    }
+    if claimed_revision.is_some_and(|claimed| claimed != revision) {
+        return Err(
+            "claimed release revision does not match full HEAD after the workload".to_owned(),
         );
     }
-    revision
+    if !changes.trim().is_empty() {
+        return Err(format!(
+            "release source is dirty after the workload: {}",
+            changes.trim().replace('\n', ", ")
+        ));
+    }
+    Ok(())
 }
 
 fn valid_revision(value: &str) -> bool {
@@ -580,6 +640,27 @@ mod tests {
         assert!(valid_revision(&"f".repeat(64)));
         assert!(!valid_revision(&"A".repeat(40)));
         assert!(!valid_revision("not-a-revision"));
+    }
+
+    #[test]
+    fn release_receipt_rejects_dirty_source_before_and_after_the_workload() {
+        let revision = "a".repeat(40);
+        assert!(
+            validate_source_snapshot(&revision, "?? untracked.txt\n", Some(&revision)).is_err()
+        );
+        let before = validate_source_snapshot(&revision, "", Some(&revision)).unwrap();
+        assert!(
+            validate_source_unchanged(&before, &revision, " M tracked.txt\n", Some(&revision))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn release_receipt_rejects_claimed_and_post_workload_revision_drift() {
+        let revision = "a".repeat(40);
+        assert!(validate_source_snapshot(&revision, "", Some(&"b".repeat(40))).is_err());
+        let before = validate_source_snapshot(&revision, "", Some(&revision)).unwrap();
+        assert!(validate_source_unchanged(&before, &"c".repeat(40), "", Some(&revision)).is_err());
     }
 
     #[test]
