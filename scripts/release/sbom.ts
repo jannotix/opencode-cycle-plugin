@@ -286,55 +286,104 @@ export async function collectPackedJavaScriptInventory(
   const visit = async (
     name: string,
     requirement: string,
+    relationship: LockedRelationship = "dependency",
     issuerDirectory: string = workspaceRoot,
     issuerNode?: LockedPackage,
-  ): Promise<string> => {
+    allowLockOnly = false,
+  ): Promise<string | undefined> => {
     const packedManifest = packed.get(name)
     if (packedManifest !== undefined) {
       assertVersionSatisfies(name, packedManifest.version, requirement)
       return `${name}@${packedManifest.version}`
     }
-    const locked = resolveLockedPackage(lockedPackages, name, requirement, issuerNode)
+    const locked = resolveLockedPackage(lockedPackages, name, requirement, relationship, issuerNode)
+    if (locked === undefined) return undefined
+    if (!isReleaseTargetApplicable(locked)) {
+      if (isOptionalRelationship(relationship)) return undefined
+      throw new Error(`Required production ${relationship} is outside the Windows/Linux x64 union: ${name}`)
+    }
     const identity = `${locked.name}@${locked.version}`
     if (visiting.has(locked.key)) {
       throw new Error(`bun.lock production dependency cycle includes ${locked.key}`)
     }
     const installed = await resolveInstalledPackage(issuerDirectory, workspaceRoot, name)
-    if (installed === undefined) throw new Error(`Required locked production dependency is missing: ${name}`)
-    const installedRealpath = await realpath(installed)
-    const installedManifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8")) as {
-      license?: unknown
-      name?: unknown
-      version?: unknown
+    let installedLicense: string | null = null
+    let lockOnly = allowLockOnly
+    if (installed === undefined) {
+      const otherReleaseTarget = isOptionalRelationship(relationship) &&
+        hasTargetRestriction(locked) &&
+        !isCurrentTargetApplicable(locked)
+      if (!lockOnly && !otherReleaseTarget) {
+        if (isOptionalRelationship(relationship)) return undefined
+        throw new Error(`Required locked production ${relationship} is missing: ${name}`)
+      }
+      lockOnly = true
+    } else {
+      const installedRealpath = await realpath(installed)
+      const installedManifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8")) as {
+        license?: unknown
+        name?: unknown
+        version?: unknown
+      }
+      if (installedManifest.name !== name || installedManifest.version !== locked.version) {
+        throw new Error(`Installed ${relationship} does not match bun.lock: ${name}`)
+      }
+      const priorInstalled = installedNodes.get(locked.key)
+      if (priorInstalled !== undefined && priorInstalled !== installedRealpath) {
+        throw new Error(`Installed dependency resolution is ambiguous for bun.lock node: ${locked.key}`)
+      }
+      installedNodes.set(locked.key, installedRealpath)
+      installedLicense = typeof installedManifest.license === "string" ? installedManifest.license : null
     }
-    if (installedManifest.name !== name || installedManifest.version !== locked.version) {
-      throw new Error(`Installed dependency does not match bun.lock: ${name}`)
-    }
-    const priorInstalled = installedNodes.get(locked.key)
-    if (priorInstalled !== undefined && priorInstalled !== installedRealpath) {
-      throw new Error(`Installed dependency resolution is ambiguous for bun.lock node: ${locked.key}`)
-    }
-    installedNodes.set(locked.key, installedRealpath)
     const priorIdentity = resolvedNodes.get(locked.key)
-    if (priorIdentity !== undefined) return priorIdentity
+    if (priorIdentity !== undefined) {
+      const priorRecord = records.get(priorIdentity)
+      if (
+        priorRecord !== undefined &&
+        priorRecord.license === null &&
+        installedLicense !== null &&
+        !hasTargetRestriction(locked)
+      ) {
+        records.set(priorIdentity, { ...priorRecord, license: installedLicense })
+      }
+      return priorIdentity
+    }
 
     visiting.add(locked.key)
     try {
       const dependencies: string[] = []
-      for (const [dependency, dependencyRequirement] of Object.entries(locked.dependencies)) {
-        dependencies.push(await visit(dependency, dependencyRequirement, installed, locked))
+      for (const edge of lockedEdges(locked)) {
+        const dependency = await visit(
+          edge.name,
+          edge.requirement,
+          edge.relationship,
+          installed ?? issuerDirectory,
+          locked,
+          lockOnly,
+        )
+        if (dependency !== undefined) dependencies.push(dependency)
       }
       const record = {
         dependencies: [...new Set(dependencies)].sort(),
-        license: typeof installedManifest.license === "string" ? installedManifest.license : null,
+        license: hasTargetRestriction(locked) ? null : installedLicense,
         name: locked.name,
         version: locked.version,
       } satisfies JavaScriptPackage
       const priorRecord = records.get(identity)
-      if (priorRecord !== undefined && JSON.stringify(priorRecord) !== JSON.stringify(record)) {
-        throw new Error(`bun.lock package identity has ambiguous dependency graphs: ${identity}`)
+      if (priorRecord !== undefined) {
+        if (
+          JSON.stringify(priorRecord.dependencies) !== JSON.stringify(record.dependencies) ||
+          (priorRecord.license !== null && record.license !== null && priorRecord.license !== record.license)
+        ) {
+          throw new Error(`bun.lock package identity has ambiguous dependency graphs: ${identity}`)
+        }
+        records.set(identity, {
+          ...record,
+          license: priorRecord.license ?? record.license,
+        })
+      } else {
+        records.set(identity, record)
       }
-      records.set(identity, record)
       resolvedNodes.set(locked.key, identity)
       return identity
     } finally {
@@ -344,15 +393,22 @@ export async function collectPackedJavaScriptInventory(
 
   const roots: string[] = []
   for (const manifest of [...packed.values()].sort((left, right) => left.name.localeCompare(right.name))) {
-    const dependencyRequirements = {
-      ...manifest.dependencies,
-      ...manifest.optionalDependencies,
-    }
+    const edges: LockedEdge[] = [
+      ...Object.entries(manifest.dependencies).map(([name, requirement]) => ({
+        name,
+        relationship: "dependency" as const,
+        requirement,
+      })),
+      ...Object.entries(manifest.optionalDependencies).map(([name, requirement]) => ({
+        name,
+        relationship: "optional dependency" as const,
+        requirement,
+      })),
+    ].sort((left, right) => left.name.localeCompare(right.name))
     const dependencies: string[] = []
-    for (const [dependency, requirement] of Object.entries(dependencyRequirements).sort(([left], [right]) =>
-      left.localeCompare(right),
-    )) {
-      dependencies.push(await visit(dependency, requirement))
+    for (const edge of edges) {
+      const dependency = await visit(edge.name, edge.requirement, edge.relationship)
+      if (dependency !== undefined) dependencies.push(dependency)
     }
     const identity = `${manifest.name}@${manifest.version}`
     records.set(identity, {
@@ -377,11 +433,29 @@ interface ParsedBunLock {
 }
 
 interface LockedPackage {
+  readonly cpu?: string
   readonly dependencies: Readonly<Record<string, string>>
   readonly key: string
   readonly name: string
+  readonly optionalDependencies: Readonly<Record<string, string>>
+  readonly optionalPeers: readonly string[]
+  readonly os?: string
+  readonly peerDependencies: Readonly<Record<string, string>>
   readonly version: string
 }
+
+type LockedRelationship = "dependency" | "optional dependency" | "peer" | "optional peer"
+
+interface LockedEdge {
+  readonly name: string
+  readonly relationship: LockedRelationship
+  readonly requirement: string
+}
+
+const RELEASE_TARGETS = [
+  { cpu: "x64", os: "win32" },
+  { cpu: "x64", os: "linux" },
+] as const
 
 function parseBunLock(text: string): ParsedBunLock {
   const value = Bun.JSONC.parse(text) as unknown
@@ -469,10 +543,24 @@ function parseLockedPackages(lock: ParsedBunLock): ReadonlyMap<string, LockedPac
       throw new Error(`Locked dependency identity is invalid: ${key}`)
     }
     const metadata = isRecord(value[2]) ? value[2] : {}
+    const peerDependencies = stringMap(metadata.peerDependencies, `locked peer dependencies for ${key}`)
+    const optionalPeers = stringList(metadata.optionalPeers, `locked optional peers for ${key}`)
+    const unknownOptionalPeer = optionalPeers.find((peer) => peerDependencies[peer] === undefined)
+    if (unknownOptionalPeer !== undefined) {
+      throw new Error(`Locked optional peer is missing from peerDependencies for ${key}: ${unknownOptionalPeer}`)
+    }
     packages.set(key, {
+      ...(metadata.cpu === undefined ? {} : { cpu: requiredString(metadata.cpu, `locked cpu for ${key}`) }),
       dependencies: stringMap(metadata.dependencies, `locked dependencies for ${key}`),
       key,
       name,
+      optionalDependencies: stringMap(
+        metadata.optionalDependencies,
+        `locked optional dependencies for ${key}`,
+      ),
+      optionalPeers,
+      ...(metadata.os === undefined ? {} : { os: requiredString(metadata.os, `locked os for ${key}`) }),
+      peerDependencies,
       version,
     })
   }
@@ -483,8 +571,9 @@ function resolveLockedPackage(
   packages: ReadonlyMap<string, LockedPackage>,
   name: string,
   requirement: string,
+  relationship: LockedRelationship,
   issuer?: LockedPackage,
-): LockedPackage {
+): LockedPackage | undefined {
   const candidateKeys: string[] = []
   let current = issuer
   while (current !== undefined) {
@@ -507,9 +596,10 @@ function resolveLockedPackage(
 
   const matches = [...packages.values()].filter((candidate) => candidate.name === name)
   if (matches.length > 1) {
-    throw new Error(`Required production dependency is ambiguous in bun.lock: ${name}`)
+    throw new Error(`Production ${relationship} is ambiguous in bun.lock: ${name}`)
   }
-  throw new Error(`Required production dependency cannot be resolved from bun.lock: ${name}`)
+  if (isOptionalRelationship(relationship)) return undefined
+  throw new Error(`Required production ${relationship} cannot be resolved from bun.lock: ${name}`)
 }
 
 function lockQualifier(value: LockedPackage): string | undefined {
@@ -525,6 +615,50 @@ function assertVersionSatisfies(name: string, version: string, requirement: stri
   }
 }
 
+function lockedEdges(value: LockedPackage): readonly LockedEdge[] {
+  const optionalPeerSet = new Set(value.optionalPeers)
+  return [
+    ...Object.entries(value.dependencies).map(([name, requirement]) => ({
+      name,
+      relationship: "dependency" as const,
+      requirement,
+    })),
+    ...Object.entries(value.optionalDependencies).map(([name, requirement]) => ({
+      name,
+      relationship: "optional dependency" as const,
+      requirement,
+    })),
+    ...Object.entries(value.peerDependencies).map(([name, requirement]) => ({
+      name,
+      relationship: optionalPeerSet.has(name) ? "optional peer" as const : "peer" as const,
+      requirement,
+    })),
+  ].sort((left, right) =>
+    `${left.name}\0${left.relationship}`.localeCompare(`${right.name}\0${right.relationship}`),
+  )
+}
+
+function isOptionalRelationship(value: LockedRelationship): boolean {
+  return value === "optional dependency" || value === "optional peer"
+}
+
+function isReleaseTargetApplicable(value: LockedPackage): boolean {
+  return RELEASE_TARGETS.some(
+    (target) =>
+      (value.os === undefined || value.os === target.os) &&
+      (value.cpu === undefined || value.cpu === target.cpu),
+  )
+}
+
+function isCurrentTargetApplicable(value: LockedPackage): boolean {
+  return (value.os === undefined || value.os === process.platform) &&
+    (value.cpu === undefined || value.cpu === process.arch)
+}
+
+function hasTargetRestriction(value: LockedPackage): boolean {
+  return value.os !== undefined || value.cpu !== undefined
+}
+
 function stringMap(value: unknown, label: string): Readonly<Record<string, string>> {
   if (value === undefined) return {}
   if (!isRecord(value) || Object.values(value).some((item) => typeof item !== "string")) {
@@ -533,6 +667,21 @@ function stringMap(value: unknown, label: string): Readonly<Record<string, strin
   return Object.fromEntries(
     Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
   ) as Record<string, string>
+}
+
+function stringList(value: unknown, label: string): readonly string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new Error(`${label} must be a string list`)
+  }
+  const sorted = [...value].sort()
+  if (new Set(sorted).size !== sorted.length) throw new Error(`${label} must not contain duplicates`)
+  return sorted
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a string`)
+  return value
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

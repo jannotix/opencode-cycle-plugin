@@ -151,6 +151,13 @@ describe("release SBOM", () => {
     expect(identities).toContain("zod@4.1.8")
     expect(identities).toContain("string-width@7.2.0")
     expect(identities).toContain("string-width@8.2.2")
+    expect(identities).toContain("msgpackr-extract@3.0.4")
+    expect(identities).toContain("@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4")
+    expect(identities).toContain("@msgpackr-extract/msgpackr-extract-linux-x64@3.0.4")
+    expect(identities).not.toContain("@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4")
+    expect(identities).not.toContain("@msgpackr-extract/msgpackr-extract-darwin-x64@3.0.4")
+    expect(identities).not.toContain("@msgpackr-extract/msgpackr-extract-linux-arm@3.0.4")
+    expect(identities).not.toContain("@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4")
     expect(
       inventory.packages.find((item) => `${item.name}@${item.version}` === "chromium-bidi@17.0.2")
         ?.dependencies,
@@ -159,6 +166,55 @@ describe("release SBOM", () => {
       inventory.packages.find((item) => `${item.name}@${item.version}` === "cliui@9.0.1")
         ?.dependencies,
     ).toContain("string-width@7.2.0")
+    expect(
+      inventory.packages.find((item) => `${item.name}@${item.version}` === "msgpackr@2.0.5")
+        ?.dependencies,
+    ).toContain("msgpackr-extract@3.0.4")
+    expect(
+      inventory.packages.find((item) => `${item.name}@${item.version}` === "msgpackr-extract@3.0.4")
+        ?.dependencies,
+    ).toEqual([
+      "@msgpackr-extract/msgpackr-extract-linux-x64@3.0.4",
+      "@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4",
+      "node-gyp-build-optional-packages@5.2.2",
+    ])
+    expect(
+      inventory.packages.find((item) => `${item.name}@${item.version}` === "chromium-bidi@17.0.2")
+        ?.dependencies,
+    ).toContain("devtools-protocol@0.0.1653615")
+
+    const bom = buildCycloneDxBom(
+      {
+        packages: [packageRecord("root", "0.1.0", "MIT")],
+        resolve: { nodes: [{ deps: [], id: "root@0.1.0" }], root: null },
+      },
+      "root@0.1.0",
+      inventory.packages,
+      inventory.roots,
+      packed.map((artifact) => ({
+        digest: artifact.sha256,
+        name: artifact.name,
+        size: artifact.size,
+      })),
+    )
+    await expect(validateCycloneDxBom(bom)).resolves.toBeUndefined()
+    expect(
+      bom.components
+        .filter((component) => component.purl?.startsWith("pkg:npm/"))
+        .map((component) => `${component.name}@${component.version}`)
+        .sort(),
+    ).toEqual([...identities].sort())
+    expect(
+      bom.dependencies.find((entry) => entry.ref === "pkg:npm/msgpackr@2.0.5")?.dependsOn,
+    ).toContain("pkg:npm/msgpackr-extract@3.0.4")
+    expect(
+      bom.components.filter((component) => component.type === "file").map((component) => component.name).sort(),
+    ).toEqual(packed.map((artifact) => artifact.name).sort())
+    expect(
+      bom.components.find(
+        (component) => component.purl === "pkg:npm/%40msgpackr-extract/msgpackr-extract-win32-x64@3.0.4",
+      )?.type,
+    ).toBe("library")
 
     const plugin = JSON.parse(
       await readFile(join(root, "packages", "opencode-cycle", "package.json"), "utf8"),
@@ -201,6 +257,72 @@ describe("release SBOM", () => {
     await expect(
       collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(ambiguous)),
     ).rejects.toThrow("ambiguous")
+
+    const optionalPeers = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown[]>
+    }
+    const optionalPeerMsgpackr = optionalPeers.packages.msgpackr
+    if (optionalPeerMsgpackr === undefined) throw new Error("test fixture is missing msgpackr")
+    optionalPeerMsgpackr[2] = {
+      ...(optionalPeerMsgpackr[2] as object),
+      optionalPeers: ["optional-peer-missing", "yaml"],
+      peerDependencies: { "optional-peer-missing": "1.0.0", yaml: "^2.9.0" },
+    }
+    optionalPeers.packages["optional-peer-missing"] = [
+      "optional-peer-missing@1.0.0",
+      "",
+      {},
+      "sha512-test-only",
+    ]
+    const optionalPeerInventory = await collectPackedJavaScriptInventory(
+      root,
+      packed,
+      version,
+      JSON.stringify(optionalPeers),
+    )
+    expect(
+      optionalPeerInventory.packages.find(
+        (item) => `${item.name}@${item.version}` === "msgpackr@2.0.5",
+      )?.dependencies,
+    ).toContain("yaml@2.9.0")
+    expect(optionalPeerInventory.packages.map((item) => `${item.name}@${item.version}`)).not.toContain(
+      "optional-peer-missing@1.0.0",
+    )
+
+    const malformedOptionalPeers = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown[]>
+    }
+    const malformedMsgpackr = malformedOptionalPeers.packages.msgpackr
+    if (malformedMsgpackr === undefined) throw new Error("test fixture is missing msgpackr")
+    malformedMsgpackr[2] = {
+      ...(malformedMsgpackr[2] as object),
+      optionalPeers: ["not-an-encoded-peer"],
+    }
+    await expect(
+      collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(malformedOptionalPeers)),
+    ).rejects.toThrow("missing from peerDependencies")
+
+    const missingRequiredPeer = Bun.JSONC.parse(lock) as {
+      packages: Record<string, unknown[]>
+    }
+    const requiredPeerChromium = missingRequiredPeer.packages["chromium-bidi"]
+    if (requiredPeerChromium === undefined) throw new Error("test fixture is missing chromium-bidi")
+    requiredPeerChromium[2] = {
+      ...(requiredPeerChromium[2] as object),
+      peerDependencies: {
+        "devtools-protocol": "*",
+        "required-peer-missing": "1.0.0",
+      },
+    }
+    missingRequiredPeer.packages["required-peer-missing"] = [
+      "required-peer-missing@1.0.0",
+      "",
+      {},
+      "sha512-test-only",
+    ]
+    await expect(
+      collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(missingRequiredPeer)),
+    ).rejects.toThrow(/required.*peer|required.*missing/iu)
   })
 
   test("validates generated output against the local official CycloneDX 1.6 schema", async () => {
