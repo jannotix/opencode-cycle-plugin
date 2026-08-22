@@ -20,9 +20,11 @@ pub struct PartitionBatch<'connection> {
     transaction: Transaction<'connection>,
 }
 
-// Large initial graph transactions otherwise evict and rewrite dirty B-tree
-// pages repeatedly. SQLite allocates this finite cache on demand.
-const CACHE_SIZE_KIB: i64 = 512 * 1_024;
+const CACHE_SIZE_KIB: i64 = 64 * 1_024;
+// SQLite's application_id is a database-format boundary independent from the
+// schema version. OWF1 certifies that every graph row uses predecessor-readable
+// full v1 JSON; zero requires the atomic recovery pass below.
+const FULL_V1_APPLICATION_ID: i64 = 0x4f57_4631;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,17 +36,6 @@ struct StoredGraphNode {
     qualified_name: String,
     range: Option<SourceRange>,
     source_path: String,
-}
-
-#[derive(serde::Serialize)]
-struct SerializedGraphNode<'value> {
-    confidence: FactConfidence,
-    kind: NodeKind,
-    name: &'value str,
-    provider: &'value FactProvider,
-    qualified_name: &'value str,
-    range: Option<SourceRange>,
-    source_path: &'value str,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -59,17 +50,6 @@ struct StoredGraphEdge {
     target: crate::graph::NodeId,
 }
 
-#[derive(serde::Serialize)]
-struct SerializedGraphEdge<'value> {
-    confidence: FactConfidence,
-    kind: EdgeKind,
-    provider: &'value FactProvider,
-    range: Option<SourceRange>,
-    source: crate::graph::NodeId,
-    source_path: &'value str,
-    target: crate::graph::NodeId,
-}
-
 #[derive(Debug)]
 pub enum GraphStoreError {
     Domain(GraphError),
@@ -78,6 +58,7 @@ pub enum GraphStoreError {
     MissingSchema,
     Serialization(serde_json::Error),
     Sqlite(rusqlite::Error),
+    UnsupportedApplicationId(i64),
 }
 
 impl std::fmt::Display for GraphStoreError {
@@ -92,6 +73,12 @@ impl std::fmt::Display for GraphStoreError {
             Self::MissingSchema => formatter.write_str("code intelligence schema is unavailable"),
             Self::Serialization(error) => error.fmt(formatter),
             Self::Sqlite(error) => error.fmt(formatter),
+            Self::UnsupportedApplicationId(value) => {
+                write!(
+                    formatter,
+                    "unsupported graph storage application id: {value}"
+                )
+            }
         }
     }
 }
@@ -118,7 +105,7 @@ impl From<serde_json::Error> for GraphStoreError {
 
 impl GraphStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GraphStoreError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         connection.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
@@ -128,6 +115,7 @@ impl GraphStore {
         if version < 5 {
             return Err(GraphStoreError::MissingSchema);
         }
+        restore_full_v1_compatibility(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -374,6 +362,97 @@ impl GraphStore {
     }
 }
 
+fn restore_full_v1_compatibility(connection: &mut Connection) -> Result<(), GraphStoreError> {
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if application_id == FULL_V1_APPLICATION_ID {
+        return Ok(());
+    }
+    if application_id != 0 {
+        return Err(GraphStoreError::UnsupportedApplicationId(application_id));
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let partitions = {
+        let mut statement =
+            transaction.prepare("SELECT id, project_id, scope FROM code_partitions ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (stored_partition_id, stored_project_id, scope) in partitions {
+        let project_id = stored_project_id
+            .parse::<ProjectId>()
+            .map_err(|_| GraphStoreError::Domain(GraphError::InvalidPartition))?;
+        let partition_id = PartitionId::new(project_id, &scope);
+        if partition_id.to_string() != stored_partition_id {
+            return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
+        }
+
+        let nodes = {
+            let mut statement = transaction.prepare(
+                "SELECT generation, id, node_json FROM code_nodes
+                 WHERE partition_id = ?1 ORDER BY generation, id",
+            )?;
+            let rows = statement.query_map([&stored_partition_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (generation, row_id, json) in nodes {
+            let node = deserialize_node(partition_id, &row_id, &json)?;
+            let full_json = serde_json::to_string(&node)?;
+            if full_json != json {
+                transaction.execute(
+                    "UPDATE code_nodes SET node_json = ?1
+                     WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
+                    params![full_json, &stored_partition_id, generation, row_id],
+                )?;
+            }
+        }
+
+        let edges = {
+            let mut statement = transaction.prepare(
+                "SELECT generation, id, edge_json FROM code_edges
+                 WHERE partition_id = ?1 ORDER BY generation, id",
+            )?;
+            let rows = statement.query_map([&stored_partition_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (generation, row_id, json) in edges {
+            let edge = deserialize_edge(partition_id, &row_id, &json)?;
+            let full_json = serde_json::to_string(&edge)?;
+            if full_json != json {
+                transaction.execute(
+                    "UPDATE code_edges SET edge_json = ?1
+                     WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
+                    params![full_json, &stored_partition_id, generation, row_id],
+                )?;
+            }
+        }
+    }
+
+    transaction.pragma_update(None, "application_id", FULL_V1_APPLICATION_ID)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 impl PartitionBatch<'_> {
     pub fn replace_partition(&self, partition: &GraphPartition) -> Result<u64, GraphStoreError> {
         partition.validate()?;
@@ -513,16 +592,7 @@ fn replace_manifest_scopes_in_transaction(
 }
 
 fn serialize_node(node: &GraphNode) -> Result<String, GraphStoreError> {
-    serde_json::to_string(&SerializedGraphNode {
-        confidence: node.confidence,
-        kind: node.kind,
-        name: &node.name,
-        provider: &node.provider,
-        qualified_name: &node.qualified_name,
-        range: node.range,
-        source_path: &node.source_path,
-    })
-    .map_err(GraphStoreError::Serialization)
+    serde_json::to_string(node).map_err(GraphStoreError::Serialization)
 }
 
 fn deserialize_node(
@@ -553,16 +623,7 @@ fn deserialize_node(
 }
 
 fn serialize_edge(edge: &GraphEdge) -> Result<String, GraphStoreError> {
-    serde_json::to_string(&SerializedGraphEdge {
-        confidence: edge.confidence,
-        kind: edge.kind,
-        provider: &edge.provider,
-        range: edge.range,
-        source: edge.source,
-        source_path: &edge.source_path,
-        target: edge.target,
-    })
-    .map_err(GraphStoreError::Serialization)
+    serde_json::to_string(edge).map_err(GraphStoreError::Serialization)
 }
 
 fn deserialize_edge(
@@ -640,31 +701,9 @@ mod tests {
     };
     use workflow_core::ProjectId;
 
-    #[test]
-    fn graph_store_bounds_cache_and_defers_repeated_dirty_page_spills() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("workflow.db");
-        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+    const EXPECTED_FULL_V1_APPLICATION_ID: i64 = 0x4f57_4631;
 
-        let store = GraphStore::open(path).unwrap();
-        let cache_kib: i64 = store
-            .connection
-            .pragma_query_value(None, "cache_size", |row| row.get(0))
-            .unwrap();
-        let temp_store: i64 = store
-            .connection
-            .pragma_query_value(None, "temp_store", |row| row.get(0))
-            .unwrap();
-
-        assert_eq!(cache_kib, -CACHE_SIZE_KIB);
-        assert_eq!(temp_store, 2);
-    }
-
-    #[test]
-    fn compact_graph_rows_round_trip_and_keep_legacy_rows_readable() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("workflow.db");
-        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+    fn sample_partition() -> GraphPartition {
         let project = ProjectId::new();
         let partition_id = PartitionId::new(project, "src");
         let first = GraphNode::new(NodeInput {
@@ -689,7 +728,18 @@ mod tests {
             source_path: "src/first.rs".to_owned(),
         })
         .unwrap();
-        let edge = GraphEdge::new(EdgeInput {
+        let third = GraphNode::new(NodeInput {
+            confidence: FactConfidence::Extracted,
+            kind: NodeKind::Symbol,
+            name: "third".to_owned(),
+            partition_id,
+            provider: FactProvider::Parser("test".to_owned()),
+            qualified_name: "first::third".to_owned(),
+            range: None,
+            source_path: "src/first.rs".to_owned(),
+        })
+        .unwrap();
+        let contains = GraphEdge::new(EdgeInput {
             confidence: FactConfidence::Extracted,
             kind: EdgeKind::Contains,
             partition_id,
@@ -700,67 +750,297 @@ mod tests {
             target: second.id,
         })
         .unwrap();
-        let partition = GraphPartition {
-            edges: [(edge.id, edge.clone())].into_iter().collect(),
+        let defines = GraphEdge::new(EdgeInput {
+            confidence: FactConfidence::Extracted,
+            kind: EdgeKind::Defines,
+            partition_id,
+            provider: FactProvider::Parser("test".to_owned()),
+            range: None,
+            source: first.id,
+            source_path: "src/first.rs".to_owned(),
+            target: third.id,
+        })
+        .unwrap();
+        GraphPartition {
+            edges: [(contains.id, contains), (defines.id, defines)]
+                .into_iter()
+                .collect(),
             external_nodes: Default::default(),
             id: partition_id,
-            nodes: [(first.id, first.clone()), (second.id, second.clone())]
+            nodes: [(first.id, first), (second.id, second), (third.id, third)]
                 .into_iter()
                 .collect(),
             project_id: project,
             scope: "src".to_owned(),
-        };
-        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
-        let mut store = GraphStore::open(path).unwrap();
+        }
+    }
 
+    fn compact_node_json(node: &GraphNode) -> String {
+        serde_json::to_string(&StoredGraphNode {
+            confidence: node.confidence,
+            kind: node.kind,
+            name: node.name.clone(),
+            provider: node.provider.clone(),
+            qualified_name: node.qualified_name.clone(),
+            range: node.range,
+            source_path: node.source_path.clone(),
+        })
+        .unwrap()
+    }
+
+    fn compact_edge_json(edge: &GraphEdge) -> String {
+        serde_json::to_string(&StoredGraphEdge {
+            confidence: edge.confidence,
+            kind: edge.kind,
+            provider: edge.provider.clone(),
+            range: edge.range,
+            source: edge.source,
+            source_path: edge.source_path.clone(),
+            target: edge.target,
+        })
+        .unwrap()
+    }
+
+    fn write_compact_rows(connection: &Connection, partition: &GraphPartition) {
+        connection.pragma_update(None, "application_id", 0).unwrap();
+        for node in partition.nodes.values() {
+            connection
+                .execute(
+                    "UPDATE code_nodes SET node_json = ?1 WHERE id = ?2",
+                    params![compact_node_json(node), node.id.to_string()],
+                )
+                .unwrap();
+        }
+        for edge in partition.edges.values() {
+            connection
+                .execute(
+                    "UPDATE code_edges SET edge_json = ?1 WHERE id = ?2",
+                    params![compact_edge_json(edge), edge.id.to_string()],
+                )
+                .unwrap();
+        }
+    }
+
+    fn predecessor_load_partition(
+        connection: &Connection,
+        partition_id: PartitionId,
+    ) -> GraphPartition {
+        let (project_id, scope, generation): (String, String, i64) = connection
+            .query_row(
+                "SELECT project_id, scope, head_generation FROM code_partitions WHERE id = ?1",
+                [partition_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let mut nodes = std::collections::BTreeMap::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT node_json FROM code_nodes
+                 WHERE partition_id = ?1 AND generation = ?2 ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![partition_id.to_string(), generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        for row in rows {
+            let node = serde_json::from_str::<GraphNode>(&row.unwrap()).unwrap();
+            nodes.insert(node.id, node);
+        }
+        let mut edges = std::collections::BTreeMap::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT edge_json FROM code_edges
+                 WHERE partition_id = ?1 AND generation = ?2 ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![partition_id.to_string(), generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        for row in rows {
+            let edge = serde_json::from_str::<GraphEdge>(&row.unwrap()).unwrap();
+            edges.insert(edge.id, edge);
+        }
+        let mut partition = GraphPartition {
+            edges,
+            external_nodes: Default::default(),
+            id: partition_id,
+            nodes,
+            project_id: project_id.parse().unwrap(),
+            scope,
+        };
+        for edge in partition.edges.values() {
+            if !partition.nodes.contains_key(&edge.source) {
+                partition.external_nodes.insert(edge.source);
+            }
+            if !partition.nodes.contains_key(&edge.target) {
+                partition.external_nodes.insert(edge.target);
+            }
+        }
+        partition.validate().unwrap();
+        partition
+    }
+
+    #[test]
+    fn graph_store_uses_bounded_cache_and_memory_temporaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+
+        let store = GraphStore::open(path).unwrap();
+        let cache_kib: i64 = store
+            .connection
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+        let temp_store: i64 = store
+            .connection
+            .pragma_query_value(None, "temp_store", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(cache_kib, -65_536);
+        assert_eq!(temp_store, 2);
+    }
+
+    #[test]
+    fn unknown_storage_application_id_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x1234_5678_i64)
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            GraphStore::open(&path),
+            Err(GraphStoreError::UnsupportedApplicationId(0x1234_5678))
+        ));
+    }
+
+    #[test]
+    fn compact_rows_are_atomically_restored_for_the_predecessor_reader() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let partition = sample_partition();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
         store
             .replace_partition(&partition, true, timestamp)
             .unwrap();
-        let node_json: String = store
-            .connection
-            .query_row(
-                "SELECT node_json FROM code_nodes WHERE id = ?1",
-                [first.id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let edge_json: String = store
-            .connection
-            .query_row(
-                "SELECT edge_json FROM code_edges WHERE id = ?1",
-                [edge.id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let node_value = serde_json::from_str::<serde_json::Value>(&node_json).unwrap();
-        let edge_value = serde_json::from_str::<serde_json::Value>(&edge_json).unwrap();
-
-        assert!(node_value.get("id").is_none());
-        assert!(node_value.get("partition_id").is_none());
-        assert!(edge_value.get("id").is_none());
-        assert!(edge_value.get("partition_id").is_none());
-        assert!(node_json.len() < serde_json::to_string(&first).unwrap().len());
-        assert!(edge_json.len() < serde_json::to_string(&edge).unwrap().len());
         assert_eq!(
-            store.load_partition(partition_id).unwrap(),
-            Some(partition.clone())
+            predecessor_load_partition(&store.connection, partition.id),
+            partition
         );
-
-        store
-            .connection
-            .execute(
-                "UPDATE code_nodes SET node_json = ?1 WHERE id = ?2",
-                params![serde_json::to_string(&first).unwrap(), first.id.to_string()],
-            )
-            .unwrap();
+        write_compact_rows(&store.connection, &partition);
+        let legacy_edge = partition.edges.values().next().unwrap();
         store
             .connection
             .execute(
                 "UPDATE code_edges SET edge_json = ?1 WHERE id = ?2",
-                params![serde_json::to_string(&edge).unwrap(), edge.id.to_string()],
+                params![
+                    serde_json::to_string(legacy_edge).unwrap(),
+                    legacy_edge.id.to_string()
+                ],
             )
             .unwrap();
-        assert_eq!(store.load_partition(partition_id).unwrap(), Some(partition));
+        drop(store);
+
+        drop(GraphStore::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+        let full_edges: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM code_edges WHERE json_type(edge_json, '$.id') = 'text'
+                 AND json_type(edge_json, '$.partition_id') = 'text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(full_edges, 2);
+        assert_eq!(
+            predecessor_load_partition(&connection, partition.id),
+            partition
+        );
+    }
+
+    #[test]
+    fn corrupt_row_id_blocks_recovery_and_rolls_back_every_rewrite() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let partition = sample_partition();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        store
+            .replace_partition(&partition, true, timestamp)
+            .unwrap();
+        write_compact_rows(&store.connection, &partition);
+        let corrupt = partition.nodes.values().next().unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE code_nodes SET id = ?1 WHERE id = ?2",
+                params!["0".repeat(64), corrupt.id.to_string()],
+            )
+            .unwrap();
+        drop(store);
+
+        assert!(GraphStore::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let compact_rows: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM code_nodes WHERE json_type(node_json, '$.id') IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(application_id, 0);
+        assert_eq!(compact_rows, 3);
+    }
+
+    #[test]
+    fn corrupt_partition_identity_blocks_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let partition = sample_partition();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        store
+            .replace_partition(&partition, true, timestamp)
+            .unwrap();
+        write_compact_rows(&store.connection, &partition);
+        let mut corrupt = partition.nodes.values().next().unwrap().clone();
+        corrupt.partition_id = PartitionId::new(ProjectId::new(), "src");
+        store
+            .connection
+            .execute(
+                "UPDATE code_nodes SET node_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&corrupt).unwrap(),
+                    corrupt.id.to_string()
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        assert!(GraphStore::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, 0);
     }
 
     #[test]
