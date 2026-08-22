@@ -67,6 +67,30 @@ test("identity audit catches retired runtime and export prefixes", async () => {
   }
 })
 
+test("identity audit returns sorted findings from a multi-file batch", async () => {
+  const root = await fixture(
+    Object.fromEntries(
+      Array.from({ length: 24 }, (_, index) => [
+        `docs/${String(23 - index).padStart(2, "0")}.md`,
+        `${legacyProduct} ${index}`,
+      ]),
+    ),
+  )
+  const expected = Array.from(
+    { length: 24 },
+    (_, index) => `docs/${String(index).padStart(2, "0")}.md: ${legacyProduct}`,
+  )
+  try {
+    expect(await Promise.all(Array.from({ length: 3 }, () => auditProductIdentity(root)))).toEqual([
+      expected,
+      expected,
+      expected,
+    ])
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
 test("identity audit allows a reviewed durable domain only in its exact context", async () => {
   const root = await fixture({
     "crates/workflow-core/src/candidate.rs": `${legacyPackage}/candidate/v1`,

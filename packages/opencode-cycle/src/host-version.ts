@@ -4,22 +4,26 @@ import { MIMEType } from "node:util"
 const DEFAULT_TIMEOUT_MS = 1_000
 const MAX_RESPONSE_BYTES = 4_096
 
+type HostVersionEnvironment = Readonly<{
+  readonly OPENCODE_SERVER_PASSWORD?: string | undefined
+  readonly OPENCODE_SERVER_USERNAME?: string | undefined
+}>
+
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>
+
 export type HostVersionFetch = (
   input: string | URL | Request,
   init?: RequestInit,
 ) => Promise<Response>
 
 interface HostVersionOptions {
-  readonly env?: {
-    readonly OPENCODE_SERVER_PASSWORD?: string
-    readonly OPENCODE_SERVER_USERNAME?: string
-  }
+  readonly env?: HostVersionEnvironment
   readonly fetch?: HostVersionFetch
   readonly override?: string
   readonly timeoutMs?: number
 }
 
-function authorizationHeader(env: NonNullable<HostVersionOptions["env"]>): string | undefined {
+function authorizationHeader(env: HostVersionEnvironment | NodeJS.ProcessEnv): string | undefined {
   const password = env.OPENCODE_SERVER_PASSWORD
   if (!password) return undefined
   const username = env.OPENCODE_SERVER_USERNAME ?? "opencode"
@@ -48,7 +52,7 @@ function cancelStream(stream: ReadableStream<Uint8Array> | ReadableStreamDefault
 function readChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   signal: AbortSignal,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
+): Promise<StreamReadResult> {
   if (signal.aborted) {
     cancelStream(reader)
     return Promise.reject(signal.reason)

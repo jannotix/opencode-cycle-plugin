@@ -81,6 +81,7 @@ const BINARY_EXTENSIONS = new Set([
   "wasm",
   "webp",
 ])
+const FILE_READ_CONCURRENCY = 8
 
 async function filesBelow(root: string, directory = ""): Promise<string[]> {
   const entries = await readdir(join(root, directory), { withFileTypes: true })
@@ -136,6 +137,58 @@ function approvedOccurrences(path: string): readonly ApprovedOccurrence[] {
   ]
 }
 
+async function mapBounded<T, R>(
+  values: readonly T[],
+  worker: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length)
+  let nextIndex = 0
+  const workers = Array.from(
+    { length: Math.min(FILE_READ_CONCURRENCY, values.length) },
+    async () => {
+      for (;;) {
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= values.length) return
+        results[index] = await worker(values[index]!)
+      }
+    },
+  )
+  await Promise.all(workers)
+  return results
+}
+
+async function auditFile(root: string, path: string): Promise<string[]> {
+  const content = await readFile(join(root, path))
+  const text = decodeText(content)
+  if (text === undefined) return [`${path}: unsupported text encoding`]
+
+  const findings: string[] = []
+  const approved = approvedOccurrences(path)
+  for (const occurrence of approved) {
+    const observed = countToken(text, occurrence.needle)
+    if (observed !== occurrence.count) {
+      findings.push(`${path}: approved ${occurrence.needle} count is ${observed}, expected ${occurrence.count}`)
+    }
+  }
+  const historical = APPROVED_HISTORICAL_COUNTS[path] ?? {}
+  for (const token of FORBIDDEN) {
+    const approvedCount = approved
+      .filter((occurrence) => occurrence.needle.includes(token))
+      .reduce((total, occurrence) => total + occurrence.count, 0)
+    const expected = (historical[token] ?? 0) + approvedCount
+    const observed = countToken(text, token)
+    if (observed !== expected) {
+      findings.push(
+        expected === 0
+          ? `${path}: ${token}`
+          : `${path}: ${token} count is ${observed}, expected ${expected}`,
+      )
+    }
+  }
+  return findings
+}
+
 export async function auditProductIdentity(
   root: string,
   { requireApprovedPaths = false }: { requireApprovedPaths?: boolean } = {},
@@ -152,36 +205,9 @@ export async function auditProductIdentity(
       if (!pathSet.has(path)) findings.push(`${path}: approved compatibility path is missing`)
     }
   }
-  for (const path of paths) {
-    const content = await readFile(join(root, path))
-    if (isKnownBinaryPath(path)) continue
-    const text = decodeText(content)
-    if (text === undefined) {
-      findings.push(`${path}: unsupported text encoding`)
-      continue
-    }
-    const approved = approvedOccurrences(path)
-    for (const occurrence of approved) {
-      const observed = countToken(text, occurrence.needle)
-      if (observed !== occurrence.count) {
-        findings.push(`${path}: approved ${occurrence.needle} count is ${observed}, expected ${occurrence.count}`)
-      }
-    }
-    const historical = APPROVED_HISTORICAL_COUNTS[path] ?? {}
-    for (const token of FORBIDDEN) {
-      const approvedCount = approved
-        .filter((occurrence) => occurrence.needle.includes(token))
-        .reduce((total, occurrence) => total + occurrence.count, 0)
-      const expected = (historical[token] ?? 0) + approvedCount
-      const observed = countToken(text, token)
-      if (observed !== expected) {
-        findings.push(
-          expected === 0
-            ? `${path}: ${token}`
-            : `${path}: ${token} count is ${observed}, expected ${expected}`,
-        )
-      }
-    }
+  const scannedPaths = paths.filter((path) => !isKnownBinaryPath(path))
+  for (const fileFindings of await mapBounded(scannedPaths, (path) => auditFile(root, path))) {
+    findings.push(...fileFindings)
   }
   return findings.sort()
 }
