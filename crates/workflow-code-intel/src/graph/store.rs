@@ -16,6 +16,7 @@ pub struct GraphStore {
 }
 
 pub struct PartitionBatch<'connection> {
+    graph_changed: std::cell::Cell<bool>,
     timestamp: WorkflowTimestamp,
     transaction: Transaction<'connection>,
 }
@@ -30,6 +31,9 @@ const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 17;
 // Zero means recovery is incomplete; OWF1 certifies predecessor-readable full
 // v1 JSON; every other nonzero value is a collision and must fail closed.
 const FULL_V1_APPLICATION_ID: i64 = 0x4f57_4631;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphChangeToken(i64);
 
 #[cfg(test)]
 thread_local! {
@@ -55,6 +59,9 @@ struct FinalValidationPause {
 #[cfg(test)]
 static FINAL_VALIDATION_PAUSE: std::sync::Mutex<Option<FinalValidationPause>> =
     std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static FINAL_VALIDATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -97,7 +104,7 @@ impl std::fmt::Display for GraphStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConcurrentRecoveryWrite => {
-                formatter.write_str("database changed on another connection during graph recovery")
+                formatter.write_str("graph changed on another connection during graph recovery")
             }
             Self::Domain(error) => error.fmt(formatter),
             Self::Incomplete => formatter
@@ -159,6 +166,12 @@ impl GraphStore {
         connection.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
         connection.busy_timeout(Duration::from_secs(5))?;
+        let application_id: i64 =
+            connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        if application_id != 0 && application_id != FULL_V1_APPLICATION_ID {
+            return Err(GraphStoreError::UnsupportedApplicationId(application_id));
+        }
+        ensure_graph_change_token(&mut connection)?;
         restore_full_v1_compatibility(&mut connection, version)?;
         Ok(Self { connection })
     }
@@ -177,6 +190,7 @@ impl GraphStore {
         timestamp: WorkflowTimestamp,
     ) -> Result<PartitionBatch<'_>, GraphStoreError> {
         Ok(PartitionBatch {
+            graph_changed: std::cell::Cell::new(false),
             timestamp,
             transaction: self
                 .connection
@@ -208,7 +222,7 @@ impl GraphStore {
             "DELETE FROM code_paths_fts WHERE project_id = ?1",
             [project_id.to_string()],
         )?;
-        transaction.execute(
+        let deleted_partitions = transaction.execute(
             "DELETE FROM code_partitions WHERE project_id = ?1",
             [project_id.to_string()],
         )?;
@@ -216,6 +230,9 @@ impl GraphStore {
             "DELETE FROM code_index_state WHERE project_id = ?1",
             [project_id.to_string()],
         )?;
+        if deleted_partitions != 0 {
+            advance_graph_change_token(&transaction)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -338,6 +355,7 @@ impl GraphStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let generation = replace_partition_in_transaction(&transaction, partition, timestamp)?;
         before_commit(&transaction)?;
+        advance_graph_change_token(&transaction)?;
         transaction.commit()?;
         Ok(generation)
     }
@@ -406,6 +424,61 @@ impl GraphStore {
     }
 }
 
+fn ensure_graph_change_token(connection: &mut Connection) -> Result<(), GraphStoreError> {
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'code_graph_recovery_state'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists {
+        graph_change_token(connection)?;
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "CREATE TABLE IF NOT EXISTS code_graph_recovery_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            change_token INTEGER NOT NULL CHECK(change_token >= 0)
+         ) STRICT",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO code_graph_recovery_state(singleton, change_token)
+         VALUES (1, 0) ON CONFLICT(singleton) DO NOTHING",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn graph_change_token(connection: &Connection) -> Result<GraphChangeToken, GraphStoreError> {
+    connection
+        .query_row(
+            "SELECT change_token FROM code_graph_recovery_state WHERE singleton = 1",
+            [],
+            |row| row.get(0).map(GraphChangeToken),
+        )
+        .map_err(GraphStoreError::Sqlite)
+}
+
+fn advance_graph_change_token(transaction: &Transaction<'_>) -> Result<(), GraphStoreError> {
+    let updated = transaction.execute(
+        "UPDATE code_graph_recovery_state
+         SET change_token = change_token + 1 WHERE singleton = 1",
+        [],
+    )?;
+    if updated != 1 {
+        return Err(GraphStoreError::Sqlite(
+            rusqlite::Error::QueryReturnedNoRows,
+        ));
+    }
+    Ok(())
+}
+
 fn restore_full_v1_compatibility(
     connection: &mut Connection,
     schema_version: u32,
@@ -468,6 +541,7 @@ fn restore_partition_full_v1(
         transaction.commit()?;
         return Ok(());
     };
+    let mut graph_changed = false;
 
     let nodes = {
         let mut statement = transaction.prepare(
@@ -492,6 +566,7 @@ fn restore_partition_full_v1(
                  WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
                 params![full_json, stored_partition_id, generation, row_id],
             )?;
+            graph_changed = true;
             recovery_row_rewrite_checkpoint(stored_partition_id);
         }
     }
@@ -519,8 +594,12 @@ fn restore_partition_full_v1(
                  WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
                 params![full_json, stored_partition_id, generation, row_id],
             )?;
+            graph_changed = true;
             recovery_row_rewrite_checkpoint(stored_partition_id);
         }
+    }
+    if graph_changed {
+        advance_graph_change_token(&transaction)?;
     }
     transaction.commit()?;
     Ok(())
@@ -530,17 +609,15 @@ fn finalize_full_v1_compatibility(
     connection: &mut Connection,
     expected_schema_version: u32,
 ) -> Result<(), GraphStoreError> {
-    let initial_data_version = data_version(connection)?;
-    let partition_ids = load_partition_ids(connection)?;
+    let snapshot = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let initial_graph_token = graph_change_token(&snapshot)?;
+    let partition_ids = load_partition_ids(&snapshot)?;
+    snapshot.commit()?;
     for stored_partition_id in &partition_ids {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         validate_full_v1_partition(&transaction, stored_partition_id)?;
         transaction.commit()?;
         final_validation_partition_checkpoint(stored_partition_id);
-    }
-
-    if data_version(connection)? != initial_data_version {
-        return Err(GraphStoreError::ConcurrentRecoveryWrite);
     }
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -554,9 +631,7 @@ fn finalize_full_v1_compatibility(
             locked_schema_version,
         ));
     }
-    if locked_schema_version != expected_schema_version
-        || data_version(&transaction)? != initial_data_version
-    {
+    if locked_schema_version != expected_schema_version {
         return Err(GraphStoreError::ConcurrentRecoveryWrite);
     }
     let locked_application_id: i64 =
@@ -564,15 +639,12 @@ fn finalize_full_v1_compatibility(
     if locked_application_id != 0 {
         return Err(GraphStoreError::ConcurrentRecoveryWrite);
     }
+    if graph_change_token(&transaction)? != initial_graph_token {
+        return Err(GraphStoreError::ConcurrentRecoveryWrite);
+    }
     transaction.pragma_update(None, "application_id", FULL_V1_APPLICATION_ID)?;
     transaction.commit()?;
     Ok(())
-}
-
-fn data_version(connection: &Connection) -> Result<i64, GraphStoreError> {
-    connection
-        .pragma_query_value(None, "data_version", |row| row.get(0))
-        .map_err(GraphStoreError::Sqlite)
 }
 
 fn validate_full_v1_partition(
@@ -665,6 +737,7 @@ fn final_validation_partition_checkpoint(_: &str) {}
 impl PartitionBatch<'_> {
     pub fn replace_partition(&self, partition: &GraphPartition) -> Result<u64, GraphStoreError> {
         partition.validate()?;
+        self.graph_changed.set(true);
         replace_partition_in_transaction(&self.transaction, partition, self.timestamp)
     }
 
@@ -678,6 +751,9 @@ impl PartitionBatch<'_> {
     }
 
     pub fn commit(self) -> Result<(), GraphStoreError> {
+        if self.graph_changed.get() {
+            advance_graph_change_token(&self.transaction)?;
+        }
         self.transaction.commit().map_err(GraphStoreError::Sqlite)
     }
 }
@@ -984,6 +1060,23 @@ mod tests {
         }
     }
 
+    fn changed_partition(partition: &GraphPartition) -> GraphPartition {
+        let mut changed = partition.clone();
+        let node = GraphNode::new(NodeInput {
+            confidence: FactConfidence::Extracted,
+            kind: NodeKind::Symbol,
+            name: "external".to_owned(),
+            partition_id: partition.id,
+            provider: FactProvider::Parser("external-writer".to_owned()),
+            qualified_name: "first::external".to_owned(),
+            range: None,
+            source_path: "src/external.rs".to_owned(),
+        })
+        .unwrap();
+        changed.nodes.insert(node.id, node);
+        changed
+    }
+
     fn compact_node_json(node: &GraphNode) -> String {
         serde_json::to_string(&StoredGraphNode {
             confidence: node.confidence,
@@ -1176,6 +1269,90 @@ mod tests {
     }
 
     #[test]
+    fn graph_change_token_tracks_each_graph_transaction_only_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let mut store = GraphStore::open(&path).unwrap();
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let initial = graph_change_token(&store.connection).unwrap();
+        let schema_version: u32 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, MAX_SUPPORTED_SCHEMA_VERSION);
+
+        store
+            .save_index_state(ProjectId::new(), "unrelated", &"0".repeat(64), timestamp)
+            .unwrap();
+        assert_eq!(graph_change_token(&store.connection).unwrap(), initial);
+
+        let first = sample_partition();
+        store.replace_partition(&first, true, timestamp).unwrap();
+        let standalone = graph_change_token(&store.connection).unwrap();
+        assert_eq!(standalone.0, initial.0 + 1);
+
+        let second = sample_partition();
+        let changed_first = changed_partition(&first);
+        let batch = store.partition_batch(timestamp).unwrap();
+        assert_eq!(batch.replace_partition(&changed_first).unwrap(), 2);
+        assert_eq!(batch.replace_partition(&second).unwrap(), 1);
+        batch.commit().unwrap();
+        let batched = graph_change_token(&store.connection).unwrap();
+        assert_eq!(batched.0, standalone.0 + 1);
+
+        write_compact_rows(&store.connection, &changed_first);
+        write_compact_rows(&store.connection, &second);
+        drop(store);
+        let mut store = GraphStore::open(&path).unwrap();
+        let recovered = graph_change_token(&store.connection).unwrap();
+        assert_eq!(recovered.0, batched.0 + 2);
+
+        store.reset_project(first.project_id).unwrap();
+        let after_first_delete = graph_change_token(&store.connection).unwrap();
+        assert_eq!(after_first_delete.0, recovered.0 + 1);
+        store.reset_project(second.project_id).unwrap();
+        let after_second_delete = graph_change_token(&store.connection).unwrap();
+        assert_eq!(after_second_delete.0, after_first_delete.0 + 1);
+        store.reset_project(ProjectId::new()).unwrap();
+        assert_eq!(
+            graph_change_token(&store.connection).unwrap(),
+            after_second_delete
+        );
+
+        let aba_partition = sample_partition();
+        assert_eq!(
+            store
+                .replace_partition(&aba_partition, true, timestamp)
+                .unwrap(),
+            1
+        );
+        let token_before_aba = graph_change_token(&store.connection).unwrap();
+        let metadata_before_aba = (aba_partition.id.to_string(), 1_i64);
+        store.reset_project(aba_partition.project_id).unwrap();
+        let changed_aba_partition = changed_partition(&aba_partition);
+        assert_eq!(
+            store
+                .replace_partition(&changed_aba_partition, true, timestamp)
+                .unwrap(),
+            1
+        );
+        let metadata_after_aba: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT id, head_generation FROM code_partitions WHERE id = ?1",
+                [aba_partition.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata_after_aba, metadata_before_aba);
+        assert_eq!(
+            graph_change_token(&store.connection).unwrap().0,
+            token_before_aba.0 + 2
+        );
+    }
+
+    #[test]
     fn unknown_storage_application_id_fails_closed() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workflow.db");
@@ -1190,6 +1367,16 @@ mod tests {
             GraphStore::open(&path),
             Err(GraphStoreError::UnsupportedApplicationId(0x1234_5678))
         ));
+        let connection = Connection::open(&path).unwrap();
+        let token_tables: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'code_graph_recovery_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_tables, 0);
     }
 
     #[test]
@@ -1379,7 +1566,8 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_does_not_hold_writer_lock_and_rejects_data_version_drift() {
+    fn unrelated_state_writes_do_not_block_or_starve_graph_finalization() {
+        let _serial = FINAL_VALIDATION_TEST_LOCK.lock().unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workflow.db");
         drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
@@ -1406,21 +1594,114 @@ mod tests {
 
         let writer = Connection::open(&path).unwrap();
         writer.busy_timeout(Duration::from_millis(500)).unwrap();
-        let external_project = ProjectId::new().to_string();
-        let write_result = writer.execute(
-            "INSERT INTO code_index_state(
-                project_id, repository_path, fingerprint, updated_at
-             ) VALUES (?1, ?2, ?3, ?4)",
-            params![external_project, "external", "0".repeat(64), "now"],
-        );
+        let graph_token_before = graph_change_token(&writer).unwrap();
+        let mut external_projects = Vec::new();
+        let mut write_results = Vec::new();
+        for index in 0..4 {
+            let external_project = ProjectId::new().to_string();
+            let started = std::time::Instant::now();
+            let result = writer.execute(
+                "INSERT INTO code_index_state(
+                    project_id, repository_path, fingerprint, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &external_project,
+                    format!("external-{index}"),
+                    "0".repeat(64),
+                    "now"
+                ],
+            );
+            write_results.push((result, started.elapsed()));
+            external_projects.push(external_project);
+        }
+        let graph_token_after = graph_change_token(&writer).unwrap();
         drop(writer);
         resume.wait();
         let recovery_result = recovery.join().unwrap();
         *FINAL_VALIDATION_PAUSE.lock().unwrap() = None;
 
+        for (result, elapsed) in &write_results {
+            assert!(result.is_ok(), "unrelated write was blocked: {result:?}");
+            assert!(
+                *elapsed < Duration::from_millis(500),
+                "unrelated write exceeded busy timeout: {elapsed:?}"
+            );
+        }
+        assert_eq!(graph_token_after, graph_token_before);
         assert!(
-            write_result.is_ok(),
-            "external write was blocked: {write_result:?}"
+            recovery_result.is_ok(),
+            "recovery starved: {recovery_result:?}"
+        );
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let external_writes: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM code_index_state WHERE project_id IN (?1, ?2, ?3, ?4)",
+                params![
+                    &external_projects[0],
+                    &external_projects[1],
+                    &external_projects[2],
+                    &external_projects[3]
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+        assert_eq!(external_writes, 4);
+    }
+
+    #[test]
+    fn supported_graph_write_invalidates_validation_and_is_recovered_on_restart() {
+        let _serial = FINAL_VALIDATION_TEST_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let mut partitions = vec![sample_partition(), sample_partition(), sample_partition()];
+        partitions.sort_by_key(|partition| partition.id.to_string());
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        for partition in &partitions {
+            store.replace_partition(partition, true, timestamp).unwrap();
+        }
+        let mut external_writer = GraphStore::open(&path).unwrap();
+        external_writer
+            .connection
+            .busy_timeout(Duration::from_millis(500))
+            .unwrap();
+        for partition in &partitions {
+            write_compact_rows(&store.connection, partition);
+        }
+        drop(store);
+
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *FINAL_VALIDATION_PAUSE.lock().unwrap() = Some(FinalValidationPause {
+            partition_id: partitions[0].id.to_string(),
+            reached: std::sync::Arc::clone(&reached),
+            resume: std::sync::Arc::clone(&resume),
+        });
+        let recovery_path = path.clone();
+        let recovery = std::thread::spawn(move || GraphStore::open(recovery_path).map(drop));
+        reached.wait();
+
+        let changed = changed_partition(&partitions[0]);
+        let token_before_write = graph_change_token(&external_writer.connection).unwrap();
+        let write_started = std::time::Instant::now();
+        let write_result = external_writer.replace_partition(&changed, true, timestamp);
+        let write_elapsed = write_started.elapsed();
+        write_compact_rows(&external_writer.connection, &changed);
+        let token_after_write = graph_change_token(&external_writer.connection).unwrap();
+        resume.wait();
+        let recovery_result = recovery.join().unwrap();
+        *FINAL_VALIDATION_PAUSE.lock().unwrap() = None;
+
+        assert_eq!(write_result.unwrap(), 2);
+        assert_eq!(token_after_write.0, token_before_write.0 + 1);
+        assert!(
+            write_elapsed < Duration::from_millis(500),
+            "supported graph write exceeded busy timeout: {write_elapsed:?}"
         );
         assert!(matches!(
             recovery_result,
@@ -1430,16 +1711,18 @@ mod tests {
         let application_id: i64 = connection
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
-        let external_writes: u32 = connection
-            .query_row(
-                "SELECT count(*) FROM code_index_state WHERE project_id = ?1",
-                [external_project],
-                |row| row.get(0),
-            )
-            .unwrap();
         assert_eq!(application_id, 0);
-        assert_eq!(external_writes, 1);
+        assert_eq!(
+            row_format_counts(&connection, &changed),
+            (
+                0,
+                u32::try_from(changed.nodes.len()).unwrap(),
+                0,
+                u32::try_from(changed.edges.len()).unwrap()
+            )
+        );
         drop(connection);
+        drop(external_writer);
 
         drop(GraphStore::open(&path).unwrap());
         let connection = Connection::open(&path).unwrap();
@@ -1447,6 +1730,16 @@ mod tests {
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
         assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+        assert_eq!(
+            row_format_counts(&connection, &changed),
+            (
+                u32::try_from(changed.nodes.len()).unwrap(),
+                0,
+                u32::try_from(changed.edges.len()).unwrap(),
+                0
+            )
+        );
+        assert_eq!(predecessor_load_partition(&connection, changed.id), changed);
     }
 
     #[test]
@@ -1581,12 +1874,17 @@ mod tests {
         store
             .replace_partition(&partition, true, timestamp)
             .unwrap();
+        let token_before_failure = graph_change_token(&store.connection).unwrap();
         assert!(
             store
                 .replace(&partition, true, timestamp, |transaction| {
                     transaction.execute_batch("INVALID SQL")
                 })
                 .is_err()
+        );
+        assert_eq!(
+            graph_change_token(&store.connection).unwrap(),
+            token_before_failure
         );
         assert_eq!(store.load_partition(partition.id).unwrap(), Some(partition));
     }
