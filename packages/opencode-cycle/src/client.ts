@@ -454,13 +454,12 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: { observation, request_id: 2 },
           type: "audit",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -491,13 +490,12 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: { operation, project_key: projectKey, request_id: 3 },
           type: "history",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -540,8 +538,8 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: {
             operation,
             operation_id: randomUUID(),
@@ -552,7 +550,6 @@ export class LocalControlPlane {
           type: "control",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -583,8 +580,8 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: {
             operation,
             project_key: projectKey,
@@ -595,7 +592,6 @@ export class LocalControlPlane {
           type: "admission",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -637,18 +633,21 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
-          data: {
-            project_directory: projectDirectory,
-            project_key: projectKey,
-            request_id: 14,
-            workflow_id: workflowId,
+      const message = asRecord(
+        await writeJsonAndRead(
+          decoder,
+          {
+            data: {
+              project_directory: projectDirectory,
+              project_key: projectKey,
+              request_id: 14,
+              workflow_id: workflowId,
+            },
+            type: "code_index",
           },
-          type: "code_index",
-        }),
+          30 * 60_000,
+        ),
       )
-      const message = asRecord(await readJson(socket, decoder, 30 * 60_000))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -691,20 +690,21 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
-          data: {
-            candidate_id: candidateId,
-            project_directory: projectDirectory,
-            project_key: projectKey,
-            request_id: 15,
-            workflow_id: workflowId,
-          },
-          type: "promote_candidate",
-        }),
-      )
       const message = asRecord(
-        await readJson(socket, decoder, CANDIDATE_OPERATION_TIMEOUT_MILLIS),
+        await writeJsonAndRead(
+          decoder,
+          {
+            data: {
+              candidate_id: candidateId,
+              project_directory: projectDirectory,
+              project_key: projectKey,
+              request_id: 15,
+              workflow_id: workflowId,
+            },
+            type: "promote_candidate",
+          },
+          CANDIDATE_OPERATION_TIMEOUT_MILLIS,
+        ),
       )
       if (message.type === "error") {
         const data = asRecord(message.data)
@@ -742,13 +742,12 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: { operation, project_key: projectKey, request_id: 4 },
           type: "memory",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type === "error") {
         const data = asRecord(message.data)
         throw new ControlPlaneError(
@@ -793,8 +792,8 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: {
             affected_paths: [...(request.affectedPaths ?? [])],
             critical_downgrade_approval: request.criticalDowngradeApproval ?? null,
@@ -807,7 +806,6 @@ export class LocalControlPlane {
           type: "request",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type !== "response") {
         throw new ControlPlaneError("workflowd returned an unexpected workflow response")
       }
@@ -847,8 +845,8 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
+      const message = asRecord(
+        await writeJsonAndRead(decoder, {
           data: {
             affected_paths: [],
             critical_downgrade_approval: null,
@@ -861,7 +859,6 @@ export class LocalControlPlane {
           type: "request",
         }),
       )
-      const message = asRecord(await readJson(socket, decoder))
       if (message.type !== "response") {
         throw new ControlPlaneError("workflowd returned an unexpected architecture response")
       }
@@ -898,19 +895,20 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
-          data: {
-            project_directory: projectDirectory,
-            project_key: projectKey,
-            request_id: 7,
-            workflow_id: workflowId,
-          },
-          type: "worktree",
-        }),
-      )
       const message = asRecord(
-        await readJson(socket, decoder, CANDIDATE_OPERATION_TIMEOUT_MILLIS),
+        await writeJsonAndRead(
+          decoder,
+          {
+            data: {
+              project_directory: projectDirectory,
+              project_key: projectKey,
+              request_id: 7,
+              workflow_id: workflowId,
+            },
+            type: "worktree",
+          },
+          CANDIDATE_OPERATION_TIMEOUT_MILLIS,
+        ),
       )
       if (message.type === "error") {
         const data = asRecord(message.data)
@@ -957,22 +955,23 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      socket.write(
-        encodeFrame({
-          data: {
-            base_revision: baseRevision,
-            candidate_id: candidateId,
-            evidence_ids: [...evidenceIds],
-            plan_id: planId,
-            project_key: projectKey,
-            request_id: 8,
-            workflow_id: workflowId,
-          },
-          type: "freeze_candidate",
-        }),
-      )
       const message = asRecord(
-        await readJson(socket, decoder, CANDIDATE_OPERATION_TIMEOUT_MILLIS),
+        await writeJsonAndRead(
+          decoder,
+          {
+            data: {
+              base_revision: baseRevision,
+              candidate_id: candidateId,
+              evidence_ids: [...evidenceIds],
+              plan_id: planId,
+              project_key: projectKey,
+              request_id: 8,
+              workflow_id: workflowId,
+            },
+            type: "freeze_candidate",
+          },
+          CANDIDATE_OPERATION_TIMEOUT_MILLIS,
+        ),
       )
       if (message.type === "error") {
         const data = asRecord(message.data)
@@ -1205,8 +1204,9 @@ export class LocalControlPlane {
   async #query(secret: Buffer): Promise<ControlPlaneHealth> {
     const { decoder, socket } = await this.#connect(secret)
     try {
-      await writeJson(socket, { data: { request_id: 1 }, type: "health" })
-      const healthMessage = asRecord(await readJson(socket, decoder))
+      const healthMessage = asRecord(
+        await writeJsonAndRead(decoder, { data: { request_id: 1 }, type: "health" }),
+      )
       if (healthMessage.type !== "health") {
         throw new ControlPlaneError("workflowd returned an unexpected health response")
       }
@@ -1235,8 +1235,13 @@ export class LocalControlPlane {
     if (secret === undefined) throw new ControlPlaneError("workflowd credential disappeared")
     const { decoder, socket } = await this.#connect(secret)
     try {
-      await writeJson(socket, { data: { ...data, request_id: requestId }, type: requestType })
-      const message = asRecord(await readJson(socket, decoder, timeoutMillis))
+      const message = asRecord(
+        await writeJsonAndRead(
+          decoder,
+          { data: { ...data, request_id: requestId }, type: requestType },
+          timeoutMillis,
+        ),
+      )
       if (message.type === "error") {
         const error = asRecord(message.data)
         throw new ControlPlaneError(
@@ -1262,16 +1267,17 @@ export class LocalControlPlane {
       errorFactory: (message) => new ControlPlaneError(message),
     })
     try {
-      const challengeMessage = asRecord(await readJson(socket, decoder))
+      const challengeMessage = asRecord(await readJson(decoder))
       if (challengeMessage.type !== "challenge") {
         throw new ControlPlaneError("workflowd did not send an authentication challenge")
       }
       const challenge = parseChallenge(challengeMessage.data)
-      await writeJson(socket, {
-        data: { mac: calculateMac(secret, challenge), nonce: challenge.nonce },
-        type: "authenticate",
-      })
-      const authenticated = asRecord(await readJson(socket, decoder))
+      const authenticated = asRecord(
+        await writeJsonAndRead(decoder, {
+          data: { mac: calculateMac(secret, challenge), nonce: challenge.nonce },
+          type: "authenticate",
+        }),
+      )
       if (authenticated.type !== "authenticated") {
         throw new ControlPlaneError("workflowd did not acknowledge authentication")
       }
@@ -1361,20 +1367,15 @@ function encodeFrame(value: unknown): Buffer {
   return frame
 }
 
-function writeJson(socket: Socket, value: unknown): Promise<void> {
-  return new Promise((resolve, reject) => {
-    socket.write(encodeFrame(value), (error) => {
-      if (error === null || error === undefined) resolve()
-      else reject(error)
-    })
-  })
-}
-
-function readJson(
-  _socket: Socket,
+function writeJsonAndRead(
   decoder: IpcFrameReader,
+  value: unknown,
   timeoutMillis = 10_000,
 ): Promise<unknown> {
+  return decoder.writeAndRead(encodeFrame(value), timeoutMillis)
+}
+
+function readJson(decoder: IpcFrameReader, timeoutMillis = 10_000): Promise<unknown> {
   return decoder.read(timeoutMillis)
 }
 
