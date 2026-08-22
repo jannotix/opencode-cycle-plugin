@@ -766,9 +766,36 @@ where
             ClientMessage::ReportTaskClosure { report, request_id } => {
                 let workflow_id = report.workflow_id;
                 let task_id = report.task_id;
-                let result = {
+                let preparation = {
                     let mut locked = store.lock().await;
-                    report_task_closure(&mut locked, worktrees.as_ref(), &report)
+                    prepare_task_closure(&mut locked, &report)
+                };
+                let result = match preparation {
+                    Ok(TaskClosurePreparation::Applied(applied)) => Ok(applied),
+                    Ok(TaskClosurePreparation::Ready(snapshot)) => {
+                        let validation_binding = snapshot.binding.clone();
+                        let validation_report = (*report).clone();
+                        let validation_worktrees = Arc::clone(&worktrees);
+                        validate_task_binding_then_reacquire(
+                            &store,
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    validate_task_revision_binding(
+                                        &validation_worktrees,
+                                        &validation_binding,
+                                        &validation_report,
+                                    )
+                                })
+                                .await
+                                .map_err(|error| {
+                                    format!("task closure Git validation failed: {error}")
+                                })?
+                            },
+                            |locked| finalize_task_closure(locked, &report, &snapshot),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
                 };
                 match result {
                     Ok(applied) => {
@@ -901,14 +928,21 @@ where
                 request_id,
                 workflow_id,
             } => {
-                let project_id = {
+                let preparation = {
                     let store = store.lock().await;
-                    validate_worktree_request(&store, &project_key, workflow_id)
+                    validate_worktree_request(&store, &project_key, workflow_id).and_then(
+                        |project_id| {
+                            store
+                                .load_worktree_binding(workflow_id)
+                                .map(|binding| (project_id, binding))
+                                .map_err(|error| error.to_string())
+                        },
+                    )
                 };
-                let result = match project_id {
-                    Ok(project_id) => {
+                let result = match preparation {
+                    Ok((project_id, persisted)) => {
                         let worktrees = Arc::clone(&worktrees);
-                        tokio::task::spawn_blocking(move || {
+                        let prepared = tokio::task::spawn_blocking(move || {
                             if project_directory.is_empty()
                                 || project_directory.len() > 32_768
                                 || project_directory.contains('\0')
@@ -921,22 +955,79 @@ where
                             )
                             .and_then(|manager| manager.create(project_id, workflow_id))
                             .map_err(|error| error.to_string())
+                            .and_then(|worktree| {
+                                let path = worktree.path.to_str().ok_or_else(|| {
+                                    "managed worktree path is not valid UTF-8".to_owned()
+                                })?;
+                                if let Some(binding) = persisted {
+                                    if binding.project_id != project_id
+                                        || binding.workflow_id != workflow_id
+                                        || binding.path != path
+                                        || resolve_worktree_revision(
+                                            &worktree.path,
+                                            &binding.base_revision,
+                                        )? != binding.base_revision
+                                        || !worktree_revision_is_ancestor(
+                                            &worktree.path,
+                                            &binding.base_revision,
+                                            &worktree.base_revision,
+                                        )?
+                                    {
+                                        return Err(
+                                            "prepared worktree does not match its durable binding"
+                                                .to_owned(),
+                                        );
+                                    }
+                                    Ok(binding)
+                                } else {
+                                    Ok(workflow_store::WorktreeBinding {
+                                        base_revision: worktree.base_revision,
+                                        path: path.to_owned(),
+                                        project_id,
+                                        workflow_id,
+                                    })
+                                }
+                            })
                         })
                         .await
-                        .map_err(|error| format!("worktree task failed: {error}"))?
+                        .map_err(|error| format!("worktree task failed: {error}"))?;
+                        match prepared {
+                            Ok(binding) => {
+                                let mut locked = store.lock().await;
+                                validate_worktree_request(&locked, &project_key, workflow_id)
+                                    .and_then(|current_project| {
+                                        if current_project != binding.project_id {
+                                            return Err(
+                                                "prepared worktree project changed during creation"
+                                                    .to_owned(),
+                                            );
+                                        }
+                                        locked
+                                            .save_worktree_binding_once(
+                                                &binding,
+                                                workflow_core::WorkflowTimestamp::now(),
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        locked
+                                            .load_worktree_binding(workflow_id)
+                                            .map_err(|error| error.to_string())?
+                                            .ok_or_else(|| {
+                                                "prepared worktree binding was not persisted"
+                                                    .to_owned()
+                                            })
+                                    })
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                     Err(error) => Err(error),
                 };
                 match result {
-                    Ok(worktree) => {
-                        let path = worktree
-                            .path
-                            .to_str()
-                            .ok_or_else(|| "managed worktree path is not valid UTF-8".to_owned())?;
+                    Ok(binding) => {
                         channel
                             .send(&ServerMessage::Worktree {
-                                base_revision: worktree.base_revision,
-                                path: path.to_owned(),
+                                base_revision: binding.base_revision,
+                                path: binding.path,
                                 request_id,
                                 workflow_id,
                             })
@@ -1016,11 +1107,24 @@ fn report_execution(
     workflow_state(state.state())
 }
 
-fn report_task_closure(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskClosureSnapshot {
+    binding: workflow_store::WorktreeBinding,
+    payload_digest: workflow_core::ContentDigest,
+    project_id: workflow_core::ProjectId,
+    ready_dependents: Vec<workflow_core::TaskId>,
+    repair_cycle: u8,
+}
+
+enum TaskClosurePreparation {
+    Applied(workflow_store::TaskApplyResult),
+    Ready(TaskClosureSnapshot),
+}
+
+fn prepare_task_closure(
     store: &mut Store,
-    worktrees: &Path,
     report: &workflow_ipc::protocol::TaskClosureReport,
-) -> Result<workflow_store::TaskApplyResult, String> {
+) -> Result<TaskClosurePreparation, String> {
     use std::collections::BTreeSet;
     use workflow_ipc::protocol::{TaskClosureCommandStatus, TaskClosureReviewDecision};
 
@@ -1136,7 +1240,7 @@ fn report_task_closure(
     if current.state() != workflow_core::TaskState::Ready {
         let payload_digest = closure_payload_digest(report)?;
         if current.state() == workflow_core::TaskState::Completed {
-            return store
+            let applied = store
                 .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
                     workflow_id: report.workflow_id,
                     task_id: report.task_id,
@@ -1146,7 +1250,8 @@ fn report_task_closure(
                     ready_dependents: &[],
                     timestamp: workflow_core::WorkflowTimestamp::now(),
                 })
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())?;
+            return Ok(TaskClosurePreparation::Applied(applied));
         }
         return Err("task is not ready for closure".to_owned());
     }
@@ -1157,17 +1262,12 @@ fn report_task_closure(
     }) {
         return Err("task dependencies are not completed".to_owned());
     }
-    let worktree_base = store
-        .load_worktree_base_revision(report.workflow_id)
+    let binding = store
+        .load_worktree_binding(report.workflow_id)
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "task closure requires a prepared worktree base revision".to_owned())?;
-    validate_task_revision_binding(
-        worktrees,
-        project_id,
-        report.workflow_id,
-        &worktree_base,
-        report,
-    )?;
+        .ok_or_else(|| {
+            "task closure requires an authoritative prepared worktree binding".to_owned()
+        })?;
     let ready_dependents = architecture
         .tasks
         .iter()
@@ -1184,35 +1284,72 @@ fn report_task_closure(
         })
         .map(|task| task.id)
         .collect::<Vec<_>>();
-    store
-        .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
-            workflow_id: report.workflow_id,
-            task_id: report.task_id,
-            receipt_id: report.receipt_id,
-            payload_digest: closure_payload_digest(report)?,
-            repair_cycle: workflow.repair_cycles(),
-            ready_dependents: &ready_dependents,
-            timestamp: workflow_core::WorkflowTimestamp::now(),
-        })
-        .map_err(|error| error.to_string())
+    Ok(TaskClosurePreparation::Ready(TaskClosureSnapshot {
+        binding,
+        payload_digest: closure_payload_digest(report)?,
+        project_id,
+        ready_dependents,
+        repair_cycle: workflow.repair_cycles(),
+    }))
+}
+
+fn finalize_task_closure(
+    store: &mut Store,
+    report: &workflow_ipc::protocol::TaskClosureReport,
+    expected: &TaskClosureSnapshot,
+) -> Result<workflow_store::TaskApplyResult, String> {
+    match prepare_task_closure(store, report)? {
+        TaskClosurePreparation::Applied(applied) => Ok(applied),
+        TaskClosurePreparation::Ready(current) if current == *expected => store
+            .complete_verified_task_closure(workflow_store::VerifiedTaskClosure {
+                workflow_id: report.workflow_id,
+                task_id: report.task_id,
+                receipt_id: report.receipt_id,
+                payload_digest: expected.payload_digest,
+                repair_cycle: expected.repair_cycle,
+                ready_dependents: &expected.ready_dependents,
+                timestamp: workflow_core::WorkflowTimestamp::now(),
+            })
+            .map_err(|error| error.to_string()),
+        TaskClosurePreparation::Ready(_) => {
+            Err("task closure authoritative state changed during Git validation".to_owned())
+        }
+    }
+}
+
+async fn validate_task_binding_then_reacquire<T, Validation, Finalize>(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    validation: Validation,
+    finalize: Finalize,
+) -> Result<T, String>
+where
+    Validation: std::future::Future<Output = Result<(), String>>,
+    Finalize: FnOnce(&mut Store) -> Result<T, String>,
+{
+    validation.await?;
+    let mut locked = store.lock().await;
+    finalize(&mut locked)
 }
 
 fn validate_task_revision_binding(
     worktrees: &Path,
-    project_id: workflow_core::ProjectId,
-    workflow_id: workflow_core::WorkflowId,
-    prepared_base: &str,
+    binding: &workflow_store::WorktreeBinding,
     report: &workflow_ipc::protocol::TaskClosureReport,
 ) -> Result<(), String> {
     let managed_root = worktrees
         .canonicalize()
         .map_err(|_| "task closure requires a prepared managed worktree".to_owned())?;
     let expected = managed_root
-        .join(project_id.to_string())
-        .join(workflow_id.to_string());
-    let worktree = expected
+        .join(binding.project_id.to_string())
+        .join(binding.workflow_id.to_string())
         .canonicalize()
         .map_err(|_| "task closure requires a prepared managed worktree".to_owned())?;
+    let worktree = Path::new(&binding.path)
+        .canonicalize()
+        .map_err(|_| "task closure durable worktree path does not exist".to_owned())?;
+    if worktree != expected {
+        return Err("task closure durable worktree path does not match its identity".to_owned());
+    }
     let relative = worktree
         .strip_prefix(&managed_root)
         .map_err(|_| "task closure managed worktree is outside its trusted root".to_owned())?;
@@ -1220,10 +1357,11 @@ fn validate_task_revision_binding(
         return Err("task closure managed worktree identity is invalid".to_owned());
     }
 
-    let resolved_prepared = resolve_worktree_revision(&worktree, prepared_base).map_err(|_| {
-        "prepared worktree base revision is not present in the managed worktree".to_owned()
-    })?;
-    if resolved_prepared != prepared_base {
+    let resolved_prepared =
+        resolve_worktree_revision(&worktree, &binding.base_revision).map_err(|_| {
+            "prepared worktree base revision is not present in the managed worktree".to_owned()
+        })?;
+    if resolved_prepared != binding.base_revision {
         return Err("prepared worktree base revision is not canonical".to_owned());
     }
     let resolved_base =
@@ -1231,7 +1369,7 @@ fn validate_task_revision_binding(
             "task closure base revision does not belong to the prepared worktree".to_owned()
         })?;
     if resolved_base != report.base_revision
-        || !worktree_revision_is_ancestor(&worktree, prepared_base, &report.base_revision)?
+        || !worktree_revision_is_ancestor(&worktree, &binding.base_revision, &report.base_revision)?
     {
         return Err(
             "task closure base revision does not belong to the prepared worktree".to_owned(),
@@ -2513,10 +2651,13 @@ impl RuntimePaths {
 
 #[cfg(test)]
 mod tests {
-    use workflow_core::WorkflowState;
-    use workflow_ipc::AdmissionOperation;
+    use std::{num::NonZeroUsize, sync::Arc};
 
-    use super::admission_allowed;
+    use workflow_core::{WorkflowId, WorkflowState};
+    use workflow_ipc::AdmissionOperation;
+    use workflow_store::Store;
+
+    use super::{admission_allowed, validate_task_binding_then_reacquire};
 
     #[test]
     fn terminal_and_suspended_workflows_cannot_reenter_admission() {
@@ -2534,5 +2675,53 @@ mod tests {
             AdmissionOperation::Acquire,
             WorkflowState::Architecture,
         ));
+    }
+
+    #[tokio::test]
+    async fn slow_git_validation_does_not_hold_the_global_store_mutex() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            Store::open(
+                directory.path().join("workflow.db"),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap(),
+        ));
+        let validation_started = Arc::new(std::sync::Barrier::new(2));
+        let validation_release = Arc::new(std::sync::Barrier::new(2));
+        let task_store = Arc::clone(&store);
+        let task_started = Arc::clone(&validation_started);
+        let task_release = Arc::clone(&validation_release);
+        let validation = async move {
+            tokio::task::spawn_blocking(move || {
+                task_started.wait();
+                task_release.wait();
+                Ok(())
+            })
+            .await
+            .unwrap()
+        };
+        let task = tokio::spawn(async move {
+            validate_task_binding_then_reacquire(&task_store, validation, |locked| {
+                locked
+                    .load_workflow(WorkflowId::new())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        });
+        tokio::task::spawn_blocking(move || validation_started.wait())
+            .await
+            .unwrap();
+
+        let locked = tokio::time::timeout(std::time::Duration::from_millis(250), store.lock())
+            .await
+            .expect("an unrelated store-backed request must not wait for Git validation");
+        assert!(locked.load_workflow(WorkflowId::new()).unwrap().is_none());
+        drop(locked);
+        tokio::task::spawn_blocking(move || validation_release.wait())
+            .await
+            .unwrap();
+        task.await.unwrap().unwrap();
     }
 }

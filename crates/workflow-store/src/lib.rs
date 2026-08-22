@@ -12,6 +12,7 @@ mod reviews;
 mod tasks;
 mod verification;
 mod workflows;
+mod worktrees;
 
 pub use candidates::{CandidateFilePayload, StoredCandidate};
 pub use goals::{GoalApplyResult, GoalPlanRecord};
@@ -19,6 +20,7 @@ pub use leases::LeaseAcquisition;
 pub use paths::{DataPaths, PathError, Platform, ProjectIdentity};
 pub use tasks::{TaskApplyResult, VerifiedTaskClosure};
 pub use workflows::WorkflowApplyResult;
+pub use worktrees::WorktreeBinding;
 
 use std::{
     num::NonZeroUsize,

@@ -8,7 +8,7 @@ use workflow_core::{
 };
 use workflow_ipc::ControlOperation;
 use workflow_ledger::{Actor, CheckpointKey, EventData, LedgerEvent, Redactor};
-use workflow_store::Store;
+use workflow_store::{Store, WorktreeBinding};
 
 #[test]
 fn native_control_inspects_and_changes_only_the_latest_project_workflow() {
@@ -474,6 +474,17 @@ fn recovery_returns_request_bound_architecture_repair_context() {
         .join(project_id.to_string())
         .join(workflow_id.to_string());
     std::fs::create_dir_all(&expected_worktree).unwrap();
+    store
+        .save_worktree_binding_once(
+            &WorktreeBinding {
+                base_revision: base_revision.clone(),
+                path: expected_worktree.to_string_lossy().into_owned(),
+                project_id,
+                workflow_id,
+            },
+            timestamp,
+        )
+        .unwrap();
 
     let recovery = workflowd::control::execute(
         &mut store,
@@ -775,6 +786,17 @@ fn recovery_preserves_failed_verification_evidence_for_quick_execution_repair() 
         .join(project_id.to_string())
         .join(workflow_id.to_string());
     std::fs::create_dir_all(&expected_worktree).unwrap();
+    store
+        .save_worktree_binding_once(
+            &WorktreeBinding {
+                base_revision: base_revision.clone(),
+                path: expected_worktree.to_string_lossy().into_owned(),
+                project_id,
+                workflow_id,
+            },
+            timestamp,
+        )
+        .unwrap();
 
     let recovery = workflowd::control::execute(
         &mut store,

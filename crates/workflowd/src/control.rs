@@ -254,15 +254,23 @@ fn early_recovery(
         .as_ref()
         .and_then(|candidate| candidate.manifest.base_revision())
         .map(str::to_owned);
-    let ledger_revision = store
-        .load_worktree_base_revision(workflow_id)
+    let worktree_binding = store
+        .load_worktree_binding(workflow_id)
         .map_err(|error| error.to_string())?;
-    let base_revision = match (candidate_revision, ledger_revision) {
-        (Some(candidate), Some(ledger)) if candidate != ledger => {
+    if worktree_binding.as_ref().is_some_and(|binding| {
+        binding.project_id != project_id || binding.workflow_id != workflow_id
+    }) {
+        return Err("workflow worktree binding ownership is invalid".to_owned());
+    }
+    let base_revision = match (candidate_revision, worktree_binding.as_ref()) {
+        (Some(candidate), Some(binding)) if candidate != binding.base_revision => {
             return Err("workflow worktree base revision is inconsistent".to_owned());
         }
-        (Some(candidate), _) => Some(candidate),
-        (None, ledger) => ledger,
+        (Some(_), None) => {
+            return Err("workflow candidate has no authoritative worktree binding".to_owned());
+        }
+        (_, Some(binding)) => Some(binding.base_revision.clone()),
+        (None, None) => None,
     };
     if base_revision.as_deref().is_some_and(|revision| {
         !matches!(revision.len(), 40 | 64)
@@ -272,9 +280,13 @@ fn early_recovery(
     }) {
         return Err("workflow worktree base revision is invalid".to_owned());
     }
-    let worktree_path = worktrees
+    let expected_worktree_path = worktrees
         .join(project_id.to_string())
         .join(workflow_id.to_string());
+    let worktree_path = worktree_binding
+        .as_ref()
+        .map(|binding| std::path::PathBuf::from(&binding.path))
+        .unwrap_or(expected_worktree_path);
     let worktree_exists = std::fs::symlink_metadata(&worktree_path)
         .map(|_| true)
         .or_else(|error| {

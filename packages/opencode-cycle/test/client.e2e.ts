@@ -412,9 +412,9 @@ test("plugin starts, authenticates, and validates the real control plane", async
     expect(routedDatabase.query("SELECT count(*) AS count FROM ledger_entries").get()).toEqual({
       count: 10 + verificationPlan.evidenceIds.length,
     })
-    expect(routedDatabase.query("SELECT count(*) AS count FROM workflow_constraints").get()).toEqual({
-      count: 1,
-    })
+    expect(
+      routedDatabase.query("SELECT kind FROM workflow_constraints ORDER BY kind").all(),
+    ).toEqual([{ kind: "essentiality" }, { kind: "prepared_worktree" }])
     expect(routedDatabase.query("SELECT count(*) AS count FROM workflow_candidates").get()).toEqual({
       count: 1,
     })
@@ -626,12 +626,12 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
     )
     await expect(
       controlPlane.reportTaskClosure(projectKey, workflowId, unpreparedReport),
-    ).rejects.toThrow("requires a prepared worktree base revision")
+    ).rejects.toThrow("requires an authoritative prepared worktree binding")
     const worktree = await controlPlane.prepareWorktree(projectKey, repository, workflowId)
     await controlPlane.audit({
       actor_id: "opencode-plugin",
       candidate_id: null,
-      data: { externally_attributed: false, revision: worktree.baseRevision, type: "git" },
+      data: { externally_attributed: false, revision: "0".repeat(40), type: "git" },
       evidence_ids: [],
       files: [],
       metadata: { action: "execution_worktree_prepared" },
@@ -643,11 +643,22 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
       timestamp_unix_millis: Date.now(),
       workflow_id: workflowId,
     })
+    await controlPlane.dispose()
+    controlPlane = new LocalControlPlane({
+      binaryPath: binary,
+      dataDirectory,
+      stopOwnedProcessOnDispose: true,
+    })
+    expect(await controlPlane.control(projectKey, "recovery", workflowId)).toMatchObject({
+      baseRevision: worktree.baseRevision,
+      worktreePath: worktree.path,
+    })
     await mkdir(join(worktree.path, "src"), { recursive: true })
     await writeFile(join(worktree.path, "src", "feature.ts"), "root task\n")
     await execGit(worktree.path, ["add", "src/feature.ts"])
     await execGit(worktree.path, ["commit", "-m", "root task"])
     const rootRevision = await gitHead(worktree.path)
+    expect(await controlPlane.prepareWorktree(projectKey, repository, workflowId)).toEqual(worktree)
     expect(await controlPlane.control(projectKey, "tasks", workflowId)).toEqual({
       tasks: [
         { state: "pending", taskId: dependentTaskId },
@@ -845,6 +856,13 @@ test("verified task closure is authoritative, idempotent, dependency-aware, and 
         submitted_revision: unknownSubmittedRevision,
       }),
     ).rejects.toThrow("submitted revision does not belong")
+    await expect(
+      controlPlane.reportTaskClosure(projectKey, workflowId, {
+        ...rootReport,
+        changed_paths: [],
+        receipt_id: crypto.randomUUID(),
+      }),
+    ).rejects.toThrow("changed paths do not match")
 
     expect(await controlPlane.reportTaskClosure(projectKey, workflowId, rootReport)).toMatchObject({
       duplicate: false,
