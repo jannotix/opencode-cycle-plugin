@@ -36,7 +36,25 @@ thread_local! {
     static RECOVERY_FAIL_AFTER_PARTITIONS: std::cell::Cell<Option<usize>> = const {
         std::cell::Cell::new(None)
     };
+    static RECOVERY_TRACK_PARTITION: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static RECOVERY_REWRITE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FinalValidationPause {
+    partition_id: String,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static FINAL_VALIDATION_PAUSE: std::sync::Mutex<Option<FinalValidationPause>> =
+    std::sync::Mutex::new(None);
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +82,7 @@ struct StoredGraphEdge {
 
 #[derive(Debug)]
 pub enum GraphStoreError {
+    ConcurrentRecoveryWrite,
     Domain(GraphError),
     Incomplete,
     IntegerRange,
@@ -77,6 +96,9 @@ pub enum GraphStoreError {
 impl std::fmt::Display for GraphStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ConcurrentRecoveryWrite => {
+                formatter.write_str("database changed on another connection during graph recovery")
+            }
             Self::Domain(error) => error.fmt(formatter),
             Self::Incomplete => formatter
                 .write_str("incomplete graph candidate cannot replace a readable partition"),
@@ -137,7 +159,7 @@ impl GraphStore {
         connection.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        restore_full_v1_compatibility(&mut connection)?;
+        restore_full_v1_compatibility(&mut connection, version)?;
         Ok(Self { connection })
     }
 
@@ -384,7 +406,10 @@ impl GraphStore {
     }
 }
 
-fn restore_full_v1_compatibility(connection: &mut Connection) -> Result<(), GraphStoreError> {
+fn restore_full_v1_compatibility(
+    connection: &mut Connection,
+    schema_version: u32,
+) -> Result<(), GraphStoreError> {
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     if application_id == FULL_V1_APPLICATION_ID {
@@ -399,7 +424,7 @@ fn restore_full_v1_compatibility(connection: &mut Connection) -> Result<(), Grap
         restore_partition_full_v1(connection, partition_id)?;
         recovery_partition_commit_checkpoint(index + 1)?;
     }
-    finalize_full_v1_compatibility(connection)?;
+    finalize_full_v1_compatibility(connection, schema_version)?;
     Ok(())
 }
 
@@ -467,6 +492,7 @@ fn restore_partition_full_v1(
                  WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
                 params![full_json, stored_partition_id, generation, row_id],
             )?;
+            recovery_row_rewrite_checkpoint(stored_partition_id);
         }
     }
 
@@ -493,23 +519,75 @@ fn restore_partition_full_v1(
                  WHERE partition_id = ?2 AND generation = ?3 AND id = ?4",
                 params![full_json, stored_partition_id, generation, row_id],
             )?;
+            recovery_row_rewrite_checkpoint(stored_partition_id);
         }
     }
     transaction.commit()?;
     Ok(())
 }
 
-fn finalize_full_v1_compatibility(connection: &mut Connection) -> Result<(), GraphStoreError> {
+fn finalize_full_v1_compatibility(
+    connection: &mut Connection,
+    expected_schema_version: u32,
+) -> Result<(), GraphStoreError> {
+    let initial_data_version = data_version(connection)?;
+    let partition_ids = load_partition_ids(connection)?;
+    for stored_partition_id in &partition_ids {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        validate_full_v1_partition(&transaction, stored_partition_id)?;
+        transaction.commit()?;
+        final_validation_partition_checkpoint(stored_partition_id);
+    }
+
+    if data_version(connection)? != initial_data_version {
+        return Err(GraphStoreError::ConcurrentRecoveryWrite);
+    }
+
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for stored_partition_id in load_partition_ids(&transaction)? {
-        let Some(partition_id) = validated_partition_id(&transaction, &stored_partition_id)? else {
-            continue;
-        };
-        let mut statement = transaction.prepare(
+    let locked_schema_version: u32 =
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_schema_version < MIN_SUPPORTED_SCHEMA_VERSION {
+        return Err(GraphStoreError::MissingSchema);
+    }
+    if locked_schema_version > MAX_SUPPORTED_SCHEMA_VERSION {
+        return Err(GraphStoreError::UnsupportedSchemaVersion(
+            locked_schema_version,
+        ));
+    }
+    if locked_schema_version != expected_schema_version
+        || data_version(&transaction)? != initial_data_version
+    {
+        return Err(GraphStoreError::ConcurrentRecoveryWrite);
+    }
+    let locked_application_id: i64 =
+        transaction.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if locked_application_id != 0 {
+        return Err(GraphStoreError::ConcurrentRecoveryWrite);
+    }
+    transaction.pragma_update(None, "application_id", FULL_V1_APPLICATION_ID)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn data_version(connection: &Connection) -> Result<i64, GraphStoreError> {
+    connection
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .map_err(GraphStoreError::Sqlite)
+}
+
+fn validate_full_v1_partition(
+    connection: &Connection,
+    stored_partition_id: &str,
+) -> Result<(), GraphStoreError> {
+    let Some(partition_id) = validated_partition_id(connection, stored_partition_id)? else {
+        return Ok(());
+    };
+    {
+        let mut statement = connection.prepare(
             "SELECT id, node_json FROM code_nodes
              WHERE partition_id = ?1 ORDER BY generation, id",
         )?;
-        let rows = statement.query_map([&stored_partition_id], |row| {
+        let rows = statement.query_map([stored_partition_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -519,13 +597,13 @@ fn finalize_full_v1_compatibility(connection: &mut Connection) -> Result<(), Gra
                 return Err(GraphStoreError::Domain(GraphError::InvalidPartition));
             }
         }
-        drop(statement);
-
-        let mut statement = transaction.prepare(
+    }
+    {
+        let mut statement = connection.prepare(
             "SELECT id, edge_json FROM code_edges
              WHERE partition_id = ?1 ORDER BY generation, id",
         )?;
-        let rows = statement.query_map([&stored_partition_id], |row| {
+        let rows = statement.query_map([stored_partition_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -536,8 +614,6 @@ fn finalize_full_v1_compatibility(connection: &mut Connection) -> Result<(), Gra
             }
         }
     }
-    transaction.pragma_update(None, "application_id", FULL_V1_APPLICATION_ID)?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -556,6 +632,35 @@ fn recovery_partition_commit_checkpoint(completed: usize) -> Result<(), GraphSto
 fn recovery_partition_commit_checkpoint(_: usize) -> Result<(), GraphStoreError> {
     Ok(())
 }
+
+#[cfg(test)]
+fn recovery_row_rewrite_checkpoint(partition_id: &str) {
+    RECOVERY_TRACK_PARTITION.with(|tracked| {
+        if tracked.borrow().as_deref() == Some(partition_id) {
+            RECOVERY_REWRITE_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn recovery_row_rewrite_checkpoint(_: &str) {}
+
+#[cfg(test)]
+fn final_validation_partition_checkpoint(partition_id: &str) {
+    let pause = FINAL_VALIDATION_PAUSE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|pause| pause.partition_id == partition_id)
+        .cloned();
+    if let Some(pause) = pause {
+        pause.reached.wait();
+        pause.resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn final_validation_partition_checkpoint(_: &str) {}
 
 impl PartitionBatch<'_> {
     pub fn replace_partition(&self, partition: &GraphPartition) -> Result<u64, GraphStoreError> {
@@ -1274,6 +1379,77 @@ mod tests {
     }
 
     #[test]
+    fn final_validation_does_not_hold_writer_lock_and_rejects_data_version_drift() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workflow.db");
+        drop(workflow_store::Store::open(&path, std::num::NonZeroUsize::new(1).unwrap()).unwrap());
+        let mut partitions = vec![sample_partition(), sample_partition(), sample_partition()];
+        partitions.sort_by_key(|partition| partition.id.to_string());
+        let timestamp = WorkflowTimestamp::parse("2026-08-12T12:00:00Z").unwrap();
+        let mut store = GraphStore::open(&path).unwrap();
+        for partition in &partitions {
+            store.replace_partition(partition, true, timestamp).unwrap();
+            write_compact_rows(&store.connection, partition);
+        }
+        drop(store);
+
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *FINAL_VALIDATION_PAUSE.lock().unwrap() = Some(FinalValidationPause {
+            partition_id: partitions[0].id.to_string(),
+            reached: std::sync::Arc::clone(&reached),
+            resume: std::sync::Arc::clone(&resume),
+        });
+        let recovery_path = path.clone();
+        let recovery = std::thread::spawn(move || GraphStore::open(recovery_path).map(drop));
+        reached.wait();
+
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::from_millis(500)).unwrap();
+        let external_project = ProjectId::new().to_string();
+        let write_result = writer.execute(
+            "INSERT INTO code_index_state(
+                project_id, repository_path, fingerprint, updated_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![external_project, "external", "0".repeat(64), "now"],
+        );
+        drop(writer);
+        resume.wait();
+        let recovery_result = recovery.join().unwrap();
+        *FINAL_VALIDATION_PAUSE.lock().unwrap() = None;
+
+        assert!(
+            write_result.is_ok(),
+            "external write was blocked: {write_result:?}"
+        );
+        assert!(matches!(
+            recovery_result,
+            Err(GraphStoreError::ConcurrentRecoveryWrite)
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let external_writes: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM code_index_state WHERE project_id = ?1",
+                [external_project],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(application_id, 0);
+        assert_eq!(external_writes, 1);
+        drop(connection);
+
+        drop(GraphStore::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, EXPECTED_FULL_V1_APPLICATION_ID);
+    }
+
+    #[test]
     fn corrupt_last_sorting_row_rolls_back_only_its_active_partition() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workflow.db");
@@ -1292,16 +1468,31 @@ mod tests {
             .values()
             .max_by_key(|node| node.id)
             .unwrap();
+        let corrupt_row_id = "f".repeat(64);
+        assert!(
+            corrupt_partition
+                .nodes
+                .keys()
+                .all(|id| id.to_string() < corrupt_row_id)
+        );
         store
             .connection
             .execute(
                 "UPDATE code_nodes SET id = ?1 WHERE id = ?2",
-                params!["0".repeat(64), corrupt.id.to_string()],
+                params![&corrupt_row_id, corrupt.id.to_string()],
             )
             .unwrap();
         drop(store);
 
-        assert!(GraphStore::open(&path).is_err());
+        RECOVERY_TRACK_PARTITION.with(|tracked| {
+            *tracked.borrow_mut() = Some(corrupt_partition.id.to_string());
+        });
+        RECOVERY_REWRITE_COUNT.with(|count| count.set(0));
+        let result = GraphStore::open(&path);
+        let attempted_rewrites = RECOVERY_REWRITE_COUNT.with(std::cell::Cell::get);
+        RECOVERY_TRACK_PARTITION.with(|tracked| *tracked.borrow_mut() = None);
+        assert!(result.is_err());
+        assert_eq!(attempted_rewrites, 2);
         let connection = Connection::open(&path).unwrap();
         let application_id: i64 = connection
             .pragma_query_value(None, "application_id", |row| row.get(0))
