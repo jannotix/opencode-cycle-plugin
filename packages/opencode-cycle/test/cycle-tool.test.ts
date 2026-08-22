@@ -231,7 +231,7 @@ test("doctor includes host compatibility in the user-visible result", async () =
     inspectHost() {
       return {
         certified: false,
-        certifiedVersions: ["1.18.16", "1.18.18"],
+        certifiedVersions: ["1.18.16", "1.18.18", "1.18.21"],
         compatible: true,
         message: "OpenCode 1.18.19 matches the 1.x plugin contract.",
         minimumVersion: "1.18.16",

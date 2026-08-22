@@ -1294,17 +1294,12 @@ export function resolveDataDirectory(
   if (platform === "win32") {
     return combine(requiredEnvironment(environment, "LOCALAPPDATA"), "OpenCode Cycle")
   }
-  if (platform === "darwin") {
-    return combine(
-      requiredEnvironment(environment, "HOME"),
-      "Library",
-      "Application Support",
-      "OpenCode Cycle",
-    )
+  if (platform === "linux") {
+    const base =
+      environment.XDG_DATA_HOME || combine(requiredEnvironment(environment, "HOME"), ".local", "share")
+    return combine(base, "opencode-cycle")
   }
-  const base =
-    environment.XDG_DATA_HOME || combine(requiredEnvironment(environment, "HOME"), ".local", "share")
-  return combine(base, "opencode-cycle")
+  throw new ControlPlaneError(`unsupported native platform ${platform}; supported platforms are linux and win32`)
 }
 
 function requiredEnvironment(environment: NodeJS.ProcessEnv, name: string): string {
@@ -1315,9 +1310,9 @@ function requiredEnvironment(environment: NodeJS.ProcessEnv, name: string): stri
 
 export function nativePackageName(platform: NodeJS.Platform, architecture: string): string {
   const target = `${platform}-${architecture}`
-  if (!["darwin-arm64", "darwin-x64", "linux-x64", "win32-x64"].includes(target)) {
+  if (!["linux-x64", "win32-x64"].includes(target)) {
     throw new ControlPlaneError(
-      `unsupported native platform ${target}; supported targets are darwin-arm64, darwin-x64, linux-x64 and win32-x64`,
+      `unsupported native platform ${target}; supported targets are linux-x64 and win32-x64`,
     )
   }
   return `@opencode-cycle/native-${target}`

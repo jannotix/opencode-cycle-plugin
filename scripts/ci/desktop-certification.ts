@@ -7,7 +7,6 @@ import {
   mkdtemp,
   readFile,
   readdir,
-  rename,
   rm,
   stat,
   writeFile,
@@ -20,6 +19,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import {
   CERTIFIED_PLATFORMS,
+  DESKTOP_ASSET_NAMES,
   type CertifiedPlatform,
 } from "../release/release-manifest.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
@@ -31,7 +31,7 @@ export interface DesktopAsset {
   readonly url: string
 }
 
-interface DesktopAssetMatrix {
+export interface DesktopAssetMatrix {
   readonly assets: Readonly<Record<CertifiedPlatform, DesktopAsset>>
   readonly release: string
   readonly version: string
@@ -49,6 +49,9 @@ export function validateDesktopAsset(
   asset: DesktopAsset,
   version: string,
 ): void {
+  if (asset.name !== DESKTOP_ASSET_NAMES[platform]) {
+    throw new Error(`${platform} Desktop asset name is invalid`)
+  }
   const prefix = `https://github.com/anomalyco/opencode/releases/download/v${version}/`
   if (!asset.url.startsWith(prefix) || !asset.url.endsWith(`/${asset.name}`)) {
     throw new Error(`${platform} Desktop asset is not an official release URL`)
@@ -56,6 +59,45 @@ export function validateDesktopAsset(
   if (!/^[0-9a-f]{64}$/u.test(asset.sha256)) throw new Error(`${platform} Desktop asset has invalid SHA-256`)
   if (!Number.isSafeInteger(asset.size) || asset.size < 1) {
     throw new Error(`${platform} Desktop asset has invalid size`)
+  }
+}
+
+export function validateDesktopAssetMatrix(matrix: DesktopAssetMatrix): void {
+  if (!/^\d+\.\d+\.\d+$/u.test(matrix.version)) {
+    throw new Error("Desktop asset matrix version is invalid")
+  }
+  if (matrix.release !== `https://github.com/anomalyco/opencode/releases/tag/v${matrix.version}`) {
+    throw new Error("Desktop asset matrix release URL is invalid")
+  }
+  const platforms = Object.keys(matrix.assets).sort()
+  if (
+    platforms.length !== SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS.length ||
+    !SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS.every((platform) => platforms.includes(platform))
+  ) {
+    throw new Error("Desktop asset matrix platform set is invalid")
+  }
+  for (const platform of SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS) {
+    validateDesktopAsset(platform, matrix.assets[platform], matrix.version)
+  }
+}
+
+async function requireSourceRevision(root: string, revision: string): Promise<void> {
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(revision)) {
+    throw new Error("Desktop certification revision must be a full Git object ID")
+  }
+  const child = Bun.spawn(["git", "rev-parse", "HEAD"], {
+    cwd: root,
+    stderr: "pipe",
+    stdout: "pipe",
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ])
+  if (exitCode !== 0) throw new Error(`Cannot resolve Desktop certification revision: ${stderr.trim()}`)
+  if (stdout.trim() !== revision) {
+    throw new Error("Desktop certification revision does not match the checked-out source")
   }
 }
 
@@ -140,6 +182,8 @@ async function main(): Promise<void> {
   const matrix = JSON.parse(
     await readFile(join(root, ".github", "opencode-desktop-assets.json"), "utf8"),
   ) as DesktopAssetMatrix
+  validateDesktopAssetMatrix(matrix)
+  await requireSourceRevision(root, options.revision)
   const asset = matrix.assets[options.platform]
   validateDesktopAsset(options.platform, asset, matrix.version)
 
@@ -158,11 +202,7 @@ async function main(): Promise<void> {
   let desktopProfile: string | undefined
   let windowsProtocol: WindowsProtocolRegistration | undefined
   let mainError: unknown
-  const quarantined: string[] = []
   try {
-    quarantined.push(
-      ...(await stagePackedPluginOverLiveInstall(pluginArchive, nativeArchive, options.platform)),
-    )
     const home = environment.HOME as string
     const userProfile = environment.USERPROFILE ?? home
     await Promise.all([
@@ -356,7 +396,6 @@ async function main(): Promise<void> {
     mainError = error
   } finally {
     if (desktopProcess !== undefined) await terminateDesktopProcess(desktopProcess, options.platform)
-    await restoreQuarantinedPlugins(quarantined)
     if (windowsProtocol !== undefined) {
       await restoreWindowsProtocolRegistration(windowsProtocol, scratch, environment)
     }
@@ -374,41 +413,6 @@ async function main(): Promise<void> {
   if (mainError !== undefined) {
     throw mainError as Error
   }
-}
-
-function liveCycleInstallRoot(): string | undefined {
-  const home = process.env.USERPROFILE ?? process.env.HOME
-  if (!home) return undefined
-  return join(home, ".config", "opencode", "opencode-cycle")
-}
-
-async function stagePackedPluginOverLiveInstall(
-  pluginArchive: string,
-  nativeArchive: string,
-  platform: CertifiedPlatform,
-): Promise<string[]> {
-  const liveRoot = liveCycleInstallRoot()
-  if (liveRoot === undefined || !(await exists(liveRoot))) return []
-  const backup = `${liveRoot}.cert-quarantine`
-  await rm(backup, { force: true, recursive: true, maxRetries: 5 })
-  await rename(liveRoot, backup)
-  const staging = await mkdtemp(join(tmpdir(), "occ-stage-"))
-  try {
-    await mkdir(join(staging, "plugin"), { recursive: true })
-    await mkdir(join(staging, "native"), { recursive: true })
-    await run(["tar", "-xf", pluginArchive, "-C", join(staging, "plugin")], staging, process.env)
-    await run(["tar", "-xf", nativeArchive, "-C", join(staging, "native")], staging, process.env)
-    const packedPlugin = join(staging, "plugin", "package")
-    const nativeBinary = platform === "windows-x64" ? "workflowd.exe" : "workflowd"
-    const packedNative = join(staging, "native", "package", "bin", nativeBinary)
-    await copyDirectory(packedPlugin, liveRoot)
-    await mkdir(join(liveRoot, "bin"), { recursive: true })
-    await copyFile(packedNative, join(liveRoot, "bin", nativeBinary))
-    if (platform !== "windows-x64") await chmod(join(liveRoot, "bin", nativeBinary), 0o755)
-  } finally {
-    await rm(staging, { force: true, recursive: true, maxRetries: 5 })
-  }
-  return [backup]
 }
 
 async function installPackedPluginTree(
@@ -450,14 +454,6 @@ async function copyDirectory(from: string, to: string): Promise<void> {
     const destination = join(to, entry.name)
     if (entry.isDirectory()) await copyDirectory(source, destination)
     else await copyFile(source, destination)
-  }
-}
-
-async function restoreQuarantinedPlugins(backups: readonly string[]): Promise<void> {
-  for (const backup of backups) {
-    const original = backup.replace(/\.cert-quarantine$/u, "")
-    await rm(original, { force: true, recursive: true, maxRetries: 5 }).catch(() => undefined)
-    await rename(backup, original).catch(() => undefined)
   }
 }
 

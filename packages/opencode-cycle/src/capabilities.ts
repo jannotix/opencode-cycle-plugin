@@ -43,7 +43,7 @@ const REQUIRED_CAPABILITIES: readonly HostCapability[] = [
   "session-create",
 ]
 
-export const CERTIFIED_HOST_VERSIONS = ["1.18.16", "1.18.18"] as const
+export const CERTIFIED_HOST_VERSIONS = ["1.18.16", "1.18.18", "1.18.21"] as const
 export const MINIMUM_HOST_VERSION = "1.18.16" as const
 export const SUPPORTED_HOST_MAJOR = 1
 
@@ -92,8 +92,7 @@ export function hostCompatibility(version: string | undefined): HostCompatibilit
       certified: false,
       certifiedVersions,
       compatible: true,
-      message:
-        "OpenCode host version was not reported. Required plugin capabilities are present, so Cycle continues. Certified evidence covers 1.18.16 and 1.18.18.",
+      message: `OpenCode host version was not reported. Required plugin capabilities are present, so Cycle continues. Certified evidence covers ${certifiedVersions.join(", ")}.`,
       minimumVersion: MINIMUM_HOST_VERSION,
       version: null,
     }
@@ -136,7 +135,7 @@ export function hostCompatibility(version: string | undefined): HostCompatibilit
     compatible: true,
     message: certified
       ? `OpenCode ${version} is a certified host.`
-      : `OpenCode ${version} matches the 1.x plugin contract and is above ${MINIMUM_HOST_VERSION}. Release evidence covers ${certifiedVersions.join(" and ")}. Cycle continues; this host is not in the certified evidence set.`,
+      : `OpenCode ${version} matches the 1.x plugin contract and is above ${MINIMUM_HOST_VERSION}. Release evidence covers ${certifiedVersions.join(", ")}. Cycle continues; this host is not in the certified evidence set.`,
     minimumVersion: MINIMUM_HOST_VERSION,
     version,
   }

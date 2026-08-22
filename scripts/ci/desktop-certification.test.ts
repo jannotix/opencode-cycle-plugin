@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 
 import {
   activationScanRoots,
@@ -15,11 +15,13 @@ import {
   stageDesktopAsset,
   terminateDesktopProcess,
   validateDesktopAsset,
+  validateDesktopAssetMatrix,
   windowsDesktopExtraction,
   windowsPowerShellEnvironment,
   windowsPowerShellPath,
   SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS,
   type DesktopAsset,
+  type DesktopAssetMatrix,
 } from "./desktop-certification.js"
 
 test("Desktop certification exposes only Windows x64 and Linux x64 for v1", () => {
@@ -46,17 +48,59 @@ const asset: DesktopAsset = {
   name: "opencode-desktop-win-x64.exe",
   sha256: "a".repeat(64),
   size: 123,
-  url: "https://github.com/anomalyco/opencode/releases/download/v1.18.16/opencode-desktop-win-x64.exe",
+  url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-win-x64.exe",
 }
 
 test("desktop asset policy accepts only immutable official release assets", () => {
-  expect(() => validateDesktopAsset("windows-x64", asset, "1.18.16")).not.toThrow()
+  expect(() => validateDesktopAsset("windows-x64", asset, "1.18.21")).not.toThrow()
   expect(() =>
-    validateDesktopAsset("windows-x64", { ...asset, url: "https://example.invalid/file" }, "1.18.16"),
+    validateDesktopAsset("windows-x64", { ...asset, url: "https://example.invalid/file" }, "1.18.21"),
   ).toThrow("official release")
-  expect(() => validateDesktopAsset("windows-x64", { ...asset, sha256: "bad" }, "1.18.16")).toThrow(
+  expect(() => validateDesktopAsset("windows-x64", { ...asset, sha256: "bad" }, "1.18.21")).toThrow(
     "SHA-256",
   )
+  expect(() =>
+    validateDesktopAsset(
+      "windows-x64",
+      {
+        ...asset,
+        name: "opencode-desktop-linux-x86_64.AppImage",
+        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-linux-x86_64.AppImage",
+      },
+      "1.18.21",
+    ),
+  ).toThrow("asset name")
+})
+
+test("Desktop asset matrix is the exact official OpenCode 1.18.21 Windows/Linux release", async () => {
+  const matrix = JSON.parse(
+    await readFile(resolve(import.meta.dir, "../../.github/opencode-desktop-assets.json"), "utf8"),
+  ) as DesktopAssetMatrix
+  expect(() => validateDesktopAssetMatrix(matrix)).not.toThrow()
+  expect(matrix).toEqual({
+    assets: {
+      "linux-x64": {
+        name: "opencode-desktop-linux-x86_64.AppImage",
+        sha256: "fb384fc4f030aca8624d775b8757cafa39b5871fc0eddeecebb128f25ed649d8",
+        size: 158_944_115,
+        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-linux-x86_64.AppImage",
+      },
+      "windows-x64": {
+        name: "opencode-desktop-win-x64.exe",
+        sha256: "3bd1a81d8fcb377a6bda60a9abf8d412aca1c9c702218ddbbdf7c7b09deaa739",
+        size: 126_209_592,
+        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-win-x64.exe",
+      },
+    },
+    release: "https://github.com/anomalyco/opencode/releases/tag/v1.18.21",
+    version: "1.18.21",
+  })
+  expect(() =>
+    validateDesktopAssetMatrix({
+      ...matrix,
+      assets: { ...matrix.assets, "macos-x64": asset } as never,
+    }),
+  ).toThrow("platform set")
 })
 
 test("certification uses an isolated Desktop and OpenCode profile", () => {

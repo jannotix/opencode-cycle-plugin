@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test"
+import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 
-import { negotiateCapabilities, parseHostVersion } from "../src/capabilities.js"
+import {
+  CERTIFIED_HOST_VERSIONS,
+  MINIMUM_HOST_VERSION,
+  negotiateCapabilities,
+  parseHostVersion,
+} from "../src/capabilities.js"
 
 const supportedClient = () => ({
   app: { agents() {}, log() {} },
@@ -9,7 +16,9 @@ const supportedClient = () => ({
 })
 
 test("enables certified hosts without safe mode", () => {
-  for (const version of ["1.18.16", "1.18.18"]) {
+  expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.16", "1.18.18", "1.18.21"])
+  expect(MINIMUM_HOST_VERSION).toBe("1.18.16")
+  for (const version of CERTIFIED_HOST_VERSIONS) {
     const result = negotiateCapabilities(supportedClient(), version)
     expect(result.safeMode).toBeFalse()
     expect(result.certified).toBeTrue()
@@ -28,13 +37,27 @@ test("enables certified hosts without safe mode", () => {
 })
 
 test("newer 1.x Desktop updates stay active when required capabilities exist", () => {
-  for (const version of ["1.18.17", "1.18.19", "1.19.0"]) {
+  for (const version of ["1.18.17", "1.18.19", "1.18.20", "1.19.0"]) {
     const result = negotiateCapabilities(supportedClient(), version)
     expect(result.safeMode).toBeFalse()
     expect(result.certified).toBeFalse()
     expect(result.host.compatible).toBeTrue()
     expect(result.warnings.join(" ")).toContain(version)
     expect(result.reasons).toEqual([])
+  }
+})
+
+test("pins the OpenCode plugin and SDK dependency graph to the certified Desktop release", async () => {
+  const root = resolve(import.meta.dir, "../../..")
+  for (const manifestPath of [
+    resolve(root, "package.json"),
+    resolve(root, "packages", "opencode-cycle", "package.json"),
+  ]) {
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      dependencies?: Record<string, string>
+    }
+    expect(manifest.dependencies?.["@opencode-ai/plugin"]).toBe("1.18.21")
+    expect(manifest.dependencies?.["@opencode-ai/sdk"]).toBe("1.18.21")
   }
 })
 

@@ -1,43 +1,48 @@
-import { createHash } from "node:crypto"
-import { readFile, readdir, writeFile } from "node:fs/promises"
-import { dirname, relative, resolve, sep } from "node:path"
+import { writeFile } from "node:fs/promises"
+import { join, relative, resolve, sep } from "node:path"
 
-export async function createChecksumManifest(directory: string, output: string): Promise<void> {
+import { readReleaseManifest, verifyArtifactDirectory } from "./release-manifest.js"
+
+export async function createChecksumManifest(
+  directory: string,
+  output: string,
+  manifestPath: string,
+): Promise<void> {
   const root = resolve(directory)
   const target = resolve(output)
-  const paths = (await findFiles(root)).filter((path) => path !== target).sort()
-  const lines = await Promise.all(
-    paths.map(async (path) => {
-      const digest = createHash("sha256").update(await readFile(path)).digest("hex")
-      return `${digest}  ${relative(root, path).split(sep).join("/")}`
-    }),
-  )
+  const manifest = await readReleaseManifest(manifestPath)
+  const artifactsDirectory = join(root, "artifacts")
+  const artifacts = await verifyArtifactDirectory(artifactsDirectory, manifest.artifacts)
+  const lines = artifacts.map((artifact) => {
+    const path = join(artifactsDirectory, artifact.name)
+    const relativePath = relative(root, path).split(sep).join("/")
+    return `${artifact.sha256}  ${relativePath}`
+  })
   await writeFile(target, `${lines.join("\n")}\n`, "utf8")
 }
 
-async function findFiles(root: string): Promise<string[]> {
-  const output: string[] = []
-  const queue = [root]
-  while (queue.length > 0) {
-    const directory = queue.shift() as string
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const path = resolve(directory, entry.name)
-      if (entry.isDirectory()) queue.push(path)
-      else if (entry.isFile()) output.push(path)
-    }
-  }
-  return output
-}
-
 async function main(): Promise<void> {
-  const directoryIndex = Bun.argv.indexOf("--directory")
-  const outputIndex = Bun.argv.indexOf("--output")
-  const directory = Bun.argv[directoryIndex + 1]
-  const output = Bun.argv[outputIndex + 1]
-  if (directoryIndex < 0 || outputIndex < 0 || directory === undefined || output === undefined) {
-    throw new Error("Expected --directory <path> --output <path>")
+  const values = new Map<string, string>()
+  const allowed = new Set(["directory", "manifest", "output"])
+  const argumentsList = Bun.argv.slice(2)
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const argument = argumentsList[index]
+    const value = argumentsList[index + 1]
+    if (argument === undefined || value === undefined || !argument.startsWith("--")) {
+      throw new Error("Checksum arguments must be --key value pairs")
+    }
+    const name = argument.slice(2)
+    if (!allowed.has(name) || values.has(name)) {
+      throw new Error(`Unknown or duplicate argument: ${argument}`)
+    }
+    values.set(name, value)
   }
-  await createChecksumManifest(directory, output)
+  for (const name of allowed) if (!values.has(name)) throw new Error(`Missing --${name}`)
+  await createChecksumManifest(
+    values.get("directory") as string,
+    values.get("output") as string,
+    values.get("manifest") as string,
+  )
 }
 
 if (import.meta.main) await main()

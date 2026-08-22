@@ -63,12 +63,29 @@ describe("release SBOM", () => {
       "root@0.1.0",
       [],
       [],
-      [{ digest: "a".repeat(64), name: "plugin.tgz" }],
+      [{ digest: "a".repeat(64), name: "plugin.tgz", size: 1 }],
     )
 
     const artifact = bom.components.find((component) => component.type === "file")
     expect(artifact?.name).toBe("plugin.tgz")
     expect(artifact?.hashes).toEqual([{ alg: "SHA-256", content: "a".repeat(64) }])
+  })
+
+  test("rejects an artifact inventory that differs from the release manifest allowlist", () => {
+    const cargo = {
+      packages: [packageRecord("root", "0.1.0", "MIT")],
+      resolve: { nodes: [], root: null },
+    }
+    expect(() =>
+      buildCycloneDxBom(
+        cargo,
+        "root@0.1.0",
+        [],
+        [],
+        [{ digest: "a".repeat(64), name: "plugin.tgz", size: 1 }],
+        [{ name: "plugin.tgz", sha256: "b".repeat(64), size: 1 }],
+      ),
+    ).toThrow("manifest artifact allowlist")
   })
 })
 

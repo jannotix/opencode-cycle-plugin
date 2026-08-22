@@ -3,6 +3,7 @@ use std::{
     fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -39,6 +40,7 @@ struct Results {
     hardware: HardwareResults,
     incremental: IncrementalResults,
     passed: bool,
+    revision: String,
     resources: ResourceResults,
     schema_version: u32,
     timings_ms: TimingResults,
@@ -111,6 +113,7 @@ struct TimingResults {
 
 fn main() {
     let options = options();
+    let revision = source_revision();
     let total_started = Instant::now();
     let output = options.output.clone();
     let temporary = tempfile::tempdir().expect("benchmark temporary directory must be available");
@@ -285,6 +288,7 @@ fn main() {
             renamed_found,
         },
         passed,
+        revision,
         resources,
         schema_version: 1,
         timings_ms: TimingResults {
@@ -316,6 +320,41 @@ fn main() {
         );
         std::process::exit(1);
     }
+}
+
+fn source_revision() -> String {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .expect("release revision must be resolved with git");
+    assert!(
+        output.status.success(),
+        "release revision must be resolved with git"
+    );
+    let revision = String::from_utf8(output.stdout)
+        .expect("release revision must be UTF-8")
+        .trim()
+        .to_owned();
+    assert!(
+        valid_revision(&revision),
+        "release revision must be a full Git object ID"
+    );
+    if let Ok(expected) = std::env::var("CYCLE_RELEASE_REVISION") {
+        assert_eq!(
+            revision, expected,
+            "release revision does not match CYCLE_RELEASE_REVISION"
+        );
+    }
+    revision
+}
+
+fn valid_revision(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 struct Options {
@@ -534,6 +573,14 @@ impl ResourceSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_revision_requires_a_full_lowercase_git_object_id() {
+        assert!(valid_revision(&"a".repeat(40)));
+        assert!(valid_revision(&"f".repeat(64)));
+        assert!(!valid_revision(&"A".repeat(40)));
+        assert!(!valid_revision("not-a-revision"));
+    }
 
     #[test]
     fn generation_parallelism_is_bounded_by_partitions_and_available_workers() {

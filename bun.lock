@@ -5,8 +5,8 @@
     "": {
       "name": "opencode-cycle-workspace",
       "dependencies": {
-        "@opencode-ai/plugin": "1.18.16",
-        "@opencode-ai/sdk": "1.18.16",
+        "@opencode-ai/plugin": "1.18.21",
+        "@opencode-ai/sdk": "1.18.21",
         "ajv": "8.20.0",
         "ajv-formats": "3.0.1",
         "puppeteer-core": "25.6.0",
@@ -17,14 +17,6 @@
         "json-schema-to-typescript": "15.0.4",
         "typescript": "7.0.2",
       },
-    },
-    "packages/native-darwin-arm64": {
-      "name": "@opencode-cycle/native-darwin-arm64",
-      "version": "1.0.0",
-    },
-    "packages/native-darwin-x64": {
-      "name": "@opencode-cycle/native-darwin-x64",
-      "version": "1.0.0",
     },
     "packages/native-linux-x64": {
       "name": "@opencode-cycle/native-linux-x64",
@@ -38,13 +30,11 @@
       "name": "opencode-cycle",
       "version": "1.0.0",
       "dependencies": {
-        "@opencode-ai/plugin": "1.18.16",
-        "@opencode-ai/sdk": "1.18.16",
+        "@opencode-ai/plugin": "1.18.21",
+        "@opencode-ai/sdk": "1.18.21",
         "puppeteer-core": "25.6.0",
       },
       "optionalDependencies": {
-        "@opencode-cycle/native-darwin-arm64": "1.0.0",
-        "@opencode-cycle/native-darwin-x64": "1.0.0",
         "@opencode-cycle/native-linux-x64": "1.0.0",
         "@opencode-cycle/native-win32-x64": "1.0.0",
       },
@@ -77,13 +67,9 @@
 
     "@msgpackr-extract/msgpackr-extract-win32-x64": ["@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4", "", { "os": "win32", "cpu": "x64" }, "sha512-CmCXPQrkbwExx3j946/PtHWHbYJiCRBRDl4BlkRQcJB/YOwQxJRTpoo7aTsortjgoJ1x7opzTSxn7C+ASSLVjQ=="],
 
-    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.18.16", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.18.16", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-XvlZ9CFAXqrNrmpTe+EhhRYnDhca6db1ebcB10v5JO8kSm1iFbVbPP982Qzc4MRSrfpPjD8W1fg13Ubnff377g=="],
+    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.18.21", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.18.21", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-wQXMbSvg3pG75F8fYAiJxYuyr6Cl9Hd74lSCY2yznZnejpwa+ksd2kMphmgSo+/UgLhb2AId9KAI6dsRhprzTg=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.16", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-UvaHyL93spLm7MttoprWTOBSYQN3aYWd7/3Ie5WNnG2pRAPq/U/d51qt0smYBTrkjxqlQmg+AJoGw8MEH6lGUg=="],
-
-    "@opencode-cycle/native-darwin-arm64": ["@opencode-cycle/native-darwin-arm64@workspace:packages/native-darwin-arm64"],
-
-    "@opencode-cycle/native-darwin-x64": ["@opencode-cycle/native-darwin-x64@workspace:packages/native-darwin-x64"],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.21", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-k6iHQ5C8wOPglk+LgFyYnst168cGMQYumgpbVoeXJ+iC1AtvwD5zmjuF8CxMze/y9G1K2bOeO6p9yRvA7eHZLA=="],
 
     "@opencode-cycle/native-linux-x64": ["@opencode-cycle/native-linux-x64@workspace:packages/native-linux-x64"],
 

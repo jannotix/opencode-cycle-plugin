@@ -38,8 +38,14 @@ test("workspace pins the certified toolchain and production allowlist", async ()
     '"": {\n      "name": "opencode-cycle-workspace",',
   )
   expect(plugin.version).toBe("1.0.0")
-  expect(root.workspaces).toEqual(["packages/*"])
-  expect(plugin.dependencies?.["@opencode-ai/plugin"]).toBe("1.18.16")
+  expect(root.workspaces).toEqual([
+    "packages/native-linux-x64",
+    "packages/native-win32-x64",
+    "packages/opencode-cycle",
+    "packages/protocol-contracts",
+  ])
+  expect(plugin.dependencies?.["@opencode-ai/plugin"]).toBe("1.18.21")
+  expect(plugin.dependencies?.["@opencode-ai/sdk"]).toBe("1.18.21")
   expect(plugin.dependencies?.["puppeteer-core"]).toBe("25.6.0")
   expect(plugin.files).toEqual(["dist/**/*.js", "LICENSE", "NOTICE"])
   expect(plugin.optionalDependencies).toEqual({

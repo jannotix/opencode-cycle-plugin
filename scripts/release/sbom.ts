@@ -1,9 +1,14 @@
-import { createHash } from "node:crypto"
 import { access, readFile, readdir, writeFile } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { NATIVE_PACKAGE_NAMES, PRODUCT_IDENTITY } from "../product-identity.js"
+import {
+  assertArtifactInventoryMatchesManifest,
+  readReleaseManifest,
+  type ReleaseArtifact,
+  verifyArtifactDirectory,
+} from "./release-manifest.js"
 
 export interface CargoMetadata {
   readonly packages: readonly {
@@ -35,6 +40,7 @@ export interface JavaScriptPackage {
 export interface ArtifactComponent {
   readonly digest: string
   readonly name: string
+  readonly size: number
 }
 
 interface BomComponent {
@@ -70,7 +76,20 @@ export function buildCycloneDxBom(
   javascript: readonly JavaScriptPackage[],
   javascriptRoots: readonly string[],
   artifacts: readonly ArtifactComponent[],
+  manifestArtifacts: readonly ReleaseArtifact[] = artifacts.map((artifact) => ({
+    name: artifact.name,
+    sha256: artifact.digest,
+    size: artifact.size,
+  })),
 ): CycloneDxBom {
+  assertArtifactInventoryMatchesManifest(
+    artifacts.map((artifact) => ({
+      name: artifact.name,
+      sha256: artifact.digest,
+      size: artifact.size,
+    })),
+    manifestArtifacts,
+  )
   const cargoPackages = new Map(cargo.packages.map((item) => [item.id, item]))
   const cargoNodes = new Map((cargo.resolve?.nodes ?? []).map((node) => [node.id, node]))
   const cargoReachable = traverse([cargoRoot], (id) =>
@@ -238,13 +257,17 @@ async function main(): Promise<void> {
       return `${manifest.name}@${manifest.version}`
     }),
   )
-  const artifacts = await Promise.all(
-    argumentsMap.artifacts.map(async (path) => ({
-      digest: await digest(resolve(path)),
-      name: basename(path),
-    })),
+  const manifest = await readReleaseManifest(argumentsMap.manifest)
+  const verifiedArtifacts = await verifyArtifactDirectory(
+    argumentsMap.artifactsDirectory,
+    manifest.artifacts,
   )
-  const bom = buildCycloneDxBom(cargo, cargoRoot, javascript, roots, artifacts)
+  const artifacts = verifiedArtifacts.map((artifact) => ({
+    digest: artifact.sha256,
+    name: artifact.name,
+    size: artifact.size,
+  }))
+  const bom = buildCycloneDxBom(cargo, cargoRoot, javascript, roots, artifacts, manifest.artifacts)
   await writeFile(resolve(argumentsMap.output), `${JSON.stringify(bom, null, 2)}\n`, "utf8")
 }
 
@@ -310,32 +333,35 @@ async function exists(path: string): Promise<boolean> {
   )
 }
 
-async function digest(path: string): Promise<string> {
-  return createHash("sha256").update(await readFile(path)).digest("hex")
-}
-
 function validateDigest(value: string): void {
   if (!/^[0-9a-f]{64}$/u.test(value)) throw new Error(`Invalid SHA-256 digest: ${value}`)
 }
 
-function parseArguments(argumentsList: readonly string[]): { artifacts: string[]; output: string } {
-  const artifacts: string[] = []
-  let output: string | undefined
-  for (let index = 0; index < argumentsList.length; index += 1) {
+function parseArguments(argumentsList: readonly string[]): {
+  artifactsDirectory: string
+  manifest: string
+  output: string
+} {
+  const values = new Map<string, string>()
+  const allowed = new Set(["artifacts-directory", "manifest", "output"])
+  for (let index = 0; index < argumentsList.length; index += 2) {
     const argument = argumentsList[index]
     const value = argumentsList[index + 1]
-    if (argument === "--artifact" && value !== undefined) {
-      artifacts.push(value)
-      index += 1
-    } else if (argument === "--output" && value !== undefined) {
-      output = value
-      index += 1
-    } else {
-      throw new Error(`Unknown or incomplete argument: ${argument}`)
+    if (argument === undefined || value === undefined || !argument.startsWith("--")) {
+      throw new Error("SBOM arguments must be --key value pairs")
     }
+    const name = argument.slice(2)
+    if (!allowed.has(name) || values.has(name)) {
+      throw new Error(`Unknown or duplicate argument: ${argument}`)
+    }
+    values.set(name, value)
   }
-  if (output === undefined) throw new Error("Expected --output <path>")
-  return { artifacts, output }
+  for (const name of allowed) if (!values.has(name)) throw new Error(`Missing --${name}`)
+  return {
+    artifactsDirectory: values.get("artifacts-directory") as string,
+    manifest: values.get("manifest") as string,
+    output: values.get("output") as string,
+  }
 }
 
 if (import.meta.main) await main()
