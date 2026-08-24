@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { open, lstat, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 
-import type { ControlPlaneHealth } from "./client.js"
+import type { ControlPlaneHealth, OwnedProcessIdentity } from "./client.js"
 
 const FULL_REVISION = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 const SHA256 = /^[0-9a-f]{64}$/u
@@ -17,6 +17,7 @@ export interface DesktopCertificationBinding {
 }
 
 export interface DesktopActivationMarker {
+  readonly daemon: DesktopDaemonIdentity
   readonly createdAtUnixMillis: number
   readonly health: {
     readonly productVersion: "1.0.0"
@@ -28,8 +29,45 @@ export interface DesktopActivationMarker {
   readonly nonce: string
   readonly pluginPackageSha256: string
   readonly revision: string
-  readonly schemaVersion: 1
+  readonly runDigest: string
+  readonly schemaVersion: 2
   readonly type: "opencode-cycle-desktop-activation"
+}
+
+export interface DesktopDaemonIdentity {
+  readonly binaryPath: string
+  readonly pid: number
+  readonly startToken: string
+  readonly startedAtUnixMillis: number
+}
+
+export interface DesktopDaemonMarker {
+  readonly daemon: DesktopDaemonIdentity
+  readonly nativePackageSha256: string
+  readonly nonce: string
+  readonly pluginPackageSha256: string
+  readonly revision: string
+  readonly runDigest: string
+  readonly schemaVersion: 1
+  readonly type: "opencode-cycle-desktop-daemon"
+}
+
+export function desktopCertificationBindingDigest(binding: DesktopCertificationBinding): string {
+  return createHash("sha256").update(JSON.stringify({
+    nativePackageSha256: binding.nativePackageSha256,
+    nonce: binding.nonce,
+    pluginPackageSha256: binding.pluginPackageSha256,
+    revision: binding.revision,
+    root: binding.root,
+    startedAtUnixMillis: binding.startedAtUnixMillis,
+  })).digest("hex")
+}
+
+export function desktopCertificationProcessToken(binding: DesktopCertificationBinding): string {
+  return createHash("sha256")
+    .update("opencode-cycle-desktop-daemon-v1\0")
+    .update(desktopCertificationBindingDigest(binding))
+    .digest("hex")
 }
 
 export function certificationBindingFromOptions(
@@ -82,6 +120,7 @@ export function certificationBindingFromOptions(
 export function buildDesktopActivationMarker(
   binding: DesktopCertificationBinding,
   health: ControlPlaneHealth,
+  daemon: DesktopDaemonIdentity,
   createdAtUnixMillis: number,
 ): DesktopActivationMarker {
   if (
@@ -98,8 +137,13 @@ export function buildDesktopActivationMarker(
   ) {
     throw new Error("Desktop certification activation time predates the isolated run")
   }
+  const validatedDaemon = validateDesktopDaemonIdentity(daemon, binding)
+  if (validatedDaemon.startedAtUnixMillis > createdAtUnixMillis) {
+    throw new Error("Desktop daemon identity postdates plugin activation")
+  }
   return {
     createdAtUnixMillis,
+    daemon: validatedDaemon,
     health: {
       productVersion: "1.0.0",
       protocolVersion: 1,
@@ -110,7 +154,8 @@ export function buildDesktopActivationMarker(
     nonce: binding.nonce,
     pluginPackageSha256: binding.pluginPackageSha256,
     revision: binding.revision,
-    schemaVersion: 1,
+    runDigest: desktopCertificationBindingDigest(binding),
+    schemaVersion: 2,
     type: "opencode-cycle-desktop-activation",
   }
 }
@@ -120,11 +165,13 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
     value,
     [
       "createdAtUnixMillis",
+      "daemon",
       "health",
       "nativePackageSha256",
       "nonce",
       "pluginPackageSha256",
       "revision",
+      "runDigest",
       "schemaVersion",
       "type",
     ],
@@ -135,8 +182,9 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
     ["productVersion", "protocolVersion", "schemaMode", "schemaVersion"],
     "Desktop activation health",
   )
+  const daemon = parseDesktopDaemonIdentity(marker.daemon)
   if (
-    marker.schemaVersion !== 1 ||
+    marker.schemaVersion !== 2 ||
     marker.type !== "opencode-cycle-desktop-activation" ||
     typeof marker.createdAtUnixMillis !== "number" ||
     !Number.isSafeInteger(marker.createdAtUnixMillis) ||
@@ -148,6 +196,8 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
     !SHA256.test(marker.pluginPackageSha256) ||
     typeof marker.nativePackageSha256 !== "string" ||
     !SHA256.test(marker.nativePackageSha256) ||
+    typeof marker.runDigest !== "string" ||
+    !SHA256.test(marker.runDigest) ||
     health.productVersion !== "1.0.0" ||
     health.protocolVersion !== 1 ||
     health.schemaMode !== "read_write" ||
@@ -155,7 +205,81 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
   ) {
     throw new Error("Desktop activation marker is invalid")
   }
-  return marker as unknown as DesktopActivationMarker
+  return { ...marker, daemon } as unknown as DesktopActivationMarker
+}
+
+export function parseDesktopDaemonMarker(value: unknown): DesktopDaemonMarker {
+  const marker = requireExactRecord(
+    value,
+    [
+      "daemon",
+      "nativePackageSha256",
+      "nonce",
+      "pluginPackageSha256",
+      "revision",
+      "runDigest",
+      "schemaVersion",
+      "type",
+    ],
+    "Desktop daemon marker",
+  )
+  const daemon = parseDesktopDaemonIdentity(marker.daemon)
+  if (
+    marker.schemaVersion !== 1 ||
+    marker.type !== "opencode-cycle-desktop-daemon" ||
+    typeof marker.nonce !== "string" ||
+    !SHA256.test(marker.nonce) ||
+    typeof marker.revision !== "string" ||
+    !FULL_REVISION.test(marker.revision) ||
+    typeof marker.pluginPackageSha256 !== "string" ||
+    !SHA256.test(marker.pluginPackageSha256) ||
+    typeof marker.nativePackageSha256 !== "string" ||
+    !SHA256.test(marker.nativePackageSha256) ||
+    typeof marker.runDigest !== "string" ||
+    !SHA256.test(marker.runDigest)
+  ) {
+    throw new Error("Desktop daemon marker is invalid")
+  }
+  return { ...marker, daemon } as unknown as DesktopDaemonMarker
+}
+
+function parseDesktopDaemonIdentity(value: unknown): DesktopDaemonIdentity {
+  const daemon = requireExactRecord(
+    value,
+    ["binaryPath", "pid", "startToken", "startedAtUnixMillis"],
+    "Desktop daemon identity",
+  )
+  if (
+    typeof daemon.binaryPath !== "string" ||
+    !isAbsolute(daemon.binaryPath) ||
+    resolve(daemon.binaryPath) !== daemon.binaryPath ||
+    daemon.binaryPath.includes("\0") ||
+    typeof daemon.pid !== "number" ||
+    !Number.isSafeInteger(daemon.pid) ||
+    daemon.pid < 1 ||
+    typeof daemon.startToken !== "string" ||
+    !SHA256.test(daemon.startToken) ||
+    typeof daemon.startedAtUnixMillis !== "number" ||
+    !Number.isSafeInteger(daemon.startedAtUnixMillis) ||
+    daemon.startedAtUnixMillis < 1
+  ) {
+    throw new Error("Desktop daemon identity is invalid")
+  }
+  return daemon as unknown as DesktopDaemonIdentity
+}
+
+function validateDesktopDaemonIdentity(
+  value: DesktopDaemonIdentity | OwnedProcessIdentity,
+  binding: DesktopCertificationBinding,
+): DesktopDaemonIdentity {
+  const daemon = parseDesktopDaemonIdentity(value)
+  if (
+    daemon.startToken !== desktopCertificationProcessToken(binding) ||
+    daemon.startedAtUnixMillis < binding.startedAtUnixMillis
+  ) {
+    throw new Error("Desktop daemon identity does not match the certification run")
+  }
+  return daemon
 }
 
 interface ActivationWriterHooks {
@@ -165,12 +289,66 @@ interface ActivationWriterHooks {
 
 const productionWriter = createDesktopActivationWriter({})
 
+export async function writeDesktopDaemonMarker(
+  binding: DesktopCertificationBinding,
+  identity: OwnedProcessIdentity,
+): Promise<DesktopDaemonMarker> {
+  await assertCertificationRoot(binding.root)
+  const marker: DesktopDaemonMarker = {
+    daemon: validateDesktopDaemonIdentity(identity, binding),
+    nativePackageSha256: binding.nativePackageSha256,
+    nonce: binding.nonce,
+    pluginPackageSha256: binding.pluginPackageSha256,
+    revision: binding.revision,
+    runDigest: desktopCertificationBindingDigest(binding),
+    schemaVersion: 1,
+    type: "opencode-cycle-desktop-daemon",
+  }
+  const path = join(binding.root, "desktop-daemon.json")
+  const existing = await readDesktopDaemonMarker(path)
+  if (existing !== undefined) {
+    if (JSON.stringify(existing) !== JSON.stringify(marker)) {
+      throw new Error("Desktop daemon marker exists with another binding")
+    }
+    return existing
+  }
+  const temporary = join(binding.root, `.desktop-daemon.${randomUUID()}.tmp`)
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(temporary, "wx", 0o600)
+    await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8")
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(temporary, path)
+    return marker
+  } finally {
+    if (handle !== undefined) await handle.close().catch(() => undefined)
+    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
+  }
+}
+
+async function readDesktopDaemonMarker(path: string): Promise<DesktopDaemonMarker | undefined> {
+  const details = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
+  if (details === undefined) return undefined
+  if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || await realpath(path) !== path) {
+    throw new Error("Desktop daemon marker exists as an unsafe file")
+  }
+  return parseDesktopDaemonMarker(JSON.parse(await readFile(path, "utf8")) as unknown)
+}
+
 export function writeDesktopActivationMarker(
   binding: DesktopCertificationBinding,
   health: ControlPlaneHealth,
+  daemon: DesktopDaemonIdentity,
   now: () => number = Date.now,
 ): Promise<DesktopActivationMarker> {
-  return productionWriter(binding, health, now)
+  return productionWriter(binding, health, daemon, now)
 }
 
 export function createDesktopActivationWriterForTests(
@@ -180,15 +358,9 @@ export function createDesktopActivationWriterForTests(
 }
 
 function createDesktopActivationWriter(hooks: ActivationWriterHooks): typeof writeDesktopActivationMarker {
-  return async (binding, health, now = Date.now) => {
-    const rootDetails = await lstat(binding.root)
-    if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
-      throw new Error("Desktop certification root must be a real directory")
-    }
-    if (await realpath(binding.root) !== binding.root) {
-      throw new Error("Desktop certification root must not be a link or alias")
-    }
-    const marker = buildDesktopActivationMarker(binding, health, now())
+  return async (binding, health, daemon, now = Date.now) => {
+    await assertCertificationRoot(binding.root)
+    const marker = buildDesktopActivationMarker(binding, health, daemon, now())
     const path = join(binding.root, "desktop-activation.json")
     const lockPath = join(binding.root, "desktop-activation.lock")
     const existing = await existingMarker(path, binding, marker)
@@ -283,11 +455,23 @@ async function existingMarker(
     existing.revision !== marker.revision ||
     existing.pluginPackageSha256 !== marker.pluginPackageSha256 ||
     existing.nativePackageSha256 !== marker.nativePackageSha256 ||
+    existing.runDigest !== marker.runDigest ||
+    JSON.stringify(existing.daemon) !== JSON.stringify(marker.daemon) ||
     JSON.stringify(existing.health) !== JSON.stringify(marker.health)
   ) {
     throw new Error("Desktop certification activation marker exists with another binding")
   }
   return existing
+}
+
+async function assertCertificationRoot(root: string): Promise<void> {
+  const rootDetails = await lstat(root)
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw new Error("Desktop certification root must be a real directory")
+  }
+  if (await realpath(root) !== root) {
+    throw new Error("Desktop certification root must not be a link or alias")
+  }
 }
 
 function requireExactRecord(

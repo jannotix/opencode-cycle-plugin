@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID } from "node:crypto"
 import { constants } from "node:fs"
-import { access, readFile } from "node:fs/promises"
+import { access, readFile, realpath } from "node:fs/promises"
 import type { Socket } from "node:net"
 import { join, posix, win32 } from "node:path"
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
@@ -30,8 +30,17 @@ export interface ControlPlaneOptions {
   readonly dataDirectory?: string
   readonly environment?: NodeJS.ProcessEnv
   readonly expectedProtocolVersion?: number
+  readonly onProcessSpawn?: (identity: OwnedProcessIdentity) => Promise<void>
   readonly platform?: NodeJS.Platform
+  readonly processOwnerToken?: string
   readonly stopOwnedProcessOnDispose?: boolean
+}
+
+export interface OwnedProcessIdentity {
+  readonly binaryPath: string
+  readonly pid: number
+  readonly startToken: string
+  readonly startedAtUnixMillis: number
 }
 
 export interface AuditObservation {
@@ -333,10 +342,13 @@ export class LocalControlPlane {
   readonly #dataDirectory: string
   readonly #endpoint: string
   readonly #expectedProtocolVersion: number
+  readonly #onProcessSpawn: ((identity: OwnedProcessIdentity) => Promise<void>) | undefined
   readonly #platform: NodeJS.Platform
+  readonly #processOwnerToken: string | undefined
   readonly #secretPath: string
   readonly #stopOwnedProcessOnDispose: boolean
   #ownedProcess: ChildProcess | undefined
+  #ownedProcessIdentity: OwnedProcessIdentity | undefined
 
   constructor(options: ControlPlaneOptions = {}) {
     const platform = options.platform ?? process.platform
@@ -349,7 +361,16 @@ export class LocalControlPlane {
     this.#endpoint =
       platform === "win32" ? "" : join(this.#dataDirectory, "runtime", "workflow.sock")
     this.#expectedProtocolVersion = options.expectedProtocolVersion ?? 1
+    this.#onProcessSpawn = options.onProcessSpawn
+    this.#processOwnerToken = options.processOwnerToken
     this.#stopOwnedProcessOnDispose = options.stopOwnedProcessOnDispose ?? false
+    if (
+      (this.#processOwnerToken !== undefined && !SHA256.test(this.#processOwnerToken)) ||
+      (this.#onProcessSpawn !== undefined && this.#processOwnerToken === undefined) ||
+      (this.#processOwnerToken !== undefined && !this.#stopOwnedProcessOnDispose)
+    ) {
+      throw new ControlPlaneError("workflowd process ownership binding is invalid")
+    }
   }
 
   async health(): Promise<ControlPlaneHealth> {
@@ -375,18 +396,44 @@ export class LocalControlPlane {
       this.#ownedProcess.exitCode !== null ||
       this.#ownedProcess.signalCode !== null
     ) {
-      const binaryPath =
+      const configuredBinaryPath =
         this.#binaryPath ?? packagedBinaryPath(this.#platform, this.#architecture)
-      await access(binaryPath, constants.X_OK).catch((cause: unknown) => {
-        throw new ControlPlaneError(`workflowd binary is unavailable: ${binaryPath}`, { cause })
+      await access(configuredBinaryPath, constants.X_OK).catch((cause: unknown) => {
+        throw new ControlPlaneError(`workflowd binary is unavailable: ${configuredBinaryPath}`, { cause })
       })
-      this.#ownedProcess = spawn(binaryPath, ["--data-dir", this.#dataDirectory], {
+      const binaryPath = await realpath(configuredBinaryPath)
+      const startedAtUnixMillis = Date.now()
+      const argumentsList = ["--data-dir", this.#dataDirectory]
+      if (this.#processOwnerToken !== undefined) {
+        argumentsList.push("--certification-owner-token", this.#processOwnerToken)
+      }
+      this.#ownedProcess = spawn(binaryPath, argumentsList, {
         detached: !this.#stopOwnedProcessOnDispose,
         shell: false,
         stdio: "ignore",
         windowsHide: true,
       })
-      this.#ownedProcess.unref()
+      const pid = this.#ownedProcess.pid
+      if (!Number.isSafeInteger(pid) || (pid as number) < 1) {
+        this.#ownedProcess.kill()
+        this.#ownedProcess = undefined
+        throw new ControlPlaneError("workflowd did not expose a valid process identity")
+      }
+      if (this.#processOwnerToken !== undefined) {
+        this.#ownedProcessIdentity = {
+          binaryPath,
+          pid: pid as number,
+          startToken: this.#processOwnerToken,
+          startedAtUnixMillis,
+        }
+        try {
+          await this.#onProcessSpawn?.(this.#ownedProcessIdentity)
+        } catch (cause) {
+          await this.dispose()
+          throw new ControlPlaneError("workflowd ownership publication failed", { cause })
+        }
+      }
+      if (!this.#stopOwnedProcessOnDispose) this.#ownedProcess.unref()
     }
 
     const deadline = Date.now() + HEALTH_WAIT_MS
@@ -409,6 +456,7 @@ export class LocalControlPlane {
   async #reclaimStaleDaemon(): Promise<void> {
     const child = this.#ownedProcess
     this.#ownedProcess = undefined
+    this.#ownedProcessIdentity = undefined
     if (child !== undefined && child.exitCode === null && child.signalCode === null) {
       child.kill()
     }
@@ -416,6 +464,7 @@ export class LocalControlPlane {
     const raw = await readFile(pidPath, "utf8").catch(() => "")
     const pid = Number.parseInt(raw.trim(), 10)
     if (
+      this.#processOwnerToken === undefined &&
       Number.isInteger(pid) &&
       pid > 0 &&
       pid !== process.pid &&
@@ -438,14 +487,34 @@ export class LocalControlPlane {
 
   async dispose(): Promise<void> {
     if (this.#stopOwnedProcessOnDispose && this.#ownedProcess !== undefined) {
-      const process = this.#ownedProcess
-      if (process.exitCode === null && process.signalCode === null) {
-        const exited = once(process, "exit")
-        process.kill()
-        await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))])
+      const child = this.#ownedProcess
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill()
+        if (!await waitForChildExit(child, 2_000)) {
+          child.kill("SIGKILL")
+          if (!await waitForChildExit(child, 3_000)) {
+            throw new ControlPlaneError("workflowd owned process did not exit during disposal")
+          }
+        }
       }
     }
     this.#ownedProcess = undefined
+    this.#ownedProcessIdentity = undefined
+  }
+
+  ownedProcessIdentity(): OwnedProcessIdentity {
+    const identity = this.#ownedProcessIdentity
+    const process = this.#ownedProcess
+    if (
+      identity === undefined ||
+      process === undefined ||
+      process.pid !== identity.pid ||
+      process.exitCode !== null ||
+      process.signalCode !== null
+    ) {
+      throw new ControlPlaneError("workflowd owned process identity is unavailable")
+    }
+    return identity
   }
 
   async audit(observation: AuditObservation): Promise<AuditReceipt> {
@@ -1291,6 +1360,17 @@ export class LocalControlPlane {
       throw error
     }
   }
+}
+
+async function waitForChildExit(child: ChildProcess, timeout: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeout)
+    void once(child, "exit").then(() => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
 }
 
 export function resolveDataDirectory(

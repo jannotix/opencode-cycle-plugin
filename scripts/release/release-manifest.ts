@@ -194,7 +194,9 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "activationPluginPackageSha256",
         "activationRevision",
         "controlPlane",
+        "daemon",
         "desktop",
+        "loadDiagnostics",
         "nativePackageSha256",
         "platform",
         "pluginPackageSha256",
@@ -212,6 +214,24 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       evidence.desktop,
       ["asset", "authenticity", "profileIsolation", "sha256", "size", "version"],
       "Desktop asset evidence",
+    )
+    const daemon = requireExactRecord(
+      evidence.daemon,
+      [
+        "binaryPathSha256",
+        "markerPublished",
+        "pid",
+        "processAbsent",
+        "startedAtUnixMillis",
+        "startTokenSha256",
+        "terminated",
+      ],
+      "Desktop daemon evidence",
+    )
+    const loadDiagnostics = requireExactRecord(
+      evidence.loadDiagnostics,
+      ["bytes", "sha256"],
+      "Desktop load diagnostics evidence",
     )
     const asset = DESKTOP_ASSET_METADATA[platform]
     if (
@@ -233,6 +253,23 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       desktop.sha256 !== asset.sha256 ||
       desktop.size !== asset.size ||
       desktop.profileIsolation !== "fresh-isolated-certification-root" ||
+      daemon.markerPublished !== true ||
+      daemon.processAbsent !== true ||
+      typeof daemon.terminated !== "boolean" ||
+      typeof daemon.pid !== "number" ||
+      !Number.isSafeInteger(daemon.pid) ||
+      daemon.pid < 1 ||
+      typeof daemon.startedAtUnixMillis !== "number" ||
+      !Number.isSafeInteger(daemon.startedAtUnixMillis) ||
+      daemon.startedAtUnixMillis < 1 ||
+      daemon.startedAtUnixMillis > evidence.activationCreatedAtUnixMillis ||
+      typeof daemon.binaryPathSha256 !== "string" ||
+      typeof daemon.startTokenSha256 !== "string" ||
+      typeof loadDiagnostics.bytes !== "number" ||
+      !Number.isSafeInteger(loadDiagnostics.bytes) ||
+      loadDiagnostics.bytes < 1 ||
+      loadDiagnostics.bytes > 64 * 1024 ||
+      typeof loadDiagnostics.sha256 !== "string" ||
       typeof evidence.nativePackageSha256 !== "string" ||
       typeof evidence.pluginPackageSha256 !== "string"
     ) {
@@ -245,6 +282,9 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(evidence.activationNativePackageSha256)
     validateDigest(evidence.nativePackageSha256)
     validateDigest(evidence.pluginPackageSha256)
+    validateDigest(daemon.binaryPathSha256)
+    validateDigest(daemon.startTokenSha256)
+    validateDigest(loadDiagnostics.sha256)
     if (
       evidence.activationRevision !== evidence.revision ||
       evidence.activationPluginPackageSha256 !== evidence.pluginPackageSha256 ||

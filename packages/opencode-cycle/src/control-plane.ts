@@ -13,6 +13,7 @@ export {
   type GoalOperation,
   type HistoryOperation,
   type MemoryOperation,
+  type OwnedProcessIdentity,
   type PromotionReceipt,
   type TaskClosureReceipt,
   type TaskClosureReportInput,

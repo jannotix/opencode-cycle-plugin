@@ -575,6 +575,30 @@ test("plugin starts, authenticates, and validates the real control plane", async
   }
 }, 60_000)
 
+test("certification ownership publication failure terminates the spawned workflowd", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-cert-owner-failure-"))
+  let spawnedPid = 0
+  const controlPlane = new LocalControlPlane({
+    binaryPath: binary,
+    dataDirectory,
+    async onProcessSpawn(identity) {
+      spawnedPid = identity.pid
+      throw new Error("injected ownership publication failure")
+    },
+    processOwnerToken: "f".repeat(64),
+    stopOwnedProcessOnDispose: true,
+  })
+  try {
+    await expect(controlPlane.health()).rejects.toThrow("ownership publication failed")
+    expect(spawnedPid).toBeGreaterThan(0)
+    await waitUntilProcessExits(spawnedPid)
+    expect(() => process.kill(spawnedPid, 0)).toThrow()
+  } finally {
+    await controlPlane.dispose()
+    await rm(dataDirectory, { force: true, recursive: true })
+  }
+}, 60_000)
+
 test("verified task closure is authoritative, idempotent, dependency-aware, and durable", async () => {
   const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-task-closure-"))
   let controlPlane = new LocalControlPlane({

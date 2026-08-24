@@ -7,7 +7,10 @@ import {
   buildDesktopActivationMarker,
   certificationBindingFromOptions,
   createDesktopActivationWriterForTests,
+  desktopCertificationBindingDigest,
+  desktopCertificationProcessToken,
   parseDesktopActivationMarker,
+  type DesktopCertificationBinding,
   writeDesktopActivationMarker,
 } from "../src/certification.js"
 
@@ -21,6 +24,15 @@ const health = {
   protocol_version: 1,
   schema_mode: "read_write" as const,
   schema_version: 17,
+}
+
+function daemon(binding: DesktopCertificationBinding) {
+  return {
+    binaryPath: join(binding.root, process.platform === "win32" ? "workflowd.exe" : "workflowd"),
+    pid: 4242,
+    startToken: desktopCertificationProcessToken(binding),
+    startedAtUnixMillis: binding.startedAtUnixMillis,
+  }
 }
 
 test("certification binding requires matching isolated environment authority", async () => {
@@ -68,21 +80,26 @@ test("Desktop-loaded health produces one strict nonce and package-bound activati
     startedAtUnixMillis: 1_700_000_000_000,
   }
   try {
-    const marker = buildDesktopActivationMarker(binding, health, 1_700_000_000_100)
+    const processIdentity = daemon(binding)
+    const marker = buildDesktopActivationMarker(binding, health, processIdentity, 1_700_000_000_100)
+    expect(marker.daemon).toEqual(processIdentity)
+    expect(marker.runDigest).toBe(desktopCertificationBindingDigest(binding))
+    expect(marker.schemaVersion).toBe(2)
     expect(parseDesktopActivationMarker(marker)).toEqual(marker)
-    await writeDesktopActivationMarker(binding, health, () => 1_700_000_000_100)
+    await writeDesktopActivationMarker(binding, health, daemon(binding), () => 1_700_000_000_100)
     expect(
       parseDesktopActivationMarker(
         JSON.parse(await readFile(join(root, "desktop-activation.json"), "utf8")) as unknown,
       ),
     ).toEqual(marker)
     await expect(
-      writeDesktopActivationMarker(binding, health, () => 1_700_000_000_101),
+      writeDesktopActivationMarker(binding, health, daemon(binding), () => 1_700_000_000_101),
     ).resolves.toEqual(marker)
     await expect(
       writeDesktopActivationMarker(
         { ...binding, nonce: "e".repeat(64) },
         health,
+        daemon({ ...binding, nonce: "e".repeat(64) }),
         () => 1_700_000_000_101,
       ),
     ).rejects.toThrow("another binding")
@@ -106,10 +123,22 @@ test("activation marker rejects missing or non-candidate Desktop health", () => 
     { ...health, schema_mode: "safe_read_only" },
     { ...health, schema_version: 18 },
   ]) {
-    expect(() => buildDesktopActivationMarker(binding, invalid as never, 1_700_000_000_100)).toThrow(
+    expect(() => buildDesktopActivationMarker(binding, invalid as never, daemon(binding), 1_700_000_000_100)).toThrow(
       "health",
     )
   }
+  expect(() => buildDesktopActivationMarker(
+    binding,
+    health,
+    { ...daemon(binding), startToken: "e".repeat(64) },
+    1_700_000_000_100,
+  )).toThrow("daemon")
+  expect(() => buildDesktopActivationMarker(
+    binding,
+    health,
+    { ...daemon(binding), binaryPath: "relative" },
+    1_700_000_000_100,
+  )).toThrow("daemon")
 })
 
 test("activation final is absent while the private temp is paused and publishes atomically", async () => {
@@ -134,9 +163,9 @@ test("activation final is absent while the private temp is paused and publishes 
     },
   })
   try {
-    const first = writer(binding, health, Date.now)
+    const first = writer(binding, health, daemon(binding), Date.now)
     while (!reached) await Bun.sleep(1)
-    const second = writer(binding, health, Date.now)
+    const second = writer(binding, health, daemon(binding), Date.now)
     await Bun.sleep(20)
     expect(await access(join(root, "desktop-activation.json")).then(() => true, () => false)).toBeFalse()
     release?.()
@@ -163,11 +192,11 @@ test("activation temp and lock are cleaned on failure and partial finals are rej
     const failing = createDesktopActivationWriterForTests({
       async afterTempSynced() { throw new Error("injected publication failure") },
     })
-    await expect(failing(binding, health, Date.now)).rejects.toThrow("injected")
+    await expect(failing(binding, health, daemon(binding), Date.now)).rejects.toThrow("injected")
     expect((await Array.fromAsync(new Bun.Glob("desktop-activation*").scan({ cwd: root })))).toEqual([])
 
     await writeFile(join(root, "desktop-activation.json"), "{\"partial\":true")
-    await expect(writeDesktopActivationMarker(binding, health)).rejects.toThrow()
+    await expect(writeDesktopActivationMarker(binding, health, daemon(binding))).rejects.toThrow()
   } finally {
     await rm(root, { force: true, recursive: true })
   }

@@ -1,11 +1,21 @@
-import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
+import { createHash, randomBytes } from "node:crypto"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 
+import type { DesktopCertificationBinding } from "../../packages/opencode-cycle/src/certification.js"
 import { packageNative, type NativeTarget } from "../packaging/native-package.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
+import { cleanupCertifiedDaemon } from "./certified-daemon.js"
+import {
+  certificationEnvironment,
+  completeDesktopDaemonCleanupDiagnostic,
+  desktopLoadDiagnosticSummary,
+  prepareDesktopCertificationLoad,
+  waitForDesktopActivation,
+} from "./desktop-certification.js"
+import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
 
 const root = fileURLToPath(new URL("../../", import.meta.url))
 const packageRoot = join(root, "packages", PRODUCT_IDENTITY.mainPackage)
@@ -61,22 +71,68 @@ try {
     ["bun", "install", "--ignore-scripts", "--production", "--no-save", native.archive],
     installedPackage,
   )
-  const module = await import(pathToFileURL(join(installedPackage, "dist", "index.js")).href)
-  if (typeof module.default !== "function" || Object.keys(module).some((key) => key !== "default")) {
-    throw new Error("Packed plugin does not export the OpenCode plugin entrypoint")
+  const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
+  const certificationRoot = join(scratch, "certification")
+  const dataDirectory = join(scratch, "runtime-data")
+  const project = join(scratch, "project")
+  await Promise.all([mkdir(certificationRoot), mkdir(project)])
+  const binding: DesktopCertificationBinding = {
+    nativePackageSha256: native.checksum,
+    nonce: randomBytes(32).toString("hex"),
+    pluginPackageSha256: await digest(archive),
+    revision: (await run(["git", "rev-parse", "HEAD"], root)).trim(),
+    root: certificationRoot,
+    startedAtUnixMillis: Date.now(),
   }
-  const client = await import(pathToFileURL(join(installedPackage, "dist", "client.js")).href)
-  const controlPlane = new client.LocalControlPlane({
-    dataDirectory: join(scratch, "runtime-data"),
-    stopOwnedProcessOnDispose: true,
+  const environment = certificationEnvironment(scratch, platform, process.env, binding)
+  const prepared = await prepareDesktopCertificationLoad({
+    certification: binding,
+    dataDirectory,
+    environment,
+    hostVersion: "1.18.21",
+    nativeExecutable: join(root, "target", "debug", executable),
+    packedPlugin: installedPackage,
+    platform,
+    scratch,
   })
-  try {
-    const health = await controlPlane.health()
-    if (health.protocol_version !== 1 || health.schema_version !== 17) {
-      throw new Error("Installed plugin and native package failed the health contract")
-    }
-  } finally {
-    await controlPlane.dispose()
+  const proofRequest = join(scratch, "host-proof-request.json")
+  const proofResult = join(scratch, "host-proof-result.json")
+  await writeFile(proofRequest, `${JSON.stringify({
+    binding,
+    candidatePackageRoot: prepared.installedPlugin,
+    configFile: prepared.configFile,
+    directory: project,
+    resultFile: proofResult,
+    worktree: project,
+  })}\n`)
+  const proof = Bun.spawn(
+    [process.execPath, join(root, "scripts", "ci", "opencode-1.18.21-host-proof.ts"), "--request", proofRequest],
+    { cwd: scratch, env: environment, stderr: "ignore", stdout: "ignore" },
+  )
+  if ((await proof.exited) !== 0) throw new Error("Packed plugin failed the OpenCode 1.18.21 host proof")
+  const hostReceipt = JSON.parse(await readFile(proofResult, "utf8")) as OpenCodeHostProofReceipt
+  if (
+    hostReceipt.provenanceCommit !== OPENCODE_11821_HOST_PROOF_PROVENANCE.commit ||
+    hostReceipt.mergedOrigins !== 3 ||
+    hostReceipt.deduplicatedOrigins !== 1 ||
+    hostReceipt.loadedPlugins !== 1 ||
+    !hostReceipt.tupleOptions
+  ) throw new Error("Packed plugin host proof receipt is invalid")
+  await waitForDesktopActivation(certificationRoot, binding, 5_000)
+  const cleanup = await cleanupCertifiedDaemon({
+    binding,
+    environment,
+    expectedBinaryPath: join(prepared.installedPlugin, "bin", executable),
+    platform,
+  })
+  if (!cleanup.markerPublished) throw new Error("Packed plugin did not publish daemon ownership")
+  await completeDesktopDaemonCleanupDiagnostic(prepared.diagnosticsFile, binding, "passed")
+  const diagnostics = await desktopLoadDiagnosticSummary(certificationRoot, binding)
+  if (
+    !diagnostics.includes("activation_marker_verified=passed") ||
+    !diagnostics.includes("daemon_cleanup_verified=passed")
+  ) {
+    throw new Error("Packed plugin host proof diagnostics are incomplete")
   }
 } finally {
   await rm(scratch, { force: true, recursive: true })

@@ -74,6 +74,15 @@ function certificationEvidence(targetRevision = revision): Record<string, unknow
       schemaMode: "read_write",
       schemaVersion: 17,
     },
+    daemon: {
+      binaryPathSha256: "5".repeat(64),
+      markerPublished: true,
+      pid: 4242,
+      processAbsent: true,
+      startedAtUnixMillis: 1_700_000_000_050,
+      startTokenSha256: "6".repeat(64),
+      terminated: true,
+    },
     desktop: {
       asset: platform === "windows-x64"
         ? "opencode-desktop-win-x64.exe"
@@ -93,6 +102,7 @@ function certificationEvidence(targetRevision = revision): Record<string, unknow
       size: platform === "windows-x64" ? 126_209_592 : 158_944_115,
       version: "1.18.21",
     },
+    loadDiagnostics: { bytes: 1024, sha256: "8".repeat(64) },
     nativePackageSha256,
     platform,
     pluginPackageSha256,
@@ -342,6 +352,8 @@ describe("release manifest", () => {
     const evidence = certificationEvidence()[0] as Record<string, unknown>
     const desktop = evidence.desktop as Record<string, unknown>
     const controlPlane = evidence.controlPlane as Record<string, unknown>
+    const daemon = evidence.daemon as Record<string, unknown>
+    const loadDiagnostics = evidence.loadDiagnostics as Record<string, unknown>
     const mutations: unknown[] = [
       { ...evidence, unexpected: true },
       { ...evidence, activationNonce: "not-a-nonce" },
@@ -350,6 +362,10 @@ describe("release manifest", () => {
       { ...evidence, activationNativePackageSha256: "e".repeat(64) },
       { ...evidence, controlPlane: { ...controlPlane, productVersion: "9.9.9" } },
       { ...evidence, controlPlane: { ...controlPlane, schemaMode: "safe_read_only" } },
+      { ...evidence, daemon: { ...daemon, processAbsent: false } },
+      { ...evidence, daemon: { ...daemon, startTokenSha256: "bad" } },
+      { ...evidence, loadDiagnostics: { ...loadDiagnostics, bytes: 0 } },
+      { ...evidence, loadDiagnostics: { ...loadDiagnostics, sha256: "bad" } },
       { ...evidence, desktop: { ...desktop, version: "1.18.20" } },
       { ...evidence, desktop: { ...desktop, sha256: "f".repeat(64) } },
       { ...evidence, desktop: { ...desktop, size: 1 } },

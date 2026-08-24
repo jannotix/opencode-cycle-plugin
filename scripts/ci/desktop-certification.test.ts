@@ -1,18 +1,33 @@
 import { expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import {
   buildDesktopActivationMarker,
+  desktopCertificationBindingDigest,
+  desktopCertificationProcessToken,
+  writeDesktopActivationMarker,
   type DesktopCertificationBinding,
 } from "../../packages/opencode-cycle/src/certification.js"
+
+function daemonIdentity(binding: DesktopCertificationBinding) {
+  return {
+    binaryPath: join(binding.root, "workflowd.exe"),
+    pid: 4242,
+    startToken: desktopCertificationProcessToken(binding),
+    startedAtUnixMillis: binding.startedAtUnixMillis,
+  }
+}
 import {
   activationScanRoots,
   certificationEnvironment,
+  completeDesktopDaemonCleanupDiagnostic,
   desktopLoadDiagnosticSummary,
+  desktopOutputSummary,
+  isCertificationOnboardingProfile,
   isDesktopHarnessPath,
   desktopTestProfiles,
   desktopTestProfileRoots,
@@ -31,6 +46,10 @@ import {
   type DesktopAsset,
   type DesktopAssetMatrix,
 } from "./desktop-certification.js"
+import {
+  OPENCODE_11821_HOST_PROOF_PROVENANCE,
+  type OpenCodeHostProofReceipt,
+} from "./opencode-1.18.21-host-proof.js"
 
 test("Desktop certification exposes only Windows x64 and Linux x64 for v1", () => {
   expect(SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS).toEqual(["linux-x64", "windows-x64"])
@@ -111,6 +130,26 @@ test("Desktop asset matrix is the exact official OpenCode 1.18.21 Windows/Linux 
   ).toThrow("platform set")
 })
 
+test("OpenCode 1.18.21 host proof adapter and upstream authorities are checksum-pinned", async () => {
+  const adapter = await readFile(resolve(import.meta.dir, "opencode-1.18.21-host-proof.ts"))
+  expect(createHash("sha256").update(adapter).digest("hex")).toBe(
+    "256001e02a63ccd0fe4c0e05bf3de2f9ec368704672370cb57b6f666dd12c1d8",
+  )
+  expect(OPENCODE_11821_HOST_PROOF_PROVENANCE).toEqual({
+    commit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
+    files: {
+      "packages/core/src/v1/config/plugin.ts": "47f1990fd214247bc9813c7e3917fd651575fc5c11d3eb0aacdea3687dfe142c",
+      "packages/opencode/src/config/config.ts": "cd94580e88849c917fc619e344bf0a6bf2b235cbc6967318d3a664ec1dd986db",
+      "packages/opencode/src/config/paths.ts": "5035696f4213749075942c09e39f635ee730ea37217f4ad4aecac64645ae2d39",
+      "packages/opencode/src/config/plugin.ts": "b5f73247aea65adeeebbf2cc60acbc96c7980c96e4d58518d733216a17fc264b",
+      "packages/opencode/src/plugin/index.ts": "e8cc96d7eb486aafa0d1dbb793e7f0e326df4981a399f958c54d496a0226956f",
+      "packages/opencode/src/plugin/loader.ts": "e62ac4ee752c4f7cbbd5525eaeafc8565ba0763c55985584393ea513a1f9678d",
+      "packages/opencode/src/plugin/shared.ts": "db714592eeeb8362e8a92899ec434e5f6521a4446980426a2d7ced724fb7cffb",
+    },
+    tag: "v1.18.21",
+  })
+})
+
 test("certification uses platform-specific isolated Desktop profiles", () => {
   const root = join(tmpdir(), "certification")
   for (const platform of ["windows-x64", "linux-x64"] as const) {
@@ -140,45 +179,86 @@ test("certification uses platform-specific isolated Desktop profiles", () => {
   }
 })
 
-test("official 1.18.21 Desktop overrides cannot displace the staged certification config", () => {
-  const root = resolve(tmpdir(), "cycle-cert-config-binding")
-  const stagedConfig = join(root, "opencode-config")
+test("Linux certification owns every shell, temp and OpenCode home override", () => {
+  const root = resolve(tmpdir(), "cycle-cert-owned-effective-env")
+  const environment = certificationEnvironment(root, "linux-x64", {
+    HOME: "/owner/home",
+    OPENCODE_TEST_HOME: "/owner/test-home",
+    PATH: "/safe/bin",
+    SHELL: "/owner/profile-shell",
+    TEMP: "/owner/temp",
+    TMP: "/owner/tmp",
+    TMPDIR: "/owner/tmpdir",
+    XDG_CONFIG_HOME: "/owner/config",
+  })
 
-  for (const platform of ["windows-x64", "linux-x64"] as const) {
-    const environment = certificationEnvironment(root, platform, { PATH: "safe-path" })
-    const desktopEnvironment: NodeJS.ProcessEnv = {
-      ...environment,
-      // Official Desktop replaces these during Windows onboarding and may import
-      // different values from the login shell on Linux before spawning its sidecar.
-      HOME: join(root, "desktop-shell-home"),
-      XDG_CONFIG_HOME: join(root, "desktop-profile", "config"),
+  for (const name of ["TEMP", "TMP", "TMPDIR", "OPENCODE_TEST_HOME", "SHELL"] as const) {
+    expect(environment[name]).toBeString()
+    expect(isDesktopHarnessPath(environment[name] as string, root)).toBe(true)
+  }
+  const roots = desktopTestProfileRoots(environment, root)
+  expect(roots.length).toBeGreaterThan(0)
+  expect(roots.every((path) => isDesktopHarnessPath(path, root))).toBe(true)
+  expect(roots.join(" ")).not.toContain("/owner")
+})
+
+test("Linux certification shell emitter is profile-free and contains only isolated bindings", async () => {
+  const fixture = await createDesktopLoadFixture(undefined, "linux-x64")
+  try {
+    expect(fixture.prepared.shellWrapper).toBeString()
+    const source = await readFile(fixture.prepared.shellWrapper as string, "utf8")
+    expect(source.startsWith("#!/bin/sh\nexec /usr/bin/env -i \\")).toBe(true)
+    expect(source).toContain(`'HOME=${fixture.environment.HOME}'`)
+    expect(source).toContain(`'OPENCODE_CONFIG_DIR=${fixture.environment.OPENCODE_CONFIG_DIR}'`)
+    expect(source).not.toContain("/owner/")
+    expect(source).not.toContain("\\owner\\")
+    expect(source).not.toContain("\n+")
+    if (process.platform === "linux") {
+      const child = Bun.spawn([fixture.prepared.shellWrapper as string, "-il", "-c", "env -0"], {
+        env: { HOME: "/owner/home", XDG_CONFIG_HOME: "/owner/config" },
+        stderr: "ignore",
+        stdout: "pipe",
+      })
+      const output = Buffer.from(await new Response(child.stdout).arrayBuffer()).toString("utf8")
+      expect(await child.exited).toBe(0)
+      const values = Object.fromEntries(
+        output.split("\0").filter(Boolean).map((entry) => {
+          const separator = entry.indexOf("=")
+          return [entry.slice(0, separator), entry.slice(separator + 1)]
+        }),
+      )
+      expect(values.HOME).toBe(fixture.environment.HOME)
+      expect(values.OPENCODE_CONFIG_DIR).toBe(fixture.environment.OPENCODE_CONFIG_DIR)
     }
-    // OpenCode 1.18.21 resolves its explicit config directory before falling
-    // back to the XDG-derived global directory.
-    const discovered = desktopEnvironment.OPENCODE_CONFIG_DIR ??
-      join(desktopEnvironment.XDG_CONFIG_HOME as string, "opencode")
-
-    expect(discovered).toBe(stagedConfig)
-    expect(desktopEnvironment.OPENCODE_CONFIG).toBe(join(stagedConfig, "opencode.json"))
+  } finally {
+    await rm(fixture.temporary, { force: true, recursive: true })
   }
 })
 
 async function createDesktopLoadFixture(candidateSource = `
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
 export default async function CandidateFixture(input, options) {
-  return {
+  await writeFile(join(options.certification.root, "desktop-daemon.json"), "{}\\n")
+  await writeFile(join(options.certification.root, "fixture-result.json"), JSON.stringify({
     binaryPath: options.binaryPath,
     certificationRoot: options.certification.root,
     dataDirectory: options.dataDirectory,
-    fixtureInput: input.fixture,
+    directory: input.directory,
     hostVersion: options.hostVersion,
     optionKeys: Object.keys(options).sort(),
+    worktree: input.worktree,
+  }))
+  return {
+    dispose: async () => {},
   }
 }
-`) {
+`, platform: "linux-x64" | "windows-x64" = "windows-x64") {
   const temporary = await mkdtemp(join(tmpdir(), "cycle-cert-desktop-load-"))
   const certificationRoot = join(temporary, "certification")
   const packedPlugin = join(temporary, "packed-plugin")
-  const nativeExecutable = join(temporary, "input", "workflowd.exe")
+  const nativeExecutable = join(temporary, "input", platform === "windows-x64" ? "workflowd.exe" : "workflowd")
   const dataDirectory = join(temporary, "workflow-data")
   await Promise.all([
     mkdir(certificationRoot),
@@ -186,7 +266,10 @@ export default async function CandidateFixture(input, options) {
     mkdir(join(temporary, "input")),
   ])
   await Promise.all([
-    writeFile(join(packedPlugin, "package.json"), `${JSON.stringify({ type: "module" })}\n`),
+    writeFile(
+      join(packedPlugin, "package.json"),
+      `${JSON.stringify({ exports: { ".": "./dist/index.js" }, type: "module" })}\n`,
+    ),
     writeFile(join(packedPlugin, "dist", "index.js"), candidateSource),
     writeFile(nativeExecutable, "native fixture"),
   ])
@@ -200,62 +283,180 @@ export default async function CandidateFixture(input, options) {
   }
   const environment = certificationEnvironment(
     temporary,
-    "windows-x64",
+    platform,
     { PATH: "safe-path" },
     binding,
   )
+  const effectiveEnvironment: NodeJS.ProcessEnv = {
+    ...environment,
+    HOME: join(temporary, "desktop-shell-home"),
+    XDG_CONFIG_HOME: join(temporary, "desktop-profile", "config"),
+  }
   const prepared = await prepareDesktopCertificationLoad({
     certification: binding,
     dataDirectory,
-    environment: {
-      ...environment,
-      HOME: join(temporary, "desktop-shell-home"),
-      XDG_CONFIG_HOME: join(temporary, "desktop-profile", "config"),
-    },
+    environment: effectiveEnvironment,
     hostVersion: "1.18.21",
     nativeExecutable,
     packedPlugin,
-    platform: "windows-x64",
+    platform,
     scratch: temporary,
   })
-  return { binding, dataDirectory, nativeExecutable, prepared, temporary }
+  return { binding, dataDirectory, environment: effectiveEnvironment, nativeExecutable, prepared, temporary }
 }
+
+async function runHostProof(
+  fixture: Awaited<ReturnType<typeof createDesktopLoadFixture>>,
+  label: string,
+  overrides: NodeJS.ProcessEnv = {},
+): Promise<OpenCodeHostProofReceipt> {
+  const project = join(fixture.temporary, "project")
+  const onboarding = join(fixture.temporary, "temp", `opencode-onboarding-${label}`)
+  await Promise.all([
+    mkdir(project, { recursive: true }),
+    mkdir(join(onboarding, "config"), { recursive: true }),
+    mkdir(join(onboarding, "cache"), { recursive: true }),
+    mkdir(join(onboarding, "data"), { recursive: true }),
+    mkdir(join(onboarding, "state"), { recursive: true }),
+  ])
+  const request = join(fixture.temporary, `${label}-host-proof-request.json`)
+  const result = join(fixture.temporary, `${label}-host-proof-result.json`)
+  await writeFile(request, `${JSON.stringify({
+    binding: fixture.binding,
+    candidatePackageRoot: fixture.prepared.installedPlugin,
+    configFile: fixture.prepared.configFile,
+    directory: project,
+    resultFile: result,
+    worktree: project,
+  })}\n`)
+  const child = Bun.spawn(
+    [process.execPath, resolve(import.meta.dir, "opencode-1.18.21-host-proof.ts"), "--request", request],
+    {
+      cwd: fixture.temporary,
+      env: {
+        ...fixture.environment,
+        XDG_CACHE_HOME: join(onboarding, "cache"),
+        XDG_CONFIG_HOME: join(onboarding, "config"),
+        XDG_DATA_HOME: join(onboarding, "data"),
+        XDG_STATE_HOME: join(onboarding, "state"),
+        ...overrides,
+      },
+      stderr: "ignore",
+      stdout: "ignore",
+    },
+  )
+  if ((await child.exited) !== 0) throw new Error("OpenCode 1.18.21 host proof failed")
+  return JSON.parse(await readFile(result, "utf8")) as OpenCodeHostProofReceipt
+}
+
+test("loaded host probe rejects post-overlay owner paths before candidate import", async () => {
+  const fixture = await createDesktopLoadFixture()
+  try {
+    const ownerPath = process.platform === "win32" ? "C:\\owner\\home" : "/owner/home"
+    await expect(runHostProof(fixture, "owner-overlay", { HOME: ownerPath })).rejects.toThrow(
+      "host proof failed",
+    )
+    const summary = await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)
+    expect(summary).toContain("plugin_specifier_resolved=passed")
+    expect(summary).toContain("effective_env_validated=failed")
+    expect(await access(join(fixture.binding.root, "fixture-result.json")).then(() => true, () => false)).toBe(false)
+    expect(await readFile(fixture.prepared.diagnosticsFile, "utf8")).not.toContain(ownerPath)
+  } finally {
+    await rm(fixture.temporary, { force: true, recursive: true })
+  }
+}, 20_000)
 
 test("bound Desktop config resolves and executes the candidate from the copied package layout", async () => {
   const fixture = await createDesktopLoadFixture()
   try {
     const config = JSON.parse(await readFile(fixture.prepared.configFile, "utf8")) as {
       $schema: string
-      plugin: string[]
+      plugin: [[string, Record<string, unknown>]]
     }
     expect(config).toEqual({
       $schema: "https://opencode.ai/config.json",
-      plugin: [
-        pathToFileURL(fixture.prepared.configProbe).href,
+      plugin: [[
         pathToFileURL(fixture.prepared.pluginLoader).href,
-      ],
+        {
+          binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
+          certification: fixture.binding,
+          dataDirectory: fixture.dataDirectory,
+          hostVersion: "1.18.21",
+        },
+      ]],
     })
 
-    const probe = await import(`${pathToFileURL(fixture.prepared.configProbe).href}?success-probe`)
-    expect(await probe.default({})).toEqual({})
-    const candidate = await import(`${pathToFileURL(fixture.prepared.pluginLoader).href}?success-candidate`)
-    const hooks = await candidate.default({ fixture: "real-entry" })
-    expect(hooks).toEqual({
+    const proof = await runHostProof(fixture, "success")
+    expect(proof).toMatchObject({
+      bindingDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      deduplicatedOrigins: 1,
+      loadedPlugins: 1,
+      mergedOrigins: 3,
+      provenanceCommit: OPENCODE_11821_HOST_PROOF_PROVENANCE.commit,
+      tupleOptions: true,
+    })
+    expect(JSON.parse(await readFile(join(fixture.binding.root, "fixture-result.json"), "utf8"))).toEqual({
       binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
       certificationRoot: fixture.binding.root,
       dataDirectory: fixture.dataDirectory,
-      fixtureInput: "real-entry",
+      directory: join(fixture.temporary, "project"),
       hostVersion: "1.18.21",
       optionKeys: ["binaryPath", "certification", "dataDirectory", "hostVersion"],
+      worktree: join(fixture.temporary, "project"),
     })
-    expect(await desktopLoadDiagnosticSummary(fixture.binding.root)).toBe(
-      "certification_env_binding=passed, config_tree_preparation=passed, " +
-      "config_path_discovery=passed, plugin_specifier_resolution=passed, " +
-      "candidate_module_resolution=passed, plugin_entry_execution=passed",
+    await writeDesktopActivationMarker(
+      fixture.binding,
+      {
+        product_version: "1.0.0",
+        protocol_version: 1,
+        schema_mode: "read_write",
+        schema_version: 17,
+      },
+      {
+        binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
+        pid: 4242,
+        startToken: desktopCertificationProcessToken(fixture.binding),
+        startedAtUnixMillis: fixture.binding.startedAtUnixMillis,
+      },
+    )
+    await waitForDesktopActivation(fixture.binding.root, fixture.binding, 10)
+    await completeDesktopDaemonCleanupDiagnostic(
+      fixture.prepared.diagnosticsFile,
+      fixture.binding,
+      "passed",
+    )
+    expect(await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)).toBe(
+      "certification_env_prepared=passed, config_tree_prepared=passed, " +
+      "config_path_discovered=passed, plugin_specifier_resolved=passed, " +
+      "effective_env_validated=passed, candidate_module_resolved=passed, " +
+      "plugin_entry_started=passed, plugin_entry_completed=passed, " +
+      "daemon_identity_published=passed, activation_marker_verified=passed, " +
+      "daemon_cleanup_verified=passed",
     )
     const diagnostics = await readFile(fixture.prepared.diagnosticsFile, "utf8")
     expect(diagnostics).not.toContain(fixture.temporary)
     expect(diagnostics).not.toContain(fixture.binding.nonce)
+  } finally {
+    await rm(fixture.temporary, { force: true, recursive: true })
+  }
+}, 20_000)
+
+test("Desktop config carries one exact tuple through official merge and dedup", async () => {
+  const fixture = await createDesktopLoadFixture()
+  try {
+    const config = JSON.parse(await readFile(fixture.prepared.configFile, "utf8")) as {
+      plugin: unknown[]
+    }
+    expect(config.plugin).toHaveLength(1)
+    expect(config.plugin[0]).toEqual([
+      pathToFileURL(fixture.prepared.pluginLoader).href,
+      {
+        binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
+        certification: fixture.binding,
+        dataDirectory: fixture.dataDirectory,
+        hostVersion: "1.18.21",
+      },
+    ])
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
@@ -264,18 +465,14 @@ test("bound Desktop config resolves and executes the candidate from the copied p
 test("Desktop load diagnostics fail closed at candidate module resolution without leaking details", async () => {
   const fixture = await createDesktopLoadFixture()
   try {
-    const probe = await import(`${pathToFileURL(fixture.prepared.configProbe).href}?failure-probe`)
-    await probe.default({})
     await rm(join(fixture.prepared.installedPlugin, "dist", "index.js"))
 
-    await expect(
-      import(`${pathToFileURL(fixture.prepared.pluginLoader).href}?missing-candidate`),
-    ).rejects.toThrow("Cycle candidate module resolution failed")
-    const summary = await desktopLoadDiagnosticSummary(fixture.binding.root)
-    expect(summary).toContain("config_path_discovery=passed")
-    expect(summary).toContain("plugin_specifier_resolution=passed")
-    expect(summary).toContain("candidate_module_resolution=failed")
-    expect(summary).toContain("plugin_entry_execution=missing")
+    await expect(runHostProof(fixture, "missing-candidate")).rejects.toThrow("host proof failed")
+    const summary = await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)
+    expect(summary).toContain("config_path_discovered=passed")
+    expect(summary).toContain("plugin_specifier_resolved=passed")
+    expect(summary).toContain("candidate_module_resolved=failed")
+    expect(summary).toContain("plugin_entry_started=missing")
     const diagnostics = await readFile(fixture.prepared.diagnosticsFile, "utf8")
     expect(diagnostics).not.toContain(fixture.temporary)
     expect(diagnostics).not.toContain(fixture.binding.nonce)
@@ -288,11 +485,11 @@ test("Desktop load diagnostics fail closed at candidate module resolution withou
           clock += milliseconds
         },
       }),
-    ).rejects.toThrow("candidate_module_resolution=failed")
+    ).rejects.toThrow("candidate_module_resolved=failed")
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
-})
+}, 20_000)
 
 test("Desktop load diagnostics isolate candidate entry failure without recording its message", async () => {
   const privateFailure = "private provider and model fixture must not enter diagnostics"
@@ -300,18 +497,13 @@ test("Desktop load diagnostics isolate candidate entry failure without recording
 export default async function CandidateFixture() {
   throw new Error(${JSON.stringify(privateFailure)})
 }
-`)
+  `)
   try {
-    const probe = await import(`${pathToFileURL(fixture.prepared.configProbe).href}?entry-failure-probe`)
-    await probe.default({})
-    const candidate = await import(
-      `${pathToFileURL(fixture.prepared.pluginLoader).href}?entry-failure-candidate`
-    )
-    await expect(candidate.default({ fixture: "entry-failure" })).rejects.toThrow(privateFailure)
+    await expect(runHostProof(fixture, "entry-failure")).rejects.toThrow("host proof failed")
 
-    const summary = await desktopLoadDiagnosticSummary(fixture.binding.root)
-    expect(summary).toContain("candidate_module_resolution=passed")
-    expect(summary).toContain("plugin_entry_execution=failed")
+    const summary = await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)
+    expect(summary).toContain("candidate_module_resolved=passed")
+    expect(summary).toContain("plugin_entry_completed=failed")
     const diagnostics = await readFile(fixture.prepared.diagnosticsFile, "utf8")
     expect(diagnostics).not.toContain(privateFailure)
     expect(diagnostics).not.toContain(fixture.temporary)
@@ -319,7 +511,7 @@ export default async function CandidateFixture() {
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
-})
+}, 20_000)
 
 test("malformed Desktop load diagnostics fail closed without echoing untrusted fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "cycle-cert-invalid-load-diagnostic-"))
@@ -343,7 +535,7 @@ test("malformed Desktop load diagnostics fail closed without echoing untrusted f
         type: "opencode-cycle-desktop-load-diagnostic",
       })}\n`,
     )
-    await expect(desktopLoadDiagnosticSummary(root)).rejects.toThrow("malformed")
+    await expect(desktopLoadDiagnosticSummary(root, binding)).rejects.toThrow("transcript")
 
     let clock = binding.startedAtUnixMillis
     let failure: unknown
@@ -365,11 +557,117 @@ test("malformed Desktop load diagnostics fail closed without echoing untrusted f
   }
 })
 
+test("Desktop output diagnostics expose only bounded byte counts and digests", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-output-summary-"))
+  const secret = "private provider model token C:\\owner\\config"
+  const stdout = join(root, "stdout.log")
+  const stderr = join(root, "stderr.log")
+  try {
+    await Promise.all([writeFile(stdout, secret), writeFile(stderr, `error ${secret}`)])
+    const summary = await desktopOutputSummary(stdout, stderr, root)
+    expect(summary).toContain(`stdout_bytes=${Buffer.byteLength(secret)}`)
+    expect(summary).toContain(createHash("sha256").update(secret).digest("hex"))
+    expect(summary).not.toContain(secret)
+    expect(summary).not.toContain(root)
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
+test("Desktop load transcript rejects duplicate, out-of-order and failure-overwrite records", async () => {
+  for (const scenario of ["duplicate", "out-of-order", "failure-overwrite", "stale"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "cycle-cert-invalid-transcript-"))
+    const binding: DesktopCertificationBinding = {
+      nativePackageSha256: "d".repeat(64),
+      nonce: "b".repeat(64),
+      pluginPackageSha256: "c".repeat(64),
+      revision: "a".repeat(40),
+      root,
+      startedAtUnixMillis: 1_700_000_000_000,
+    }
+    const runDigest = desktopCertificationBindingDigest(binding)
+    const record = (sequence: number, stage: string, status: "failed" | "passed", digest = runDigest) => ({
+      runDigest: digest,
+      schemaVersion: 2,
+      sequence,
+      stage,
+      status,
+      type: "opencode-cycle-desktop-load-diagnostic",
+    })
+    const records = {
+      duplicate: [
+        record(0, "certification_env_prepared", "passed"),
+        record(1, "certification_env_prepared", "passed"),
+      ],
+      "out-of-order": [record(0, "config_tree_prepared", "passed")],
+      "failure-overwrite": [
+        record(0, "certification_env_prepared", "failed"),
+        record(1, "config_tree_prepared", "passed"),
+      ],
+      stale: [record(0, "certification_env_prepared", "passed", "e".repeat(64))],
+    }[scenario]
+    try {
+      await writeFile(
+        join(root, "desktop-load-diagnostics.jsonl"),
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      )
+      await expect(desktopLoadDiagnosticSummary(root, binding)).rejects.toThrow("transcript")
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  }
+})
+
+test("a complete passing load transcript can never replace the activation marker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-transcript-no-marker-"))
+  const binding: DesktopCertificationBinding = {
+    nativePackageSha256: "d".repeat(64),
+    nonce: "b".repeat(64),
+    pluginPackageSha256: "c".repeat(64),
+    revision: "a".repeat(40),
+    root,
+    startedAtUnixMillis: 1_700_000_000_000,
+  }
+  const stages = [
+    "certification_env_prepared",
+    "config_tree_prepared",
+    "config_path_discovered",
+    "plugin_specifier_resolved",
+    "effective_env_validated",
+    "candidate_module_resolved",
+    "plugin_entry_started",
+    "plugin_entry_completed",
+    "daemon_identity_published",
+  ]
+  try {
+    await writeFile(
+      join(root, "desktop-load-diagnostics.jsonl"),
+      `${stages.map((stage, sequence) => JSON.stringify({
+        runDigest: desktopCertificationBindingDigest(binding),
+        schemaVersion: 2,
+        sequence,
+        stage,
+        status: "passed",
+        type: "opencode-cycle-desktop-load-diagnostic",
+      })).join("\n")}\n`,
+    )
+    let clock = binding.startedAtUnixMillis
+    await expect(waitForDesktopActivation(root, binding, 1, {
+      now: () => clock,
+      sleep: async (milliseconds) => { clock += milliseconds },
+    })).rejects.toThrow("did not activate")
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
 test("certification scratch directories are not treated as Desktop test profiles", () => {
   const scratch = join(tmpdir(), "opencode-cycle-desktop-certification-scratch")
   expect(isDesktopHarnessPath(scratch, scratch)).toBe(true)
   expect(isDesktopHarnessPath(join(scratch, "home"), scratch)).toBe(true)
   expect(isDesktopHarnessPath(join(scratch, "project"), scratch)).toBe(true)
+  expect(isCertificationOnboardingProfile(join(scratch, "temp", "opencode-onboarding-fresh"), scratch)).toBe(true)
+  expect(isCertificationOnboardingProfile(join(scratch, "project"), scratch)).toBe(false)
   expect(isDesktopHarnessPath(join(tmpdir(), "opencode-onboarding-certified"), scratch)).toBe(false)
 })
 
@@ -402,7 +700,7 @@ test("stale owner markers cannot satisfy the fresh certification root", async ()
       protocol_version: 1,
       schema_mode: "read_write",
       schema_version: 17,
-    }, clock)
+    }, daemonIdentity(binding), clock)
     await writeFile(join(owner, "desktop-activation.json"), JSON.stringify(stale))
     await expect(
       waitForDesktopActivation(root, binding, 2_000, {
@@ -434,12 +732,13 @@ test("activation rejects wrong nonce, package hashes and missing Desktop health"
       startedAtUnixMillis: Date.now(),
     }
     try {
-      const marker = buildDesktopActivationMarker({ ...binding, ...change }, {
+      const changedBinding = { ...binding, ...change }
+      const marker = buildDesktopActivationMarker(changedBinding, {
         product_version: "1.0.0",
         protocol_version: 1,
         schema_mode: "read_write",
         schema_version: 17,
-      }, binding.startedAtUnixMillis)
+      }, daemonIdentity(changedBinding), binding.startedAtUnixMillis)
       await writeFile(join(root, "desktop-activation.json"), JSON.stringify(marker))
       await expect(waitForDesktopActivation(root, binding, 10)).rejects.toThrow("does not match")
     } finally {

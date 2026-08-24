@@ -26,6 +26,8 @@ import {
 import { parseCycleCommand, registerCycleCommand } from "./commands.js"
 import {
   certificationBindingFromOptions,
+  desktopCertificationProcessToken,
+  writeDesktopDaemonMarker,
   writeDesktopActivationMarker,
 } from "./certification.js"
 import {
@@ -173,13 +175,31 @@ const OpenCodeCycle: Plugin = async (input, options) => {
     await logSetupFailure(input, error)
     return {}
   }
+  const certificationBinding = certificationBindingFromOptions(pluginOptions, process.env)
   const controlPlane = new LocalControlPlane({
     ...(binaryPath === undefined ? {} : { binaryPath }),
     ...(dataDirectory === undefined ? {} : { dataDirectory }),
+    ...(certificationBinding === undefined
+      ? {}
+      : {
+          onProcessSpawn: (identity: import("./client.js").OwnedProcessIdentity) =>
+            writeDesktopDaemonMarker(certificationBinding, identity).then(() => undefined),
+          processOwnerToken: desktopCertificationProcessToken(certificationBinding),
+          stopOwnedProcessOnDispose: true,
+        }),
   })
-  const certificationBinding = certificationBindingFromOptions(pluginOptions, process.env)
   if (certificationBinding !== undefined) {
-    await writeDesktopActivationMarker(certificationBinding, await controlPlane.health())
+    try {
+      const health = await controlPlane.health()
+      await writeDesktopActivationMarker(
+        certificationBinding,
+        health,
+        controlPlane.ownedProcessIdentity(),
+      )
+    } catch (error) {
+      await controlPlane.dispose()
+      throw error
+    }
   }
   const projectKey = input.project?.id ?? input.directory ?? "unknown-project"
   const workflowSessions = new Set<string>()
