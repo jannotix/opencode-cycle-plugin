@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto"
 import { createWriteStream } from "node:fs"
 import {
+  appendFile,
   chmod,
   copyFile,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   stat,
@@ -62,6 +64,35 @@ type DesktopAuthenticity =
       readonly status: "verified"
     }
   | { readonly method: "sha256"; readonly status: "verified" }
+
+const DESKTOP_LOAD_DIAGNOSTIC_FILE = "desktop-load-diagnostics.jsonl"
+const DESKTOP_LOAD_DIAGNOSTIC_TYPE = "opencode-cycle-desktop-load-diagnostic"
+const DESKTOP_LOAD_DIAGNOSTIC_STAGES = [
+  "certification_env_binding",
+  "config_tree_preparation",
+  "config_path_discovery",
+  "plugin_specifier_resolution",
+  "candidate_module_resolution",
+  "plugin_entry_execution",
+] as const
+type DesktopLoadDiagnosticStage = typeof DESKTOP_LOAD_DIAGNOSTIC_STAGES[number]
+type DesktopLoadDiagnosticStatus = "failed" | "passed" | "started"
+
+interface DesktopLoadDiagnostic {
+  readonly schemaVersion: 1
+  readonly stage: DesktopLoadDiagnosticStage
+  readonly status: DesktopLoadDiagnosticStatus
+  readonly type: typeof DESKTOP_LOAD_DIAGNOSTIC_TYPE
+}
+
+export interface PreparedDesktopCertificationLoad {
+  readonly configDirectory: string
+  readonly configFile: string
+  readonly configProbe: string
+  readonly diagnosticsFile: string
+  readonly installedPlugin: string
+  readonly pluginLoader: string
+}
 
 export const SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS = CERTIFIED_PLATFORMS
 
@@ -137,6 +168,7 @@ export function certificationEnvironment(
   certification?: Pick<DesktopCertificationBinding, "nonce" | "root">,
 ): NodeJS.ProcessEnv {
   const isolated = resolve(root)
+  const configDirectory = join(isolated, "opencode-config")
   const allowed = [
     "CI",
     "ComSpec",
@@ -186,7 +218,10 @@ export function certificationEnvironment(
       : undefined,
     HOMEPATH: platform === "windows-x64" ? join(isolated, "home").replace(/^[A-Za-z]:/u, "") : undefined,
     LOCALAPPDATA: join(isolated, "localappdata"),
+    OPENCODE_CONFIG: join(configDirectory, "opencode.json"),
+    OPENCODE_CONFIG_DIR: configDirectory,
     OPENCODE_DISABLE_AUTOUPDATE: "true",
+    OPENCODE_DISABLE_PROJECT_CONFIG: "true",
     USERPROFILE: join(isolated, "home"),
     XDG_CACHE_HOME: join(isolated, "xdg", "cache"),
     XDG_CONFIG_HOME: join(isolated, "xdg", "config"),
@@ -343,40 +378,16 @@ async function main(): Promise<void> {
     await writeFile(join(project, "README.md"), "# Desktop certification project\n", "utf8")
     await run(["git", "add", "README.md"], project, environment)
     await run(["git", "commit", "-m", "certification fixture"], project, environment)
-    const pluginConfig = {
-      plugin: [
-        [
-          pathToFileURL(join(installedPlugin, "dist", "index.js")).href,
-          {
-            binaryPath: nativeExecutable,
-            certification,
-            dataDirectory,
-            hostVersion: matrix.version,
-          },
-        ],
-      ],
-    }
-    const configContents = `${JSON.stringify(pluginConfig, null, 2)}\n`
-    await writeFile(join(project, "opencode.json"), configContents, "utf8")
-    const isolatedConfigDirectories = [
-      join(environment.XDG_CONFIG_HOME as string, "opencode"),
-      join(environment.HOME as string, ".config", "opencode"),
-    ]
-    await Promise.all(
-      isolatedConfigDirectories.map(async (directory) => {
-        await mkdir(directory, { recursive: true })
-        await writeFile(join(directory, "opencode.json"), configContents, "utf8")
-        await installPackedPluginTree(
-          directory,
-          installedPlugin,
-          nativeExecutable,
-          options.platform,
-          dataDirectory,
-          matrix.version,
-          certification,
-        )
-      }),
-    )
+    await prepareDesktopCertificationLoad({
+      certification,
+      dataDirectory,
+      environment,
+      hostVersion: matrix.version,
+      nativeExecutable,
+      packedPlugin: installedPlugin,
+      platform: options.platform,
+      scratch,
+    })
 
     const desktop = await prepareDesktop(options.platform, assetPath, scratch, environment)
     if (options.platform === "windows-x64") {
@@ -403,25 +414,11 @@ async function main(): Promise<void> {
         desktopProfileRoots,
         scratch,
       )
-      const desktopConfig = join(desktopProfile, "config", "opencode")
       await mkdir(join(desktopProfile, "desktop"), { recursive: true })
-      await mkdir(desktopConfig, { recursive: true })
-      await Promise.all([
-        writeFile(
-          join(desktopProfile, "desktop", "opencode.settings"),
-          `${JSON.stringify({ firstLaunchOnboardingComplete: true, oldLayoutEligible: false })}\n`,
-          "utf8",
-        ),
-        writeFile(join(desktopConfig, "opencode.json"), configContents, "utf8"),
-      ])
-      await installPackedPluginTree(
-        desktopConfig,
-        installedPlugin,
-        nativeExecutable,
-        options.platform,
-        dataDirectory,
-        matrix.version,
-        certification,
+      await writeFile(
+        join(desktopProfile, "desktop", "opencode.settings"),
+        `${JSON.stringify({ firstLaunchOnboardingComplete: true, oldLayoutEligible: false })}\n`,
+        "utf8",
       )
     }
     const withDesktopLogs = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -496,6 +493,84 @@ async function main(): Promise<void> {
   }
 }
 
+export async function prepareDesktopCertificationLoad(input: {
+  readonly certification: DesktopCertificationBinding
+  readonly dataDirectory: string
+  readonly environment: NodeJS.ProcessEnv
+  readonly hostVersion: string
+  readonly nativeExecutable: string
+  readonly packedPlugin: string
+  readonly platform: CertifiedPlatform
+  readonly scratch: string
+}): Promise<PreparedDesktopCertificationLoad> {
+  const certificationRoot = resolve(input.certification.root)
+  if (!isDesktopHarnessPath(certificationRoot, input.scratch)) {
+    throw new Error("Desktop certification evidence root is outside the isolated scratch")
+  }
+  const certificationRootDetails = await lstat(certificationRoot)
+  if (!certificationRootDetails.isDirectory() || certificationRootDetails.isSymbolicLink()) {
+    throw new Error("Desktop certification evidence root must be a real directory")
+  }
+  if (await realpath(certificationRoot) !== certificationRoot || certificationRoot !== input.certification.root) {
+    throw new Error("Desktop certification evidence root must not be a link or alias")
+  }
+  const diagnosticsFile = join(certificationRoot, DESKTOP_LOAD_DIAGNOSTIC_FILE)
+  await writeFile(diagnosticsFile, "", { flag: "wx", mode: 0o600 })
+
+  try {
+    assertCertificationEnvironmentBinding(input.scratch, input.environment, input.certification)
+    await appendDesktopLoadDiagnostic(diagnosticsFile, "certification_env_binding", "passed")
+  } catch (error) {
+    await appendDesktopLoadDiagnostic(diagnosticsFile, "certification_env_binding", "failed")
+    throw error
+  }
+
+  try {
+    const prepared = await installPackedPluginTree(
+      input.environment.OPENCODE_CONFIG_DIR as string,
+      input.packedPlugin,
+      input.nativeExecutable,
+      input.platform,
+      input.dataDirectory,
+      input.hostVersion,
+      input.certification,
+      diagnosticsFile,
+    )
+    await appendDesktopLoadDiagnostic(diagnosticsFile, "config_tree_preparation", "passed")
+    return { ...prepared, diagnosticsFile }
+  } catch (error) {
+    await appendDesktopLoadDiagnostic(diagnosticsFile, "config_tree_preparation", "failed")
+    throw error
+  }
+}
+
+function assertCertificationEnvironmentBinding(
+  scratch: string,
+  environment: NodeJS.ProcessEnv,
+  certification: DesktopCertificationBinding,
+): void {
+  const root = resolve(scratch)
+  const configDirectory = join(root, "opencode-config")
+  if (!isDesktopHarnessPath(certification.root, root)) {
+    throw new Error("Desktop certification evidence root is outside the isolated scratch")
+  }
+  if (
+    environment.OPENCODE_CONFIG_DIR !== configDirectory ||
+    environment.OPENCODE_CONFIG !== join(configDirectory, "opencode.json")
+  ) {
+    throw new Error("Desktop certification config binding is invalid")
+  }
+  if (
+    environment.CYCLE_CERTIFICATION_NONCE !== certification.nonce ||
+    environment.CYCLE_CERTIFICATION_ROOT !== certification.root
+  ) {
+    throw new Error("Desktop certification marker authority is not bound to the environment")
+  }
+  if (environment.OPENCODE_DISABLE_PROJECT_CONFIG !== "true") {
+    throw new Error("Desktop certification must disable ambient project configuration")
+  }
+}
+
 async function installPackedPluginTree(
   configDirectory: string,
   packedPlugin: string,
@@ -504,30 +579,117 @@ async function installPackedPluginTree(
   dataDirectory: string,
   hostVersion: string,
   certification: DesktopCertificationBinding,
-): Promise<void> {
+  diagnosticsFile: string,
+): Promise<Omit<PreparedDesktopCertificationLoad, "diagnosticsFile">> {
   const installRoot = join(configDirectory, "opencode-cycle")
   const nativeBinary = platform === "windows-x64" ? "workflowd.exe" : "workflowd"
+  await mkdir(configDirectory, { recursive: true })
   await copyDirectory(packedPlugin, installRoot)
   await mkdir(join(installRoot, "bin"), { recursive: true })
   await copyFile(nativeExecutable, join(installRoot, "bin", nativeBinary))
   if (platform !== "windows-x64") await chmod(join(installRoot, "bin", nativeBinary), 0o755)
-  const pluginsDirectory = join(configDirectory, "plugins")
-  await mkdir(pluginsDirectory, { recursive: true })
-  const loader = `import { fileURLToPath } from "node:url"
-import OpenCodeCycle from "../opencode-cycle/dist/index.js"
+  const certificationDirectory = join(configDirectory, "cycle-certification")
+  const configProbe = join(certificationDirectory, "config-probe.js")
+  const pluginLoader = join(certificationDirectory, "opencode-cycle-loader.js")
+  await mkdir(certificationDirectory, { recursive: true })
+  const diagnosticWriter = desktopLoadDiagnosticWriterSource(diagnosticsFile)
+  const probe = `${diagnosticWriter}
+recordDesktopLoadDiagnostic("config_path_discovery", "passed")
+
+export default async function CycleCertificationConfigProbe() {
+  return {}
+}
+`
+  const loader = `${diagnosticWriter}
+import { fileURLToPath } from "node:url"
+
+recordDesktopLoadDiagnostic("plugin_specifier_resolution", "passed")
+
+let OpenCodeCycle
+try {
+  const candidate = await import(new URL("../opencode-cycle/dist/index.js", import.meta.url).href)
+  if (typeof candidate.default !== "function") {
+    throw new TypeError("Cycle candidate default export is not a function")
+  }
+  OpenCodeCycle = candidate.default
+  recordDesktopLoadDiagnostic("candidate_module_resolution", "passed")
+} catch (error) {
+  recordDesktopLoadDiagnostic("candidate_module_resolution", "failed")
+  throw new Error("Cycle candidate module resolution failed", { cause: error })
+}
 
 const binaryPath = fileURLToPath(new URL("../opencode-cycle/bin/${nativeBinary}", import.meta.url))
 
 export default async function OpenCodeCyclePlugin(input) {
-  return OpenCodeCycle(input, {
-    binaryPath,
-    certification: ${JSON.stringify(certification)},
-    dataDirectory: ${JSON.stringify(dataDirectory)},
-    hostVersion: ${JSON.stringify(hostVersion)},
-  })
+  recordDesktopLoadDiagnostic("plugin_entry_execution", "started")
+  try {
+    const hooks = await OpenCodeCycle(input, {
+      binaryPath,
+      certification: ${JSON.stringify(certification)},
+      dataDirectory: ${JSON.stringify(dataDirectory)},
+      hostVersion: ${JSON.stringify(hostVersion)},
+    })
+    recordDesktopLoadDiagnostic("plugin_entry_execution", "passed")
+    return hooks
+  } catch (error) {
+    recordDesktopLoadDiagnostic("plugin_entry_execution", "failed")
+    throw error
+  }
 }
 `
-  await writeFile(join(pluginsDirectory, "opencode-cycle.js"), loader, "utf8")
+  await Promise.all([
+    writeFile(
+      join(configDirectory, "package.json"),
+      `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    ),
+    writeFile(configProbe, probe, { encoding: "utf8", flag: "wx", mode: 0o600 }),
+    writeFile(pluginLoader, loader, { encoding: "utf8", flag: "wx", mode: 0o600 }),
+  ])
+  const configFile = join(configDirectory, "opencode.json")
+  await writeFile(
+    configFile,
+    `${JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      plugin: [pathToFileURL(configProbe).href, pathToFileURL(pluginLoader).href],
+    }, null, 2)}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 },
+  )
+  return { configDirectory, configFile, configProbe, installedPlugin: installRoot, pluginLoader }
+}
+
+function desktopLoadDiagnosticWriterSource(diagnosticsFile: string): string {
+  return `import { appendFileSync } from "node:fs"
+
+const desktopLoadDiagnosticsFile = ${JSON.stringify(diagnosticsFile)}
+
+function recordDesktopLoadDiagnostic(stage, status) {
+  appendFileSync(
+    desktopLoadDiagnosticsFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      stage,
+      status,
+      type: ${JSON.stringify(DESKTOP_LOAD_DIAGNOSTIC_TYPE)},
+    }) + "\\n",
+    { encoding: "utf8", flag: "a", mode: 0o600 },
+  )
+}
+`
+}
+
+async function appendDesktopLoadDiagnostic(
+  diagnosticsFile: string,
+  stage: DesktopLoadDiagnosticStage,
+  status: DesktopLoadDiagnosticStatus,
+): Promise<void> {
+  const diagnostic: DesktopLoadDiagnostic = {
+    schemaVersion: 1,
+    stage,
+    status,
+    type: DESKTOP_LOAD_DIAGNOSTIC_TYPE,
+  }
+  await appendFile(diagnosticsFile, `${JSON.stringify(diagnostic)}\n`, { encoding: "utf8", mode: 0o600 })
 }
 
 async function copyDirectory(from: string, to: string): Promise<void> {
@@ -712,6 +874,55 @@ export function activationScanRoots(
   return [dataDirectory]
 }
 
+export async function desktopLoadDiagnosticSummary(root: string): Promise<string> {
+  const diagnosticsFile = join(root, DESKTOP_LOAD_DIAGNOSTIC_FILE)
+  const present = await lstat(diagnosticsFile).then(
+    () => true,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false
+      throw error
+    },
+  )
+  const latest = new Map<DesktopLoadDiagnosticStage, DesktopLoadDiagnosticStatus>()
+  if (present) {
+    const file = await readVerifiedRegularFile(diagnosticsFile, { maxBytes: 64 * 1024, root })
+    const lines = file.content.toString("utf8").split("\n").filter((line) => line.length > 0)
+    for (const line of lines) {
+      let value: unknown
+      try {
+        value = JSON.parse(line) as unknown
+      } catch {
+        throw new Error("Desktop load diagnostics are malformed")
+      }
+      const diagnostic = parseDesktopLoadDiagnostic(value)
+      latest.set(diagnostic.stage, diagnostic.status)
+    }
+  }
+  return DESKTOP_LOAD_DIAGNOSTIC_STAGES
+    .map((stage) => `${stage}=${latest.get(stage) ?? "missing"}`)
+    .join(", ")
+}
+
+function parseDesktopLoadDiagnostic(value: unknown): DesktopLoadDiagnostic {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Desktop load diagnostics are malformed")
+  }
+  const record = value as Record<string, unknown>
+  if (Object.keys(record).sort().join(",") !== "schemaVersion,stage,status,type") {
+    throw new Error("Desktop load diagnostics are malformed")
+  }
+  if (record.schemaVersion !== 1 || record.type !== DESKTOP_LOAD_DIAGNOSTIC_TYPE) {
+    throw new Error("Desktop load diagnostics are malformed")
+  }
+  if (!(DESKTOP_LOAD_DIAGNOSTIC_STAGES as readonly unknown[]).includes(record.stage)) {
+    throw new Error("Desktop load diagnostics are malformed")
+  }
+  if (!(record.status === "failed" || record.status === "passed" || record.status === "started")) {
+    throw new Error("Desktop load diagnostics are malformed")
+  }
+  return record as unknown as DesktopLoadDiagnostic
+}
+
 export async function waitForDesktopActivation(
   root: string,
   binding: DesktopCertificationBinding,
@@ -754,7 +965,10 @@ export async function waitForDesktopActivation(
     }
     await sleep(1_000)
   }
-  throw new Error("OpenCode Desktop did not activate the installed Cycle plugin")
+  const diagnostics = await desktopLoadDiagnosticSummary(root).catch(() => "invalid")
+  throw new Error(
+    `OpenCode Desktop did not activate the installed Cycle plugin; Desktop load diagnostics: ${diagnostics}`,
+  )
 }
 
 const DESKTOP_TEST_PROFILE_PREFIXES = ["opencode-onboarding-", "opencode-"]
