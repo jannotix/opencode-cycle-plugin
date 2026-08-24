@@ -32,6 +32,8 @@ const provenance = {
   commit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
   files: {
     "packages/core/src/v1/config/plugin.ts": "b45a25d030b253b92449050538433c8ab4dd53db9d2c81228cd6133f4d94837c",
+    "packages/desktop/src/main/server.ts": "b011cc9421ffe27bbdc18f8e18423f114636a310b7290394a19a7f1b29a8c352",
+    "packages/desktop/src/main/shell-env.ts": "eb36363c87ac3f4b6a13053fe845aef045545883b6fcee3e0f4a2517194b1daa",
     "packages/opencode/src/config/config.ts": "b0fd57d860661ce70e7fbd06e7f2cc24417c70d3db4207ad97129ac1b649997e",
     "packages/opencode/src/config/paths.ts": "cd86a34461b27caf1042f8cba140fbbed47790c4f30cd9691f87298e8d4d4444",
     "packages/opencode/src/config/plugin.ts": "8c450d5c8fdee1811bb93788462958c7e58ea551c73e18a4173c19917c734f6e",

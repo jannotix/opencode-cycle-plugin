@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 import {
   cleanPluginBuildOutput,
@@ -60,6 +60,37 @@ test("plugin package accepts the exact production module allowlist", () => {
       ["browser/session.js", "index.js"],
     ),
   ).not.toThrow()
+})
+
+test("plugin entry builds and imports in the Desktop Node runtime", async () => {
+  const root = fileURLToPath(new URL("../../", import.meta.url))
+  const output = await mkdtemp(join(root, "target", "node-runtime-load-"))
+  try {
+    const built = await Bun.build({
+      entrypoints: [join(root, "packages", "opencode-cycle", "src", "index.ts")],
+      outdir: output,
+      packages: "external",
+      target: "node",
+    })
+    expect(built.success).toBe(true)
+    expect(built.outputs).toHaveLength(1)
+    const nodeBundle = await readFile(built.outputs[0]?.path as string, "utf8")
+    expect(nodeBundle).not.toMatch(/\bBun\./u)
+    expect(nodeBundle).not.toContain('from "bun"')
+    const child = Bun.spawn(
+      [
+        "node",
+        "--input-type=module",
+        "-e",
+        "await import(process.argv[1])",
+        pathToFileURL(built.outputs[0]?.path as string).href,
+      ],
+      { cwd: root, stderr: "ignore", stdout: "ignore" },
+    )
+    expect(await child.exited).toBe(0)
+  } finally {
+    await rm(output, { force: true, recursive: true })
+  }
 })
 
 test("plugin package rejects duplicate archive members", () => {

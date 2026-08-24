@@ -434,7 +434,8 @@ function createDesktopActivationWriter(hooks: ActivationWriterHooks): typeof wri
       lockHandle = await open(lockPath, "wx", 0o600)
     } catch (error) {
       if (!isRecord(error) || error.code !== "EEXIST") throw error
-      const sleep = hooks.sleep ?? Bun.sleep
+      const sleep = hooks.sleep ?? ((milliseconds: number) =>
+        new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
       for (let attempt = 0; attempt < 250; attempt += 1) {
         const published = await existingMarker(path, binding, marker)
         if (published !== undefined) return published

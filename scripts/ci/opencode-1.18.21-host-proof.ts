@@ -15,6 +15,8 @@ export const OPENCODE_11821_HOST_PROOF_PROVENANCE = {
   commit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
   files: {
     "packages/core/src/v1/config/plugin.ts": "b45a25d030b253b92449050538433c8ab4dd53db9d2c81228cd6133f4d94837c",
+    "packages/desktop/src/main/server.ts": "b011cc9421ffe27bbdc18f8e18423f114636a310b7290394a19a7f1b29a8c352",
+    "packages/desktop/src/main/shell-env.ts": "eb36363c87ac3f4b6a13053fe845aef045545883b6fcee3e0f4a2517194b1daa",
     "packages/opencode/src/config/config.ts": "b0fd57d860661ce70e7fbd06e7f2cc24417c70d3db4207ad97129ac1b649997e",
     "packages/opencode/src/config/paths.ts": "cd86a34461b27caf1042f8cba140fbbed47790c4f30cd9691f87298e8d4d4444",
     "packages/opencode/src/config/plugin.ts": "8c450d5c8fdee1811bb93788462958c7e58ea551c73e18a4173c19917c734f6e",
@@ -52,6 +54,23 @@ export interface OpenCodeHostProofReceipt {
   readonly optionsDigest: string
   readonly provenanceCommit: string
   readonly tupleOptions: true
+}
+
+export interface OpenCodeDesktopEnvironmentProofRequest {
+  readonly configDirectory: string
+  readonly configFile: string
+  readonly directory: string
+  readonly resultFile: string
+  readonly scratch: string
+  readonly userDataPath: string
+  readonly worktree: string
+}
+
+export interface OpenCodeDesktopEnvironmentProofReceipt {
+  readonly configDirectoryDiscovered: true
+  readonly configFileDiscovered: true
+  readonly provenanceCommit: string
+  readonly shellEnvironmentSkipped: true
 }
 
 type CanonicalRuntime = {
@@ -120,6 +139,58 @@ export async function runOpenCode11821HostProof(
   }
 }
 
+export async function runOpenCode11821DesktopEnvironmentProof(
+  request: OpenCodeDesktopEnvironmentProofRequest,
+): Promise<OpenCodeDesktopEnvironmentProofReceipt> {
+  if (process.platform !== "linux") {
+    throw new Error("Canonical Desktop environment proof requires Linux")
+  }
+  const scratch = resolve(request.scratch)
+  for (const value of [
+    request.configDirectory,
+    request.configFile,
+    request.directory,
+    request.resultFile,
+    request.userDataPath,
+    request.worktree,
+  ]) {
+    if (!isAbsolute(value) || !filesystemBoundary.contains(scratch, value)) {
+      throw new Error("Canonical Desktop environment proof path is outside scratch")
+    }
+  }
+  await verifyCanonicalFixture()
+  const temporary = await mkdtemp(join(scratch, "opencode-1.18.21-desktop-env-"))
+  try {
+    const preferAppEnv = await buildCanonicalPreferAppEnvModule(temporary)
+    const shellEnvironment = preferAppEnv.preferAppEnv(request.userDataPath)
+    if (shellEnvironment !== null) {
+      throw new Error("Canonical Desktop environment proof imported a login-shell environment")
+    }
+    if (
+      process.env.OPENCODE_CONFIG_DIR !== request.configDirectory ||
+      process.env.OPENCODE_CONFIG !== request.configFile
+    ) {
+      throw new Error("Canonical Desktop environment proof changed the explicit config binding")
+    }
+    const paths = await buildCanonicalConfigPathsModule(temporary)
+    const directories = await paths.Effect.runPromise(paths.directories(request.directory, request.worktree))
+    if (!Array.isArray(directories) || !directories.includes(request.configDirectory)) {
+      throw new Error("Canonical Desktop config resolver did not discover the explicit config directory")
+    }
+    await access(request.configFile)
+    const receipt: OpenCodeDesktopEnvironmentProofReceipt = {
+      configDirectoryDiscovered: true,
+      configFileDiscovered: true,
+      provenanceCommit: OPENCODE_11821_HOST_PROOF_PROVENANCE.commit,
+      shellEnvironmentSkipped: true,
+    }
+    await writeFile(request.resultFile, `${JSON.stringify(receipt)}\n`, { flag: "wx", mode: 0o600 })
+    return receipt
+  } finally {
+    await rm(temporary, { force: true, recursive: true })
+  }
+}
+
 async function loadCanonicalRuntime(scratch: string): Promise<CanonicalRuntime> {
   await verifyCanonicalFixture()
   const effectPath = resolve(
@@ -179,6 +250,40 @@ async function buildCanonicalApplyModule(scratch: string, shared: Record<string,
   const sharedUrl = pathToFileURL(join(scratch, "shared-bridge.js")).href
   mock.module(sharedUrl, () => shared)
   await writeFile(path, `import { readPluginId, readV1Plugin, resolvePluginId } from ${JSON.stringify(sharedUrl)}\ntype PluginInstance = any\ntype PluginInput = any\ntype Hooks = any\ntype PluginModule = any\nnamespace PluginLoader { export type Loaded = any }\n${extracted}\nexport { applyPlugin }\n`)
+  return import(pathToFileURL(path).href)
+}
+
+async function buildCanonicalPreferAppEnvModule(scratch: string) {
+  const source = await readFixture("packages/desktop/src/main/server.ts")
+  const start = source.indexOf("export function preferAppEnv")
+  const boundary = "\n}\n\nexport async function spawnLocalServer"
+  const end = source.indexOf(boundary, start)
+  if (start < 0 || end < 0) throw new Error("Canonical preferAppEnv extraction boundary drifted")
+  const extracted = source.slice(start, end + 2)
+  const path = join(scratch, "canonical-prefer-app-env.ts")
+  const shellEnvUrl = fixtureUrl("packages/desktop/src/main/shell-env.ts")
+  await writeFile(
+    path,
+    `import { getUserShell, loadShellEnv } from ${JSON.stringify(shellEnvUrl)}\nconst getLogger = () => ({ log: () => undefined })\n${extracted}\n`,
+  )
+  return import(pathToFileURL(path).href)
+}
+
+async function buildCanonicalConfigPathsModule(scratch: string) {
+  const source = await readFixture("packages/opencode/src/config/paths.ts")
+  const start = source.indexOf("export const directories =")
+  const end = source.indexOf("\n\nexport function fileInDirectory", start)
+  if (start < 0 || end < 0) throw new Error("Canonical config-path extraction boundary drifted")
+  const extracted = source.slice(start, end)
+  const effectPath = resolve(
+    fileURLToPath(new URL("../../", import.meta.url)),
+    "node_modules/.bun/effect@4.0.0-beta.83/node_modules/effect/dist/index.js",
+  )
+  const path = join(scratch, "canonical-config-paths.ts")
+  await writeFile(
+    path,
+    `import path from "node:path"\nimport { Effect } from ${JSON.stringify(pathToFileURL(effectPath).href)}\nconst unique = (values) => [...new Set(values)]\nconst Flag = { OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR, OPENCODE_DISABLE_PROJECT_CONFIG: process.env.OPENCODE_DISABLE_PROJECT_CONFIG === "true" }\nconst Global = { Path: { config: path.join(process.env.XDG_CONFIG_HOME, "opencode"), home: process.env.OPENCODE_TEST_HOME ?? process.env.HOME } }\nconst FSUtil = { Service: Effect.succeed({ up: () => Effect.succeed([]) }) }\n${extracted}\nexport { Effect }\n`,
+  )
   return import(pathToFileURL(path).href)
 }
 
@@ -269,6 +374,17 @@ function digest(path: string): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  const desktopEnvironmentRequestIndex = Bun.argv.indexOf("--desktop-environment-request")
+  if (
+    desktopEnvironmentRequestIndex >= 0 &&
+    typeof Bun.argv[desktopEnvironmentRequestIndex + 1] === "string"
+  ) {
+    const request = JSON.parse(
+      await readFile(Bun.argv[desktopEnvironmentRequestIndex + 1] as string, "utf8"),
+    ) as OpenCodeDesktopEnvironmentProofRequest
+    await runOpenCode11821DesktopEnvironmentProof(request)
+    return
+  }
   const requestIndex = Bun.argv.indexOf("--request")
   if (requestIndex < 0 || typeof Bun.argv[requestIndex + 1] !== "string") {
     throw new Error("Canonical OpenCode host proof requires --request")

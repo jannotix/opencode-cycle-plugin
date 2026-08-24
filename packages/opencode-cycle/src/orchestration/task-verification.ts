@@ -1,9 +1,9 @@
-import { execFile } from "node:child_process"
+import { execFile, spawn as spawnChildProcess } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Readable } from "node:stream"
 import { promisify } from "node:util"
-import { spawn } from "bun"
 
 import type { ArchitecturePlanInput } from "../client.js"
 
@@ -164,16 +164,36 @@ async function runVerificationCommand(
 }
 
 function spawnVerificationProcess(directory: string, tool: string, args: readonly string[]) {
-  return spawn({
-    cmd: [tool, ...args],
+  const child = spawnChildProcess(tool, [...args], {
     cwd: directory,
     detached: true,
     env: verificationEnvironment(),
-    stdin: "ignore",
-    stderr: "pipe",
-    stdout: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   })
+  if (child.pid === undefined || child.stdout === null || child.stderr === null) {
+    child.once("error", () => undefined)
+    throw new Error("Verification process failed to start")
+  }
+  const exited = new Promise<number>((resolve) => {
+    let settled = false
+    const finish = (code: number): void => {
+      if (settled) return
+      settled = true
+      resolve(code)
+    }
+    child.once("error", () => finish(1))
+    child.once("exit", (code) => finish(code ?? 1))
+  })
+  return {
+    exited,
+    get exitCode() { return child.exitCode },
+    kill(signal?: NodeJS.Signals | number) { return child.kill(signal) },
+    pid: child.pid,
+    get signalCode() { return child.signalCode },
+    stderr: child.stderr,
+    stdout: child.stdout,
+  }
 }
 
 type VerificationProcess = ReturnType<typeof spawnVerificationProcess>
@@ -195,14 +215,11 @@ async function terminateProcessTree(child: VerificationProcess): Promise<void> {
 
 async function terminateWindowsProcessTree(child: VerificationProcess): Promise<void> {
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
-  const killer = spawn({
-    cmd: [join(systemRoot, "System32", "taskkill.exe"), "/PID", String(child.pid), "/T", "/F"],
-    env: verificationEnvironment(),
-    stdin: "ignore",
-    stderr: "ignore",
-    stdout: "ignore",
-    windowsHide: true,
-  })
+  const killer = spawnVerificationProcess(
+    process.cwd(),
+    join(systemRoot, "System32", "taskkill.exe"),
+    ["/PID", String(child.pid), "/T", "/F"],
+  )
   if (!(await waitForExit(killer.exited, TERMINATION_LIMIT_MILLIS))) {
     killer.kill()
     if (!(await waitForExit(killer.exited, TERMINATION_GRACE_MILLIS))) {
@@ -321,18 +338,16 @@ function failedCommandReceipt(
 }
 
 async function capture(
-  stream: ReadableStream<Uint8Array>,
+  stream: Readable,
   limit: number,
   onLimit: () => void,
 ): Promise<{ readonly digest: string; readonly preview: string }> {
   const hash = createHash("sha256")
   const decoder = new TextDecoder()
-  const reader = stream.getReader()
   let bytes = 0
   let preview = ""
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
+  for await (const chunk of stream) {
+    const value = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk)
     const remaining = Math.max(0, limit - bytes)
     const bounded = value.byteLength <= remaining ? value : value.slice(0, remaining)
     if (bounded.byteLength !== 0) {
