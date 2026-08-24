@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto"
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -20,9 +20,13 @@ import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } f
 const root = fileURLToPath(new URL("../../", import.meta.url))
 const packageRoot = join(root, "packages", PRODUCT_IDENTITY.mainPackage)
 const scratch = await mkdtemp(join(tmpdir(), "opencode-cycle-packed-plugin-"))
+const launcherTemporary = await mkdtemp(join(tmpdir(), "opencode-cycle-host-launcher-"))
+const launcher = join(launcherTemporary, "launcher.ts")
+const launcherStop = join(launcherTemporary, "stop")
 const extracted = join(scratch, "extracted")
 const nativeArtifacts = join(scratch, "native")
 const secondPack = join(scratch, "second-pack")
+let proof: ReturnType<typeof Bun.spawn> | undefined
 
 async function run(command: string[], cwd: string): Promise<string> {
   const child = Bun.spawn(command, { cwd, stderr: "inherit", stdout: "pipe" })
@@ -34,6 +38,20 @@ async function run(command: string[], cwd: string): Promise<string> {
 await mkdir(extracted, { recursive: true })
 await mkdir(secondPack, { recursive: true })
 try {
+  await writeFile(launcher, `
+import { access } from "node:fs/promises"
+const [cwd, stop, ...command] = Bun.argv.slice(2)
+if (!cwd || !stop || command.length === 0) throw new Error("launcher arguments are missing")
+const child = Bun.spawn(command, { cwd, env: process.env, stderr: "ignore", stdout: "ignore" })
+while (child.exitCode === null) {
+  if (await access(stop).then(() => true, () => false)) {
+    child.kill()
+    break
+  }
+  await Bun.sleep(25)
+}
+process.exit(await child.exited)
+`)
   const nativeTarget = `${process.platform}-${process.arch}` as NativeTarget
   const executable = process.platform === "win32" ? "workflowd.exe" : "workflowd"
   const native = await packageNative(
@@ -85,6 +103,14 @@ try {
     startedAtUnixMillis: Date.now(),
   }
   const environment = certificationEnvironment(scratch, platform, process.env, binding)
+  await Promise.all([
+    mkdir(environment.HOME as string, { recursive: true }),
+    mkdir(environment.TMPDIR as string, { recursive: true }),
+    mkdir(environment.XDG_CACHE_HOME as string, { recursive: true }),
+    mkdir(environment.XDG_CONFIG_HOME as string, { recursive: true }),
+    mkdir(environment.XDG_DATA_HOME as string, { recursive: true }),
+    mkdir(environment.XDG_STATE_HOME as string, { recursive: true }),
+  ])
   const prepared = await prepareDesktopCertificationLoad({
     certification: binding,
     dataDirectory,
@@ -97,19 +123,40 @@ try {
   })
   const proofRequest = join(scratch, "host-proof-request.json")
   const proofResult = join(scratch, "host-proof-result.json")
+  const proofRelease = join(certificationRoot, "host-proof-release")
   await writeFile(proofRequest, `${JSON.stringify({
     binding,
     candidatePackageRoot: prepared.installedPlugin,
     configFile: prepared.configFile,
     directory: project,
+    releaseFile: proofRelease,
     resultFile: proofResult,
     worktree: project,
   })}\n`)
-  const proof = Bun.spawn(
-    [process.execPath, join(root, "scripts", "ci", "opencode-1.18.21-host-proof.ts"), "--request", proofRequest],
-    { cwd: scratch, env: environment, stderr: "ignore", stdout: "ignore" },
+  proof = Bun.spawn(
+    [
+      process.execPath,
+      launcher,
+      scratch,
+      launcherStop,
+      process.execPath,
+      join(root, "scripts", "ci", "opencode-1.18.21-host-proof.ts"),
+      "--request",
+      proofRequest,
+    ],
+    { cwd: root, env: environment, stderr: "ignore", stdout: "ignore" },
   )
-  if ((await proof.exited) !== 0) throw new Error("Packed plugin failed the OpenCode 1.18.21 host proof")
+  let proofReady = false
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    proofReady = await access(proofResult).then(() => true, () => false)
+    if (proofReady) break
+    await Bun.sleep(50)
+  }
+  if (!proofReady) {
+    await writeFile(launcherStop, "stop\n", { flag: "wx" })
+    await proof.exited
+    throw new Error("Packed plugin failed the OpenCode 1.18.21 host proof")
+  }
   const hostReceipt = JSON.parse(await readFile(proofResult, "utf8")) as OpenCodeHostProofReceipt
   if (
     hostReceipt.provenanceCommit !== OPENCODE_11821_HOST_PROOF_PROVENANCE.commit ||
@@ -118,14 +165,17 @@ try {
     hostReceipt.loadedPlugins !== 1 ||
     !hostReceipt.tupleOptions
   ) throw new Error("Packed plugin host proof receipt is invalid")
-  await waitForDesktopActivation(certificationRoot, binding, 5_000)
+  const activation = await waitForDesktopActivation(certificationRoot, binding, 5_000)
   const cleanup = await cleanupCertifiedDaemon({
     binding,
-    environment,
+    dataDirectory,
     expectedBinaryPath: join(prepared.installedPlugin, "bin", executable),
+    expectedDaemon: activation.marker.daemon,
     platform,
   })
   if (!cleanup.markerPublished) throw new Error("Packed plugin did not publish daemon ownership")
+  await writeFile(proofRelease, "release\n", { flag: "wx" })
+  if ((await proof.exited) !== 0) throw new Error("OpenCode 1.18.21 host proof exited after cleanup")
   await completeDesktopDaemonCleanupDiagnostic(prepared.diagnosticsFile, binding, "passed")
   const diagnostics = await desktopLoadDiagnosticSummary(certificationRoot, binding)
   if (
@@ -135,7 +185,19 @@ try {
     throw new Error("Packed plugin host proof diagnostics are incomplete")
   }
 } finally {
-  await rm(scratch, { force: true, recursive: true })
+  if (proof !== undefined && proof.exitCode === null) {
+    const release = join(scratch, "certification", "host-proof-release")
+    await writeFile(release, "release\n", { flag: "wx" }).catch(() => undefined)
+    await Promise.race([proof.exited, Bun.sleep(2_000)])
+    if (proof.exitCode === null) {
+      await writeFile(launcherStop, "stop\n", { flag: "wx" }).catch(() => undefined)
+      await proof.exited
+    }
+  }
+  await Promise.all([
+    rm(scratch, { force: true, recursive: true }),
+    rm(launcherTemporary, { force: true, recursive: true }),
+  ])
 }
 
 async function digest(path: string): Promise<string> {

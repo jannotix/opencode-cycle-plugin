@@ -277,6 +277,11 @@ pub enum ClientMessage {
     Health {
         request_id: u64,
     },
+    Shutdown {
+        owner_token: String,
+        request_id: u64,
+        run_digest: String,
+    },
     FreezeCandidate {
         base_revision: String,
         candidate_id: CandidateId,
@@ -397,6 +402,12 @@ pub enum ServerMessage {
     Health {
         request_id: u64,
         report: HealthReport,
+    },
+    Shutdown {
+        pid: u32,
+        process_start_time_unix_millis: u64,
+        request_id: u64,
+        run_digest: String,
     },
     History {
         request_id: u64,

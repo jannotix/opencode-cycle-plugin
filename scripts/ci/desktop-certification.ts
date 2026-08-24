@@ -1,12 +1,12 @@
 import { randomBytes } from "node:crypto"
 import { createWriteStream } from "node:fs"
 import {
-  appendFile,
   chmod,
   copyFile,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   realpath,
   readdir,
@@ -26,6 +26,7 @@ import {
   parseDesktopActivationMarker,
   type DesktopActivationMarker,
   type DesktopCertificationBinding,
+  type DesktopDaemonIdentity,
 } from "../../packages/opencode-cycle/src/certification.js"
 
 import {
@@ -350,6 +351,7 @@ async function main(): Promise<void> {
   let desktopProfile: string | undefined
   let preparedLoad: PreparedDesktopCertificationLoad | undefined
   let receiptEvidence: Record<string, unknown> | undefined
+  let activationDaemon: DesktopDaemonIdentity | undefined
   let daemonCleanup: CertifiedDaemonCleanup | undefined
   let loadDiagnosticsEvidence: { readonly bytes: number; readonly sha256: string } | undefined
   let windowsProtocol: WindowsProtocolRegistration | undefined
@@ -461,6 +463,7 @@ async function main(): Promise<void> {
     const activation = await withDesktopLogs(() =>
       waitForDesktopActivation(certificationRoot, certification, 120_000),
     )
+    activationDaemon = activation.marker.daemon
 
     receiptEvidence = {
       activationCreatedAtUnixMillis: activation.marker.createdAtUnixMillis,
@@ -470,6 +473,7 @@ async function main(): Promise<void> {
       activationNonce: activation.marker.nonce,
       activationPluginPackageSha256: activation.marker.pluginPackageSha256,
       activationRevision: activation.marker.revision,
+      activationRunDigest: activation.marker.runDigest,
       controlPlane: {
         productVersion: activation.marker.health.productVersion,
         protocolVersion: activation.marker.health.protocolVersion,
@@ -504,12 +508,13 @@ async function main(): Promise<void> {
       try {
         daemonCleanup = await cleanupCertifiedDaemon({
           binding: certification,
-          environment,
+          dataDirectory: join(scratch, "workflow-data"),
           expectedBinaryPath: join(
             preparedLoad.installedPlugin,
             "bin",
             options.platform === "windows-x64" ? "workflowd.exe" : "workflowd",
           ),
+          ...(activationDaemon === undefined ? {} : { expectedDaemon: activationDaemon }),
           platform: options.platform,
         })
         if (mainError === undefined && !daemonCleanup.markerPublished) {
@@ -569,9 +574,15 @@ async function main(): Promise<void> {
   }
   receiptEvidence.daemon = {
     binaryPathSha256: daemonCleanup.binaryPathSha256,
+    exitMarkerPublished: daemonCleanup.exitMarkerPublished,
     markerPublished: daemonCleanup.markerPublished,
+    parentPid: daemonCleanup.parentPid,
+    parentStartTimeUnixMillis: daemonCleanup.parentStartTimeUnixMillis,
     pid: daemonCleanup.pid,
     processAbsent: daemonCleanup.processAbsent,
+    processStartTimeUnixMillis: daemonCleanup.processStartTimeUnixMillis,
+    runDigest: daemonCleanup.runDigest,
+    shutdownAuthenticated: daemonCleanup.shutdownAuthenticated,
     startedAtUnixMillis: daemonCleanup.startedAtUnixMillis,
     startTokenSha256: daemonCleanup.startTokenSha256,
     terminated: daemonCleanup.terminated,
@@ -790,7 +801,7 @@ async function installPackedPluginTree(
     join(configDirectory, "opencode.json"),
     environmentBindingsForLoader(environment),
   )
-  const loader = `import { appendFileSync, readFileSync, statSync } from "node:fs"
+  const loader = `import { closeSync, fsyncSync, openSync, readFileSync, statSync, writeSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -848,13 +859,17 @@ export default async function OpenCodeCyclePlugin(input, options) {
   }
   recordDesktopLoadDiagnostic("plugin_entry_completed", "passed")
   try {
-    const daemon = statSync(join(expectedPluginOptions.certification.root, "desktop-daemon.json"))
+    const daemon = statSync(join(expectedPluginOptions.certification.root, "desktop-daemon-runtime.json"))
     if (!daemon.isFile() || daemon.size < 1 || daemon.size > 64 * 1024) throw new Error("daemon marker")
   } catch {
     recordDesktopLoadDiagnostic("daemon_identity_published", "failed")
     throw new Error("Cycle candidate daemon identity was not published")
   }
   recordDesktopLoadDiagnostic("daemon_identity_published", "passed")
+  if (typeof OpenCodeCycle.finalizeDesktopCertification !== "function") {
+    throw new Error("Cycle candidate finalizer is unavailable")
+  }
+  await OpenCodeCycle.finalizeDesktopCertification(hooks, desktopLoadDiagnosticsFile)
   return hooks
 }
 `
@@ -918,18 +933,21 @@ function recordDesktopLoadDiagnostic(stage, status) {
   if (desktopLoadDiagnosticStages[sequence] !== stage || (status !== "passed" && status !== "failed")) {
     throw new Error("Desktop load transcript transition is invalid")
   }
-  appendFileSync(
-    desktopLoadDiagnosticsFile,
-    JSON.stringify({
-      runDigest: desktopLoadDiagnosticRunDigest,
-      schemaVersion: 2,
-      sequence,
-      stage,
-      status,
-      type: ${JSON.stringify(DESKTOP_LOAD_DIAGNOSTIC_TYPE)},
-    }) + "\\n",
-    { encoding: "utf8", flag: "a", mode: 0o600 },
-  )
+  const line = JSON.stringify({
+    runDigest: desktopLoadDiagnosticRunDigest,
+    schemaVersion: 2,
+    sequence,
+    stage,
+    status,
+    type: ${JSON.stringify(DESKTOP_LOAD_DIAGNOSTIC_TYPE)},
+  }) + "\\n"
+  const handle = openSync(desktopLoadDiagnosticsFile, "a", 0o600)
+  try {
+    writeSync(handle, line, undefined, "utf8")
+    fsyncSync(handle)
+  } finally {
+    closeSync(handle)
+  }
 }
 `
 }
@@ -1028,7 +1046,13 @@ async function appendDesktopLoadDiagnostic(
     status,
     type: DESKTOP_LOAD_DIAGNOSTIC_TYPE,
   }
-  await appendFile(diagnosticsFile, `${JSON.stringify(diagnostic)}\n`, { encoding: "utf8", mode: 0o600 })
+  const handle = await open(diagnosticsFile, "a", 0o600)
+  try {
+    await handle.writeFile(`${JSON.stringify(diagnostic)}\n`, "utf8")
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
 }
 
 export async function completeDesktopDaemonCleanupDiagnostic(

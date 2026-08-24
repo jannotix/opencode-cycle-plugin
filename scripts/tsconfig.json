@@ -10,5 +10,6 @@
     "target": "ES2024",
     "types": ["bun", "node"]
   },
-  "include": ["**/*.ts"]
+  "include": ["**/*.ts"],
+  "exclude": ["ci/fixtures/opencode-1.18.21/**"]
 }

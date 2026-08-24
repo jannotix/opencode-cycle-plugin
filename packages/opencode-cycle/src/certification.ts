@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
 import { open, lstat, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises"
-import { isAbsolute, join, resolve } from "node:path"
+import { isAbsolute, join, relative, resolve, sep } from "node:path"
 
-import type { ControlPlaneHealth, OwnedProcessIdentity } from "./client.js"
+import type { ControlPlaneHealth } from "./client.js"
 
 const FULL_REVISION = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 const SHA256 = /^[0-9a-f]{64}$/u
@@ -36,20 +36,24 @@ export interface DesktopActivationMarker {
 
 export interface DesktopDaemonIdentity {
   readonly binaryPath: string
+  readonly parentPid: number
+  readonly parentStartTimeUnixMillis: number
   readonly pid: number
+  readonly processStartTimeUnixMillis: number
   readonly startToken: string
   readonly startedAtUnixMillis: number
 }
 
-export interface DesktopDaemonMarker {
+export interface DesktopDaemonRuntimeMarker {
   readonly daemon: DesktopDaemonIdentity
-  readonly nativePackageSha256: string
-  readonly nonce: string
-  readonly pluginPackageSha256: string
-  readonly revision: string
   readonly runDigest: string
   readonly schemaVersion: 1
-  readonly type: "opencode-cycle-desktop-daemon"
+  readonly type: "opencode-cycle-desktop-daemon-runtime"
+}
+
+export interface DesktopDaemonExitMarker extends Omit<DesktopDaemonRuntimeMarker, "type"> {
+  readonly stoppedAtUnixMillis: number
+  readonly type: "opencode-cycle-desktop-daemon-exit"
 }
 
 export function desktopCertificationBindingDigest(binding: DesktopCertificationBinding): string {
@@ -208,45 +212,70 @@ export function parseDesktopActivationMarker(value: unknown): DesktopActivationM
   return { ...marker, daemon } as unknown as DesktopActivationMarker
 }
 
-export function parseDesktopDaemonMarker(value: unknown): DesktopDaemonMarker {
+export function parseDesktopDaemonRuntimeMarker(value: unknown): DesktopDaemonRuntimeMarker {
   const marker = requireExactRecord(
     value,
-    [
-      "daemon",
-      "nativePackageSha256",
-      "nonce",
-      "pluginPackageSha256",
-      "revision",
-      "runDigest",
-      "schemaVersion",
-      "type",
-    ],
-    "Desktop daemon marker",
+    ["daemon", "runDigest", "schemaVersion", "type"],
+    "Desktop daemon runtime marker",
   )
   const daemon = parseDesktopDaemonIdentity(marker.daemon)
   if (
     marker.schemaVersion !== 1 ||
-    marker.type !== "opencode-cycle-desktop-daemon" ||
-    typeof marker.nonce !== "string" ||
-    !SHA256.test(marker.nonce) ||
-    typeof marker.revision !== "string" ||
-    !FULL_REVISION.test(marker.revision) ||
-    typeof marker.pluginPackageSha256 !== "string" ||
-    !SHA256.test(marker.pluginPackageSha256) ||
-    typeof marker.nativePackageSha256 !== "string" ||
-    !SHA256.test(marker.nativePackageSha256) ||
+    marker.type !== "opencode-cycle-desktop-daemon-runtime" ||
     typeof marker.runDigest !== "string" ||
     !SHA256.test(marker.runDigest)
-  ) {
-    throw new Error("Desktop daemon marker is invalid")
+  ) throw new Error("Desktop daemon runtime marker is invalid")
+  return { ...marker, daemon } as unknown as DesktopDaemonRuntimeMarker
+}
+
+export function parseDesktopDaemonExitMarker(value: unknown): DesktopDaemonExitMarker {
+  const marker = requireExactRecord(
+    value,
+    ["daemon", "runDigest", "schemaVersion", "stoppedAtUnixMillis", "type"],
+    "Desktop daemon exit marker",
+  )
+  const daemon = parseDesktopDaemonIdentity(marker.daemon)
+  if (
+    marker.schemaVersion !== 1 ||
+    marker.type !== "opencode-cycle-desktop-daemon-exit" ||
+    typeof marker.runDigest !== "string" ||
+    !SHA256.test(marker.runDigest) ||
+    typeof marker.stoppedAtUnixMillis !== "number" ||
+    !Number.isSafeInteger(marker.stoppedAtUnixMillis) ||
+    marker.stoppedAtUnixMillis < daemon.processStartTimeUnixMillis
+  ) throw new Error("Desktop daemon exit marker is invalid")
+  return { ...marker, daemon } as unknown as DesktopDaemonExitMarker
+}
+
+export async function readDesktopDaemonRuntimeMarker(
+  binding: DesktopCertificationBinding,
+): Promise<DesktopDaemonRuntimeMarker> {
+  await assertCertificationRoot(binding.root)
+  const path = join(binding.root, "desktop-daemon-runtime.json")
+  const details = await lstat(path)
+  if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || await realpath(path) !== path) {
+    throw new Error("Desktop daemon runtime marker is unsafe")
   }
-  return { ...marker, daemon } as unknown as DesktopDaemonMarker
+  const marker = parseDesktopDaemonRuntimeMarker(JSON.parse(await readFile(path, "utf8")) as unknown)
+  if (
+    marker.runDigest !== desktopCertificationBindingDigest(binding) ||
+    marker.daemon.startToken !== desktopCertificationProcessToken(binding)
+  ) throw new Error("Desktop daemon runtime marker does not match the certification run")
+  return marker
 }
 
 function parseDesktopDaemonIdentity(value: unknown): DesktopDaemonIdentity {
   const daemon = requireExactRecord(
     value,
-    ["binaryPath", "pid", "startToken", "startedAtUnixMillis"],
+    [
+      "binaryPath",
+      "parentPid",
+      "parentStartTimeUnixMillis",
+      "pid",
+      "processStartTimeUnixMillis",
+      "startToken",
+      "startedAtUnixMillis",
+    ],
     "Desktop daemon identity",
   )
   if (
@@ -254,9 +283,18 @@ function parseDesktopDaemonIdentity(value: unknown): DesktopDaemonIdentity {
     !isAbsolute(daemon.binaryPath) ||
     resolve(daemon.binaryPath) !== daemon.binaryPath ||
     daemon.binaryPath.includes("\0") ||
+    typeof daemon.parentPid !== "number" ||
+    !Number.isSafeInteger(daemon.parentPid) ||
+    daemon.parentPid < 1 ||
+    typeof daemon.parentStartTimeUnixMillis !== "number" ||
+    !Number.isSafeInteger(daemon.parentStartTimeUnixMillis) ||
+    daemon.parentStartTimeUnixMillis < 1 ||
     typeof daemon.pid !== "number" ||
     !Number.isSafeInteger(daemon.pid) ||
     daemon.pid < 1 ||
+    typeof daemon.processStartTimeUnixMillis !== "number" ||
+    !Number.isSafeInteger(daemon.processStartTimeUnixMillis) ||
+    daemon.processStartTimeUnixMillis < 1 ||
     typeof daemon.startToken !== "string" ||
     !SHA256.test(daemon.startToken) ||
     typeof daemon.startedAtUnixMillis !== "number" ||
@@ -269,7 +307,7 @@ function parseDesktopDaemonIdentity(value: unknown): DesktopDaemonIdentity {
 }
 
 function validateDesktopDaemonIdentity(
-  value: DesktopDaemonIdentity | OwnedProcessIdentity,
+  value: DesktopDaemonIdentity,
   binding: DesktopCertificationBinding,
 ): DesktopDaemonIdentity {
   const daemon = parseDesktopDaemonIdentity(value)
@@ -289,59 +327,6 @@ interface ActivationWriterHooks {
 
 const productionWriter = createDesktopActivationWriter({})
 
-export async function writeDesktopDaemonMarker(
-  binding: DesktopCertificationBinding,
-  identity: OwnedProcessIdentity,
-): Promise<DesktopDaemonMarker> {
-  await assertCertificationRoot(binding.root)
-  const marker: DesktopDaemonMarker = {
-    daemon: validateDesktopDaemonIdentity(identity, binding),
-    nativePackageSha256: binding.nativePackageSha256,
-    nonce: binding.nonce,
-    pluginPackageSha256: binding.pluginPackageSha256,
-    revision: binding.revision,
-    runDigest: desktopCertificationBindingDigest(binding),
-    schemaVersion: 1,
-    type: "opencode-cycle-desktop-daemon",
-  }
-  const path = join(binding.root, "desktop-daemon.json")
-  const existing = await readDesktopDaemonMarker(path)
-  if (existing !== undefined) {
-    if (JSON.stringify(existing) !== JSON.stringify(marker)) {
-      throw new Error("Desktop daemon marker exists with another binding")
-    }
-    return existing
-  }
-  const temporary = join(binding.root, `.desktop-daemon.${randomUUID()}.tmp`)
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(temporary, "wx", 0o600)
-    await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8")
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(temporary, path)
-    return marker
-  } finally {
-    if (handle !== undefined) await handle.close().catch(() => undefined)
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error
-    })
-  }
-}
-
-async function readDesktopDaemonMarker(path: string): Promise<DesktopDaemonMarker | undefined> {
-  const details = await lstat(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined
-    throw error
-  })
-  if (details === undefined) return undefined
-  if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || await realpath(path) !== path) {
-    throw new Error("Desktop daemon marker exists as an unsafe file")
-  }
-  return parseDesktopDaemonMarker(JSON.parse(await readFile(path, "utf8")) as unknown)
-}
-
 export function writeDesktopActivationMarker(
   binding: DesktopCertificationBinding,
   health: ControlPlaneHealth,
@@ -349,6 +334,84 @@ export function writeDesktopActivationMarker(
   now: () => number = Date.now,
 ): Promise<DesktopActivationMarker> {
   return productionWriter(binding, health, daemon, now)
+}
+
+export async function finalizeDesktopActivation(
+  binding: DesktopCertificationBinding,
+  health: ControlPlaneHealth,
+  daemon: DesktopDaemonIdentity,
+  diagnosticsFile: string,
+): Promise<DesktopActivationMarker> {
+  const expectedStages = [
+    "certification_env_prepared",
+    "config_tree_prepared",
+    "config_path_discovered",
+    "plugin_specifier_resolved",
+    "effective_env_validated",
+    "candidate_module_resolved",
+    "plugin_entry_started",
+    "plugin_entry_completed",
+    "daemon_identity_published",
+  ]
+  await assertCertificationRoot(binding.root)
+  const resolvedDiagnostics = resolve(diagnosticsFile)
+  const diagnosticsRelative = relative(binding.root, resolvedDiagnostics)
+  if (
+    !isAbsolute(diagnosticsFile) ||
+    resolvedDiagnostics !== diagnosticsFile ||
+    diagnosticsRelative === "" ||
+    diagnosticsRelative === ".." ||
+    diagnosticsRelative.startsWith(`..${sep}`) ||
+    isAbsolute(diagnosticsRelative)
+  ) throw new Error("Desktop finalization diagnostics path is invalid")
+  const details = await lstat(diagnosticsFile)
+  if (
+    !details.isFile() ||
+    details.isSymbolicLink() ||
+    details.nlink !== 1 ||
+    details.size > 64 * 1024 ||
+    await realpath(diagnosticsFile) !== diagnosticsFile
+  ) {
+    throw new Error("Desktop finalization diagnostics file is unsafe")
+  }
+  const lines = (await readFile(diagnosticsFile, "utf8")).split("\n").filter(Boolean)
+  if (lines.length !== expectedStages.length) throw new Error("Desktop finalization transcript is incomplete")
+  for (let sequence = 0; sequence < lines.length; sequence += 1) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(lines[sequence] as string) as unknown
+    } catch {
+      throw new Error("Desktop finalization transcript is invalid")
+    }
+    const record = requireExactRecord(
+      parsed,
+      ["runDigest", "schemaVersion", "sequence", "stage", "status", "type"],
+      "Desktop finalization transcript",
+    )
+    if (
+      record.runDigest !== desktopCertificationBindingDigest(binding) ||
+      record.schemaVersion !== 2 ||
+      record.sequence !== sequence ||
+      record.stage !== expectedStages[sequence] ||
+      record.status !== "passed" ||
+      record.type !== "opencode-cycle-desktop-load-diagnostic"
+    ) throw new Error("Desktop finalization transcript is invalid")
+  }
+  const runtime = await readDesktopDaemonRuntimeMarker(binding)
+  if (!sameDesktopDaemonIdentity(runtime.daemon, daemon)) {
+    throw new Error("Desktop finalization daemon identity mismatch")
+  }
+  return writeDesktopActivationMarker(binding, health, daemon)
+}
+
+function sameDesktopDaemonIdentity(left: DesktopDaemonIdentity, right: DesktopDaemonIdentity): boolean {
+  return left.binaryPath === right.binaryPath &&
+    left.parentPid === right.parentPid &&
+    left.parentStartTimeUnixMillis === right.parentStartTimeUnixMillis &&
+    left.pid === right.pid &&
+    left.processStartTimeUnixMillis === right.processStartTimeUnixMillis &&
+    left.startToken === right.startToken &&
+    left.startedAtUnixMillis === right.startedAtUnixMillis
 }
 
 export function createDesktopActivationWriterForTests(

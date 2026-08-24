@@ -1,10 +1,14 @@
 use std::{
+    fs::OpenOptions,
+    io::Write,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
+use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncWrite};
 use workflow_ipc::{
     ClientMessage, IpcRequest, IpcResponse, ServerMessage, auth::Authenticator,
@@ -17,6 +21,54 @@ use crate::health::health_report;
 
 type DaemonError = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Clone, Debug)]
+pub struct CertificationLifecycle {
+    pub exit_marker: PathBuf,
+    pub owner_token: String,
+    pub run_digest: String,
+    pub runtime_marker: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificationProcessIdentity {
+    binary_path: PathBuf,
+    parent_pid: u32,
+    parent_start_time_unix_millis: u64,
+    pid: u32,
+    process_start_time_unix_millis: u64,
+    start_token: String,
+    started_at_unix_millis: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeMarker<'a> {
+    daemon: &'a CertificationProcessIdentity,
+    run_digest: &'a str,
+    schema_version: u8,
+    #[serde(rename = "type")]
+    marker_type: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExitMarker<'a> {
+    daemon: &'a CertificationProcessIdentity,
+    run_digest: &'a str,
+    schema_version: u8,
+    stopped_at_unix_millis: i64,
+    #[serde(rename = "type")]
+    marker_type: &'static str,
+}
+
+#[derive(Clone)]
+struct ShutdownContext {
+    identity: CertificationProcessIdentity,
+    lifecycle: CertificationLifecycle,
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
 struct SharedRuntime {
     admission: Arc<tokio::sync::Mutex<crate::admission::RuntimeAdmission>>,
     checkpoint_key: Arc<CheckpointKey>,
@@ -27,9 +79,27 @@ struct SharedRuntime {
     worktrees: Arc<PathBuf>,
 }
 
-pub async fn run(data_directory: impl AsRef<Path>) -> Result<(), DaemonError> {
+pub async fn run(
+    data_directory: impl AsRef<Path>,
+    certification: Option<CertificationLifecycle>,
+) -> Result<(), DaemonError> {
     let paths = RuntimePaths::new(data_directory.as_ref());
     std::fs::create_dir_all(&paths.runtime)?;
+    let certification_identity = certification
+        .as_ref()
+        .map(certification_identity)
+        .transpose()?;
+    if let (Some(lifecycle), Some(identity)) = (&certification, &certification_identity) {
+        write_json_atomic(
+            &lifecycle.runtime_marker,
+            &RuntimeMarker {
+                daemon: identity,
+                run_digest: &lifecycle.run_digest,
+                schema_version: 1,
+                marker_type: "opencode-cycle-desktop-daemon-runtime",
+            },
+        )?;
+    }
     let secret = load_or_create(&paths.secret)?;
     let store = Store::open(
         &paths.database,
@@ -62,15 +132,152 @@ pub async fn run(data_directory: impl AsRef<Path>) -> Result<(), DaemonError> {
         format!("{}\n", std::process::id()),
     )?;
 
+    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::watch::channel(false);
+    let parent_monitor = certification_identity.as_ref().map(|identity| {
+        let identity = identity.clone();
+        let sender = shutdown_sender.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let check = identity.clone();
+                let alive =
+                    tokio::task::spawn_blocking(move || certification_parent_is_alive(&check))
+                        .await
+                        .unwrap_or(false);
+                if !alive {
+                    let _ = sender.send(true);
+                    break;
+                }
+            }
+        })
+    });
     loop {
-        let stream = listener.accept().await?;
+        let stream = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            changed = shutdown_receiver.changed() => {
+                changed?;
+                if *shutdown_receiver.borrow() { break; }
+                continue;
+            }
+        };
         let authenticator = Arc::clone(&authenticator);
         let report = report.clone();
         let shared = Arc::clone(&shared);
+        let shutdown = certification
+            .as_ref()
+            .zip(certification_identity.as_ref())
+            .map(|(lifecycle, identity)| ShutdownContext {
+                identity: identity.clone(),
+                lifecycle: lifecycle.clone(),
+                sender: shutdown_sender.clone(),
+            });
         tokio::spawn(async move {
-            let _ = serve_connection(stream, authenticator, report, shared).await;
+            let _ = serve_connection(stream, authenticator, report, shared, shutdown).await;
         });
     }
+    if let Some(parent_monitor) = parent_monitor {
+        parent_monitor.abort();
+        let _ = parent_monitor.await;
+    }
+    if let (Some(lifecycle), Some(identity)) = (&certification, &certification_identity) {
+        write_json_atomic(
+            &lifecycle.exit_marker,
+            &ExitMarker {
+                daemon: identity,
+                run_digest: &lifecycle.run_digest,
+                schema_version: 1,
+                stopped_at_unix_millis: now_unix_millis()?,
+                marker_type: "opencode-cycle-desktop-daemon-exit",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn certification_parent_is_alive(identity: &CertificationProcessIdentity) -> bool {
+    process_instance_is_alive(identity.parent_pid, identity.parent_start_time_unix_millis)
+}
+
+fn process_instance_is_alive(pid: u32, process_start_time_unix_millis: u64) -> bool {
+    let system = System::new_all();
+    system
+        .process(sysinfo::Pid::from_u32(pid))
+        .is_some_and(|parent| {
+            parent.start_time().saturating_mul(1_000) == process_start_time_unix_millis
+        })
+}
+
+pub async fn wait_for_certification_instance_exit(
+    pid: u32,
+    process_start_time_unix_millis: u64,
+    timeout: Duration,
+) -> Result<(), DaemonError> {
+    if pid == 0 || process_start_time_unix_millis == 0 || timeout.is_zero() {
+        return Err("certification process identity is invalid".into());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let alive = tokio::task::spawn_blocking(move || {
+            process_instance_is_alive(pid, process_start_time_unix_millis)
+        })
+        .await?;
+        if !alive {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("certification daemon instance did not exit".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn certification_identity(
+    lifecycle: &CertificationLifecycle,
+) -> Result<CertificationProcessIdentity, DaemonError> {
+    let system = System::new_all();
+    let pid = sysinfo::get_current_pid()?;
+    let process = system
+        .process(pid)
+        .ok_or("workflowd process identity is unavailable")?;
+    let parent_pid = process
+        .parent()
+        .ok_or("workflowd parent identity is unavailable")?;
+    let parent = system
+        .process(parent_pid)
+        .ok_or("workflowd parent process identity is unavailable")?;
+    let binary_path = process
+        .exe()
+        .ok_or("workflowd executable identity is unavailable")?
+        .canonicalize()?;
+    Ok(CertificationProcessIdentity {
+        binary_path,
+        parent_pid: parent_pid.as_u32(),
+        parent_start_time_unix_millis: parent.start_time().saturating_mul(1_000),
+        pid: pid.as_u32(),
+        process_start_time_unix_millis: process.start_time().saturating_mul(1_000),
+        start_token: lifecycle.owner_token.clone(),
+        started_at_unix_millis: process.start_time().saturating_mul(1_000),
+    })
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), DaemonError> {
+    let parent = path
+        .parent()
+        .ok_or("certification marker parent is unavailable")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(value)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 async fn serve_connection<S>(
@@ -78,6 +285,7 @@ async fn serve_connection<S>(
     authenticator: Arc<tokio::sync::Mutex<Authenticator>>,
     report: workflow_ipc::HealthReport,
     shared: Arc<SharedRuntime>,
+    shutdown: Option<ShutdownContext>,
 ) -> Result<(), DaemonError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -384,6 +592,46 @@ where
                             .await?;
                     }
                 }
+            }
+            ClientMessage::Shutdown {
+                owner_token,
+                request_id,
+                run_digest,
+            } => {
+                let Some(shutdown) = shutdown.as_ref() else {
+                    channel
+                        .send(&ServerMessage::Error {
+                            request_id: Some(request_id),
+                            code: "shutdown_unavailable".to_owned(),
+                            message: "certification shutdown is unavailable".to_owned(),
+                        })
+                        .await?;
+                    continue;
+                };
+                if owner_token != shutdown.lifecycle.owner_token
+                    || run_digest != shutdown.lifecycle.run_digest
+                {
+                    channel
+                        .send(&ServerMessage::Error {
+                            request_id: Some(request_id),
+                            code: "shutdown_binding_mismatch".to_owned(),
+                            message: "certification shutdown binding mismatch".to_owned(),
+                        })
+                        .await?;
+                    continue;
+                }
+                channel
+                    .send(&ServerMessage::Shutdown {
+                        pid: shutdown.identity.pid,
+                        process_start_time_unix_millis: shutdown
+                            .identity
+                            .process_start_time_unix_millis,
+                        request_id,
+                        run_digest: shutdown.lifecycle.run_digest.clone(),
+                    })
+                    .await?;
+                let _ = shutdown.sender.send(true);
+                return Ok(());
             }
             ClientMessage::Health { request_id } => {
                 channel
@@ -2657,7 +2905,31 @@ mod tests {
     use workflow_ipc::AdmissionOperation;
     use workflow_store::Store;
 
-    use super::{admission_allowed, validate_task_binding_then_reacquire};
+    use super::{
+        CertificationLifecycle, admission_allowed, certification_identity,
+        certification_parent_is_alive, validate_task_binding_then_reacquire,
+    };
+
+    #[test]
+    fn certification_parent_contract_rejects_reused_parent_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        let lifecycle = CertificationLifecycle {
+            exit_marker: directory.path().join("exit.json"),
+            owner_token: "a".repeat(64),
+            run_digest: "b".repeat(64),
+            runtime_marker: directory.path().join("runtime.json"),
+        };
+        let identity = certification_identity(&lifecycle).unwrap();
+        assert!(certification_parent_is_alive(&identity));
+        assert!(!certification_parent_is_alive(
+            &super::CertificationProcessIdentity {
+                parent_start_time_unix_millis: identity
+                    .parent_start_time_unix_millis
+                    .saturating_add(1_000),
+                ..identity
+            }
+        ));
+    }
 
     #[test]
     fn terminal_and_suspended_workflows_cannot_reenter_admission() {

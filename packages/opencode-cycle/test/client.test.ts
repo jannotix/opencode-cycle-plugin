@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test"
 import { Socket } from "node:net"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-import { ControlPlaneError, nativePackageName, resolveDataDirectory } from "../src/client.js"
+import { ControlPlaneError, LocalControlPlane, nativePackageName, resolveDataDirectory } from "../src/client.js"
 import {
   connectIpcSocket,
   IpcFrameReader,
@@ -577,4 +579,22 @@ test("selects only certified native packages", () => {
   expect(() => nativePackageName("darwin", "arm64")).toThrow(ControlPlaneError)
   expect(() => nativePackageName("linux", "arm64")).toThrow(ControlPlaneError)
   expect(() => nativePackageName("freebsd", "x64")).toThrow(ControlPlaneError)
+})
+
+test("certification lifecycle options require one complete distinct absolute binding", () => {
+  const root = join(tmpdir(), "opencode-cycle-client-certification-binding")
+  const runtime = join(root, "runtime.json")
+  const exit = join(root, "exit.json")
+  const complete = {
+    dataDirectory: join(root, "data"),
+    processExitMarkerPath: exit,
+    processOwnerToken: "a".repeat(64),
+    processRunDigest: "b".repeat(64),
+    processRuntimeMarkerPath: runtime,
+    stopOwnedProcessOnDispose: true,
+  }
+  expect(() => new LocalControlPlane(complete)).not.toThrow()
+  expect(() => new LocalControlPlane({ ...complete, processRunDigest: undefined })).toThrow("binding")
+  expect(() => new LocalControlPlane({ ...complete, processRuntimeMarkerPath: "relative" })).toThrow("binding")
+  expect(() => new LocalControlPlane({ ...complete, processExitMarkerPath: runtime })).toThrow("binding")
 })

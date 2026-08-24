@@ -193,6 +193,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "activationNonce",
         "activationPluginPackageSha256",
         "activationRevision",
+        "activationRunDigest",
         "controlPlane",
         "daemon",
         "desktop",
@@ -219,9 +220,15 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       evidence.daemon,
       [
         "binaryPathSha256",
+        "exitMarkerPublished",
         "markerPublished",
+        "parentPid",
+        "parentStartTimeUnixMillis",
         "pid",
         "processAbsent",
+        "processStartTimeUnixMillis",
+        "runDigest",
+        "shutdownAuthenticated",
         "startedAtUnixMillis",
         "startTokenSha256",
         "terminated",
@@ -239,6 +246,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       typeof evidence.activationLogSha256 !== "string" ||
       typeof evidence.activationNonce !== "string" ||
       typeof evidence.activationRevision !== "string" ||
+      typeof evidence.activationRunDigest !== "string" ||
       typeof evidence.activationPluginPackageSha256 !== "string" ||
       typeof evidence.activationNativePackageSha256 !== "string" ||
       typeof evidence.activationCreatedAtUnixMillis !== "number" ||
@@ -253,18 +261,33 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       desktop.sha256 !== asset.sha256 ||
       desktop.size !== asset.size ||
       desktop.profileIsolation !== "fresh-isolated-certification-root" ||
+      daemon.exitMarkerPublished !== true ||
       daemon.markerPublished !== true ||
       daemon.processAbsent !== true ||
       typeof daemon.terminated !== "boolean" ||
+      typeof daemon.shutdownAuthenticated !== "boolean" ||
+      daemon.terminated !== daemon.shutdownAuthenticated ||
+      typeof daemon.parentPid !== "number" ||
+      !Number.isSafeInteger(daemon.parentPid) ||
+      daemon.parentPid < 1 ||
+      typeof daemon.parentStartTimeUnixMillis !== "number" ||
+      !Number.isSafeInteger(daemon.parentStartTimeUnixMillis) ||
+      daemon.parentStartTimeUnixMillis < 1 ||
       typeof daemon.pid !== "number" ||
       !Number.isSafeInteger(daemon.pid) ||
       daemon.pid < 1 ||
+      typeof daemon.processStartTimeUnixMillis !== "number" ||
+      !Number.isSafeInteger(daemon.processStartTimeUnixMillis) ||
+      daemon.processStartTimeUnixMillis < 1 ||
+      daemon.processStartTimeUnixMillis > evidence.activationCreatedAtUnixMillis ||
       typeof daemon.startedAtUnixMillis !== "number" ||
       !Number.isSafeInteger(daemon.startedAtUnixMillis) ||
       daemon.startedAtUnixMillis < 1 ||
       daemon.startedAtUnixMillis > evidence.activationCreatedAtUnixMillis ||
+      daemon.startedAtUnixMillis !== daemon.processStartTimeUnixMillis ||
       typeof daemon.binaryPathSha256 !== "string" ||
       typeof daemon.startTokenSha256 !== "string" ||
+      typeof daemon.runDigest !== "string" ||
       typeof loadDiagnostics.bytes !== "number" ||
       !Number.isSafeInteger(loadDiagnostics.bytes) ||
       loadDiagnostics.bytes < 1 ||
@@ -278,17 +301,20 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(evidence.activationLogSha256)
     validateDigest(evidence.activationNonce)
     validateRevision(evidence.activationRevision)
+    validateDigest(evidence.activationRunDigest)
     validateDigest(evidence.activationPluginPackageSha256)
     validateDigest(evidence.activationNativePackageSha256)
     validateDigest(evidence.nativePackageSha256)
     validateDigest(evidence.pluginPackageSha256)
     validateDigest(daemon.binaryPathSha256)
     validateDigest(daemon.startTokenSha256)
+    validateDigest(daemon.runDigest)
     validateDigest(loadDiagnostics.sha256)
     if (
       evidence.activationRevision !== evidence.revision ||
       evidence.activationPluginPackageSha256 !== evidence.pluginPackageSha256 ||
-      evidence.activationNativePackageSha256 !== evidence.nativePackageSha256
+      evidence.activationNativePackageSha256 !== evidence.nativePackageSha256 ||
+      evidence.activationRunDigest !== daemon.runDigest
     ) {
       throw new Error("Desktop activation binding does not match the receipt")
     }

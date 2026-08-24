@@ -26,9 +26,12 @@ import {
 import { parseCycleCommand, registerCycleCommand } from "./commands.js"
 import {
   certificationBindingFromOptions,
+  desktopCertificationBindingDigest,
   desktopCertificationProcessToken,
-  writeDesktopDaemonMarker,
-  writeDesktopActivationMarker,
+  finalizeDesktopActivation,
+  readDesktopDaemonRuntimeMarker,
+  type DesktopCertificationBinding,
+  type DesktopDaemonIdentity,
 } from "./certification.js"
 import {
   LocalControlPlane,
@@ -57,6 +60,11 @@ import { cycleRoleTool } from "./cycle-role-tool.js"
 import { cycleControlTool } from "./cycle-tool.js"
 
 const PRODUCT_VERSION = "1.0.0"
+const pendingDesktopFinalizations = new WeakMap<object, {
+  readonly binding: DesktopCertificationBinding
+  readonly daemon: DesktopDaemonIdentity
+  readonly health: import("./client.js").ControlPlaneHealth
+}>()
 
 function optionString(options: PluginOptions | undefined, key: string): string | undefined {
   const value = options?.[key]
@@ -176,26 +184,34 @@ const OpenCodeCycle: Plugin = async (input, options) => {
     return {}
   }
   const certificationBinding = certificationBindingFromOptions(pluginOptions, process.env)
+  let certificationFinalization: {
+    readonly binding: DesktopCertificationBinding
+    readonly daemon: DesktopDaemonIdentity
+    readonly health: import("./client.js").ControlPlaneHealth
+  } | undefined
   const controlPlane = new LocalControlPlane({
     ...(binaryPath === undefined ? {} : { binaryPath }),
     ...(dataDirectory === undefined ? {} : { dataDirectory }),
     ...(certificationBinding === undefined
       ? {}
       : {
-          onProcessSpawn: (identity: import("./client.js").OwnedProcessIdentity) =>
-            writeDesktopDaemonMarker(certificationBinding, identity).then(() => undefined),
+          processExitMarkerPath: join(certificationBinding.root, "desktop-daemon-exit.json"),
           processOwnerToken: desktopCertificationProcessToken(certificationBinding),
+          processRunDigest: desktopCertificationBindingDigest(certificationBinding),
+          processRuntimeMarkerPath: join(certificationBinding.root, "desktop-daemon-runtime.json"),
           stopOwnedProcessOnDispose: true,
         }),
   })
   if (certificationBinding !== undefined) {
     try {
       const health = await controlPlane.health()
-      await writeDesktopActivationMarker(
-        certificationBinding,
-        health,
-        controlPlane.ownedProcessIdentity(),
-      )
+      const daemon = (await readDesktopDaemonRuntimeMarker(certificationBinding)).daemon
+      const owned = controlPlane.ownedProcessIdentity()
+      if (
+        daemon.pid !== owned.pid ||
+        daemon.startToken !== owned.startToken
+      ) throw new Error("Desktop daemon runtime identity does not match the spawned process")
+      certificationFinalization = { binding: certificationBinding, daemon, health }
     } catch (error) {
       await controlPlane.dispose()
       throw error
@@ -661,7 +677,7 @@ const OpenCodeCycle: Plugin = async (input, options) => {
         : effectiveRoleVariants()[role],
   })
 
-  return {
+  const hooks: Awaited<ReturnType<Plugin>> = {
     tool: {
       [CYCLE_TOOL_NAMES.control]: cycleControlTool(controlPlane, projectKey, setupInspector),
       [CYCLE_TOOL_NAMES.browser]: cycleBrowserTool({
@@ -945,7 +961,25 @@ const OpenCodeCycle: Plugin = async (input, options) => {
       await controlPlane.dispose()
     },
   }
+  if (certificationFinalization !== undefined) {
+    pendingDesktopFinalizations.set(hooks, certificationFinalization)
+  }
+  return hooks
 }
+
+Object.defineProperty(OpenCodeCycle, "finalizeDesktopCertification", {
+  value: async (hooks: object, diagnosticsFile: string) => {
+    const pending = pendingDesktopFinalizations.get(hooks)
+    if (pending === undefined) throw new Error("Desktop certification finalization is unavailable")
+    pendingDesktopFinalizations.delete(hooks)
+    return finalizeDesktopActivation(
+      pending.binding,
+      pending.health,
+      pending.daemon,
+      diagnosticsFile,
+    )
+  },
+})
 
 async function runAdmittedWorkflow<Result>(
   controlPlane: LocalControlPlane,

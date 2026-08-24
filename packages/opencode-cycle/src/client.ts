@@ -2,7 +2,7 @@ import { createHash, createHmac, randomUUID } from "node:crypto"
 import { constants } from "node:fs"
 import { access, readFile, realpath } from "node:fs/promises"
 import type { Socket } from "node:net"
-import { join, posix, win32 } from "node:path"
+import { isAbsolute, join, posix, resolve, win32 } from "node:path"
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { once } from "node:events"
 import { createRequire } from "node:module"
@@ -32,7 +32,10 @@ export interface ControlPlaneOptions {
   readonly expectedProtocolVersion?: number
   readonly onProcessSpawn?: (identity: OwnedProcessIdentity) => Promise<void>
   readonly platform?: NodeJS.Platform
+  readonly processExitMarkerPath?: string
   readonly processOwnerToken?: string
+  readonly processRunDigest?: string
+  readonly processRuntimeMarkerPath?: string
   readonly stopOwnedProcessOnDispose?: boolean
 }
 
@@ -41,6 +44,12 @@ export interface OwnedProcessIdentity {
   readonly pid: number
   readonly startToken: string
   readonly startedAtUnixMillis: number
+}
+
+export interface CertifiedShutdownReceipt {
+  readonly pid: number
+  readonly processStartTimeUnixMillis: number
+  readonly runDigest: string
 }
 
 export interface AuditObservation {
@@ -344,7 +353,10 @@ export class LocalControlPlane {
   readonly #expectedProtocolVersion: number
   readonly #onProcessSpawn: ((identity: OwnedProcessIdentity) => Promise<void>) | undefined
   readonly #platform: NodeJS.Platform
+  readonly #processExitMarkerPath: string | undefined
   readonly #processOwnerToken: string | undefined
+  readonly #processRunDigest: string | undefined
+  readonly #processRuntimeMarkerPath: string | undefined
   readonly #secretPath: string
   readonly #stopOwnedProcessOnDispose: boolean
   #ownedProcess: ChildProcess | undefined
@@ -362,12 +374,41 @@ export class LocalControlPlane {
       platform === "win32" ? "" : join(this.#dataDirectory, "runtime", "workflow.sock")
     this.#expectedProtocolVersion = options.expectedProtocolVersion ?? 1
     this.#onProcessSpawn = options.onProcessSpawn
+    this.#processExitMarkerPath = options.processExitMarkerPath
     this.#processOwnerToken = options.processOwnerToken
+    this.#processRunDigest = options.processRunDigest
+    this.#processRuntimeMarkerPath = options.processRuntimeMarkerPath
     this.#stopOwnedProcessOnDispose = options.stopOwnedProcessOnDispose ?? false
+    const certificationBindings = [
+      this.#processOwnerToken,
+      this.#processRunDigest,
+      this.#processRuntimeMarkerPath,
+      this.#processExitMarkerPath,
+    ]
+    const hasCertificationBinding = certificationBindings.some((value) => value !== undefined)
+    const certificationMarkersCollide =
+      this.#processRuntimeMarkerPath !== undefined &&
+      this.#processExitMarkerPath !== undefined &&
+      (this.#platform === "win32"
+        ? this.#processRuntimeMarkerPath.toLowerCase() === this.#processExitMarkerPath.toLowerCase()
+        : this.#processRuntimeMarkerPath === this.#processExitMarkerPath)
     if (
       (this.#processOwnerToken !== undefined && !SHA256.test(this.#processOwnerToken)) ||
+      (this.#processRunDigest !== undefined && !SHA256.test(this.#processRunDigest)) ||
       (this.#onProcessSpawn !== undefined && this.#processOwnerToken === undefined) ||
-      (this.#processOwnerToken !== undefined && !this.#stopOwnedProcessOnDispose)
+      (this.#processOwnerToken !== undefined && !this.#stopOwnedProcessOnDispose) ||
+      (hasCertificationBinding && certificationBindings.some((value) => value === undefined)) ||
+      (this.#processRuntimeMarkerPath !== undefined && (
+        !isAbsolute(this.#processRuntimeMarkerPath) ||
+        resolve(this.#processRuntimeMarkerPath) !== this.#processRuntimeMarkerPath ||
+        this.#processRuntimeMarkerPath.includes("\0")
+      )) ||
+      (this.#processExitMarkerPath !== undefined && (
+        !isAbsolute(this.#processExitMarkerPath) ||
+        resolve(this.#processExitMarkerPath) !== this.#processExitMarkerPath ||
+        this.#processExitMarkerPath.includes("\0") ||
+        certificationMarkersCollide
+      ))
     ) {
       throw new ControlPlaneError("workflowd process ownership binding is invalid")
     }
@@ -405,7 +446,16 @@ export class LocalControlPlane {
       const startedAtUnixMillis = Date.now()
       const argumentsList = ["--data-dir", this.#dataDirectory]
       if (this.#processOwnerToken !== undefined) {
-        argumentsList.push("--certification-owner-token", this.#processOwnerToken)
+        argumentsList.push(
+          "--certification-owner-token",
+          this.#processOwnerToken,
+          "--certification-runtime-marker",
+          this.#processRuntimeMarkerPath as string,
+          "--certification-exit-marker",
+          this.#processExitMarkerPath as string,
+          "--certification-run-digest",
+          this.#processRunDigest as string,
+        )
       }
       this.#ownedProcess = spawn(binaryPath, argumentsList, {
         detached: !this.#stopOwnedProcessOnDispose,
@@ -515,6 +565,38 @@ export class LocalControlPlane {
       throw new ControlPlaneError("workflowd owned process identity is unavailable")
     }
     return identity
+  }
+
+  async shutdownOwned(ownerToken: string, runDigest: string): Promise<CertifiedShutdownReceipt> {
+    if (!SHA256.test(ownerToken) || !SHA256.test(runDigest)) {
+      throw new ControlPlaneError("workflowd shutdown binding is invalid")
+    }
+    const secret = await readSecret(this.#secretPath)
+    if (secret === undefined) throw new ControlPlaneError("workflowd shutdown endpoint is unavailable")
+    const { decoder, socket } = await this.#connect(secret)
+    try {
+      const message = asRecord(await writeJsonAndRead(decoder, {
+        data: { owner_token: ownerToken, request_id: 19, run_digest: runDigest },
+        type: "shutdown",
+      }))
+      if (message.type !== "shutdown") throw new ControlPlaneError("workflowd rejected authenticated shutdown")
+      const data = asRecord(message.data)
+      if (
+        data.request_id !== 19 ||
+        data.run_digest !== runDigest ||
+        typeof data.pid !== "number" ||
+        !Number.isSafeInteger(data.pid) ||
+        typeof data.process_start_time_unix_millis !== "number" ||
+        !Number.isSafeInteger(data.process_start_time_unix_millis)
+      ) throw new ControlPlaneError("workflowd returned a malformed shutdown receipt")
+      return {
+        pid: data.pid,
+        processStartTimeUnixMillis: data.process_start_time_unix_millis,
+        runDigest,
+      }
+    } finally {
+      socket.destroy()
+    }
   }
 
   async audit(observation: AuditObservation): Promise<AuditReceipt> {
@@ -1371,6 +1453,14 @@ async function waitForChildExit(child: ChildProcess, timeout: number): Promise<b
       resolve(true)
     })
   })
+}
+
+export function shutdownCertifiedControlPlane(
+  dataDirectory: string,
+  ownerToken: string,
+  runDigest: string,
+): Promise<CertifiedShutdownReceipt> {
+  return new LocalControlPlane({ dataDirectory }).shutdownOwned(ownerToken, runDigest)
 }
 
 export function resolveDataDirectory(

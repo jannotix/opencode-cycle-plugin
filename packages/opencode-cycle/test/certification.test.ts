@@ -9,6 +9,7 @@ import {
   createDesktopActivationWriterForTests,
   desktopCertificationBindingDigest,
   desktopCertificationProcessToken,
+  finalizeDesktopActivation,
   parseDesktopActivationMarker,
   type DesktopCertificationBinding,
   writeDesktopActivationMarker,
@@ -29,10 +30,49 @@ const health = {
 function daemon(binding: DesktopCertificationBinding) {
   return {
     binaryPath: join(binding.root, process.platform === "win32" ? "workflowd.exe" : "workflowd"),
+    parentPid: process.pid,
+    parentStartTimeUnixMillis: binding.startedAtUnixMillis,
     pid: 4242,
+    processStartTimeUnixMillis: binding.startedAtUnixMillis,
     startToken: desktopCertificationProcessToken(binding),
     startedAtUnixMillis: binding.startedAtUnixMillis,
   }
+}
+
+const finalizationStages = [
+  "certification_env_prepared",
+  "config_tree_prepared",
+  "config_path_discovered",
+  "plugin_specifier_resolved",
+  "effective_env_validated",
+  "candidate_module_resolved",
+  "plugin_entry_started",
+  "plugin_entry_completed",
+  "daemon_identity_published",
+] as const
+
+async function writeFinalizationEvidence(
+  binding: DesktopCertificationBinding,
+  records: readonly unknown[] = finalizationStages.map((stage, sequence) => ({
+    runDigest: desktopCertificationBindingDigest(binding),
+    schemaVersion: 2,
+    sequence,
+    stage,
+    status: "passed",
+    type: "opencode-cycle-desktop-load-diagnostic",
+  })),
+): Promise<string> {
+  const identity = daemon(binding)
+  await writeFile(join(binding.root, "desktop-daemon-runtime.json"), `${JSON.stringify({
+    daemon: identity,
+    runDigest: desktopCertificationBindingDigest(binding),
+    schemaVersion: 1,
+    type: "opencode-cycle-desktop-daemon-runtime",
+  })}\n`)
+  const diagnostics = join(binding.root, "desktop-load-diagnostics.jsonl")
+  await writeFile(diagnostics, `${records.map((record) =>
+    typeof record === "string" ? record : JSON.stringify(record)).join("\n")}\n`)
+  return diagnostics
 }
 
 test("certification binding requires matching isolated environment authority", async () => {
@@ -139,6 +179,95 @@ test("activation marker rejects missing or non-candidate Desktop health", () => 
     { ...daemon(binding), binaryPath: "relative" },
     1_700_000_000_100,
   )).toThrow("daemon")
+})
+
+test("candidate finalization publishes only after the exact run-bound transcript and daemon identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-finalizer-"))
+  const binding = {
+    nativePackageSha256,
+    nonce,
+    pluginPackageSha256,
+    revision,
+    root,
+    startedAtUnixMillis: 1_700_000_000_000,
+  }
+  try {
+    const diagnostics = await writeFinalizationEvidence(binding)
+    const marker = await finalizeDesktopActivation(binding, health, daemon(binding), diagnostics)
+    expect(marker.daemon).toEqual(daemon(binding))
+    expect(marker.runDigest).toBe(desktopCertificationBindingDigest(binding))
+    expect(parseDesktopActivationMarker(
+      JSON.parse(await readFile(join(root, "desktop-activation.json"), "utf8")) as unknown,
+    )).toEqual(marker)
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
+test("candidate finalization rejects malformed, reordered, stale, failed and secret-bearing transcripts", async () => {
+  const privateDetail = "C:\\private\\provider-model-token"
+  for (const scenario of ["malformed", "reordered", "stale", "failed", "extra"] as const) {
+    const root = await mkdtemp(join(tmpdir(), `cycle-cert-finalizer-${scenario}-`))
+    const binding = {
+      nativePackageSha256,
+      nonce,
+      pluginPackageSha256,
+      revision,
+      root,
+      startedAtUnixMillis: 1_700_000_000_000,
+    }
+    const records: unknown[] = finalizationStages.map((stage, sequence) => ({
+      runDigest: desktopCertificationBindingDigest(binding),
+      schemaVersion: 2,
+      sequence,
+      stage,
+      status: "passed",
+      type: "opencode-cycle-desktop-load-diagnostic",
+    }))
+    if (scenario === "malformed") records[8] = `{${privateDetail}`
+    if (scenario === "reordered") records[1] = { ...(records[1] as object), stage: finalizationStages[0] }
+    if (scenario === "stale") records[8] = { ...(records[8] as object), runDigest: "e".repeat(64) }
+    if (scenario === "failed") records[8] = { ...(records[8] as object), status: "failed" }
+    if (scenario === "extra") records[8] = { ...(records[8] as object), detail: privateDetail }
+    try {
+      const diagnostics = await writeFinalizationEvidence(binding, records)
+      let failure: unknown
+      try {
+        await finalizeDesktopActivation(binding, health, daemon(binding), diagnostics)
+      } catch (error) {
+        failure = error
+      }
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as Error).message).not.toContain(privateDetail)
+      expect(await access(join(root, "desktop-activation.json")).then(() => true, () => false)).toBe(false)
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  }
+})
+
+test("candidate finalization rejects a runtime identity mismatch before activation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cycle-cert-finalizer-daemon-"))
+  const binding = {
+    nativePackageSha256,
+    nonce,
+    pluginPackageSha256,
+    revision,
+    root,
+    startedAtUnixMillis: 1_700_000_000_000,
+  }
+  try {
+    const diagnostics = await writeFinalizationEvidence(binding)
+    await expect(finalizeDesktopActivation(
+      binding,
+      health,
+      { ...daemon(binding), processStartTimeUnixMillis: binding.startedAtUnixMillis + 1_000 },
+      diagnostics,
+    )).rejects.toThrow("identity mismatch")
+    expect(await access(join(root, "desktop-activation.json")).then(() => true, () => false)).toBe(false)
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
 })
 
 test("activation final is absent while the private temp is paused and publishes atomically", async () => {

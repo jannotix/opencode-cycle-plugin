@@ -6,16 +6,23 @@ enum Command {
         destination: PathBuf,
     },
     Serve {
-        _certification_owner_token: Option<String>,
+        certification: Option<workflowd::lifecycle::CertificationLifecycle>,
         data_directory: PathBuf,
+    },
+    WaitCertificationExit {
+        pid: u32,
+        process_start_time_unix_millis: u64,
     },
 }
 
 #[tokio::main]
 async fn main() {
     match parse_command(std::env::args_os().skip(1).collect()) {
-        Ok(Command::Serve { data_directory, .. }) => {
-            if let Err(error) = workflowd::lifecycle::run(data_directory).await {
+        Ok(Command::Serve {
+            certification,
+            data_directory,
+        }) => {
+            if let Err(error) = workflowd::lifecycle::run(data_directory, certification).await {
                 eprintln!("workflowd failed: {error}");
                 std::process::exit(1);
             }
@@ -32,6 +39,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Command::WaitCertificationExit {
+            pid,
+            process_start_time_unix_millis,
+        }) => {
+            if let Err(error) = workflowd::lifecycle::wait_for_certification_instance_exit(
+                pid,
+                process_start_time_unix_millis,
+                std::time::Duration::from_secs(15),
+            )
+            .await
+            {
+                eprintln!("workflowd certification exit verification failed: {error}");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("workflowd failed: {error}");
             std::process::exit(2);
@@ -42,16 +64,35 @@ async fn main() {
 fn parse_command(arguments: Vec<OsString>) -> Result<Command, &'static str> {
     match arguments.as_slice() {
         [flag, path] if flag == "--data-dir" => Ok(Command::Serve {
-            _certification_owner_token: None,
+            certification: None,
             data_directory: absolute(path)?,
         }),
-        [data_flag, data_directory, owner_flag, owner_token]
-            if data_flag == "--data-dir"
-                && owner_flag == "--certification-owner-token"
-                && valid_owner_token(owner_token) =>
+        [
+            data_flag,
+            data_directory,
+            owner_flag,
+            owner_token,
+            runtime_flag,
+            runtime_marker,
+            exit_flag,
+            exit_marker,
+            run_flag,
+            run_digest,
+        ] if data_flag == "--data-dir"
+            && owner_flag == "--certification-owner-token"
+            && runtime_flag == "--certification-runtime-marker"
+            && exit_flag == "--certification-exit-marker"
+            && run_flag == "--certification-run-digest"
+            && valid_digest(owner_token)
+            && valid_digest(run_digest) =>
         {
             Ok(Command::Serve {
-                _certification_owner_token: Some(owner_token.to_string_lossy().into_owned()),
+                certification: Some(workflowd::lifecycle::CertificationLifecycle {
+                    exit_marker: absolute(exit_marker)?,
+                    owner_token: owner_token.to_string_lossy().into_owned(),
+                    run_digest: run_digest.to_string_lossy().into_owned(),
+                    runtime_marker: absolute(runtime_marker)?,
+                }),
                 data_directory: absolute(data_directory)?,
             })
         }
@@ -63,13 +104,38 @@ fn parse_command(arguments: Vec<OsString>) -> Result<Command, &'static str> {
                 destination: absolute(destination)?,
             })
         }
+        [wait_flag, pid, start_flag, process_start]
+            if wait_flag == "--certification-wait-exit"
+                && start_flag == "--certification-process-start" =>
+        {
+            Ok(Command::WaitCertificationExit {
+                pid: positive_u32(pid)?,
+                process_start_time_unix_millis: positive_u64(process_start)?,
+            })
+        }
         _ => Err(
-            "expected --data-dir <absolute-path> [--certification-owner-token <64-lower-hex>] or --backup-data-dir <absolute-path> --backup-to <absolute-path>",
+            "expected --data-dir <absolute-path>, the fully bound certification serve form, --certification-wait-exit <pid> --certification-process-start <millis>, or --backup-data-dir <absolute-path> --backup-to <absolute-path>",
         ),
     }
 }
 
-fn valid_owner_token(value: &OsString) -> bool {
+fn positive_u32(value: &OsString) -> Result<u32, &'static str> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .ok_or("workflowd process identifier must be a positive integer")
+}
+
+fn positive_u64(value: &OsString) -> Result<u64, &'static str> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or("workflowd process start identity must be a positive integer")
+}
+
+fn valid_digest(value: &OsString) -> bool {
     let bytes = value.as_encoded_bytes();
     bytes.len() == 64
         && bytes
@@ -113,19 +179,27 @@ mod tests {
     #[test]
     fn serve_command_accepts_only_a_bound_certification_owner_token() {
         let data_directory = std::env::temp_dir().join("opencode-cycle-certification-runtime");
+        let runtime_marker = data_directory.join("desktop-daemon-runtime.json");
+        let exit_marker = data_directory.join("desktop-daemon-exit.json");
         let command = parse_command(vec![
             OsString::from("--data-dir"),
             data_directory.clone().into_os_string(),
             OsString::from("--certification-owner-token"),
             OsString::from("a".repeat(64)),
+            OsString::from("--certification-runtime-marker"),
+            runtime_marker.clone().into_os_string(),
+            OsString::from("--certification-exit-marker"),
+            exit_marker.clone().into_os_string(),
+            OsString::from("--certification-run-digest"),
+            OsString::from("b".repeat(64)),
         ])
         .unwrap();
         assert!(matches!(
             command,
             Command::Serve {
-                _certification_owner_token: Some(token),
+                certification: Some(_),
                 ..
-            } if token == "a".repeat(64)
+            }
         ));
         assert!(
             parse_command(vec![
@@ -133,6 +207,37 @@ mod tests {
                 data_directory.into_os_string(),
                 OsString::from("--certification-owner-token"),
                 OsString::from("A".repeat(64)),
+                OsString::from("--certification-runtime-marker"),
+                runtime_marker.into_os_string(),
+                OsString::from("--certification-exit-marker"),
+                exit_marker.into_os_string(),
+                OsString::from("--certification-run-digest"),
+                OsString::from("b".repeat(64)),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn certification_exit_wait_requires_exact_positive_process_identity() {
+        assert!(matches!(
+            parse_command(vec![
+                OsString::from("--certification-wait-exit"),
+                OsString::from("4242"),
+                OsString::from("--certification-process-start"),
+                OsString::from("1700000000000"),
+            ]),
+            Ok(Command::WaitCertificationExit {
+                pid: 4242,
+                process_start_time_unix_millis: 1_700_000_000_000,
+            })
+        ));
+        assert!(
+            parse_command(vec![
+                OsString::from("--certification-wait-exit"),
+                OsString::from("0"),
+                OsString::from("--certification-process-start"),
+                OsString::from("1700000000000"),
             ])
             .is_err()
         );

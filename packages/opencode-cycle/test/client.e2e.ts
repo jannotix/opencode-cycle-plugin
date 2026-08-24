@@ -585,7 +585,10 @@ test("certification ownership publication failure terminates the spawned workflo
       spawnedPid = identity.pid
       throw new Error("injected ownership publication failure")
     },
+    processExitMarkerPath: join(dataDirectory, "desktop-daemon-exit.json"),
     processOwnerToken: "f".repeat(64),
+    processRunDigest: "e".repeat(64),
+    processRuntimeMarkerPath: join(dataDirectory, "desktop-daemon-runtime.json"),
     stopOwnedProcessOnDispose: true,
   })
   try {

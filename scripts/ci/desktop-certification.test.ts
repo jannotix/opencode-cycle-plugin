@@ -16,7 +16,10 @@ import {
 function daemonIdentity(binding: DesktopCertificationBinding) {
   return {
     binaryPath: join(binding.root, "workflowd.exe"),
+    parentPid: process.pid,
+    parentStartTimeUnixMillis: binding.startedAtUnixMillis,
     pid: 4242,
+    processStartTimeUnixMillis: binding.startedAtUnixMillis,
     startToken: desktopCertificationProcessToken(binding),
     startedAtUnixMillis: binding.startedAtUnixMillis,
   }
@@ -48,6 +51,7 @@ import {
 } from "./desktop-certification.js"
 import {
   OPENCODE_11821_HOST_PROOF_PROVENANCE,
+  verifyCanonicalFixture,
   type OpenCodeHostProofReceipt,
 } from "./opencode-1.18.21-host-proof.js"
 
@@ -130,22 +134,20 @@ test("Desktop asset matrix is the exact official OpenCode 1.18.21 Windows/Linux 
   ).toThrow("platform set")
 })
 
-test("OpenCode 1.18.21 host proof adapter and upstream authorities are checksum-pinned", async () => {
-  const adapter = await readFile(resolve(import.meta.dir, "opencode-1.18.21-host-proof.ts"))
-  expect(createHash("sha256").update(adapter).digest("hex")).toBe(
-    "256001e02a63ccd0fe4c0e05bf3de2f9ec368704672370cb57b6f666dd12c1d8",
-  )
+test("canonical OpenCode 1.18.21 LF fixtures and upstream authorities are checksum-pinned", async () => {
+  await expect(verifyCanonicalFixture()).resolves.toBeUndefined()
   expect(OPENCODE_11821_HOST_PROOF_PROVENANCE).toEqual({
     commit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
     files: {
-      "packages/core/src/v1/config/plugin.ts": "47f1990fd214247bc9813c7e3917fd651575fc5c11d3eb0aacdea3687dfe142c",
-      "packages/opencode/src/config/config.ts": "cd94580e88849c917fc619e344bf0a6bf2b235cbc6967318d3a664ec1dd986db",
-      "packages/opencode/src/config/paths.ts": "5035696f4213749075942c09e39f635ee730ea37217f4ad4aecac64645ae2d39",
-      "packages/opencode/src/config/plugin.ts": "b5f73247aea65adeeebbf2cc60acbc96c7980c96e4d58518d733216a17fc264b",
-      "packages/opencode/src/plugin/index.ts": "e8cc96d7eb486aafa0d1dbb793e7f0e326df4981a399f958c54d496a0226956f",
-      "packages/opencode/src/plugin/loader.ts": "e62ac4ee752c4f7cbbd5525eaeafc8565ba0763c55985584393ea513a1f9678d",
-      "packages/opencode/src/plugin/shared.ts": "db714592eeeb8362e8a92899ec434e5f6521a4446980426a2d7ced724fb7cffb",
+      "packages/core/src/v1/config/plugin.ts": "b45a25d030b253b92449050538433c8ab4dd53db9d2c81228cd6133f4d94837c",
+      "packages/opencode/src/config/config.ts": "b0fd57d860661ce70e7fbd06e7f2cc24417c70d3db4207ad97129ac1b649997e",
+      "packages/opencode/src/config/paths.ts": "cd86a34461b27caf1042f8cba140fbbed47790c4f30cd9691f87298e8d4d4444",
+      "packages/opencode/src/config/plugin.ts": "8c450d5c8fdee1811bb93788462958c7e58ea551c73e18a4173c19917c734f6e",
+      "packages/opencode/src/plugin/index.ts": "47c62b7cfae891d268e6b239edb0f1c46df5cb35eb11ccfd8bd4186c156024e9",
+      "packages/opencode/src/plugin/loader.ts": "a7eba2d328a36a2486b50245ad98ef0daa769d4109c9e50470d8493b0936c4c0",
+      "packages/opencode/src/plugin/shared.ts": "1ada9e15915e47bbb7b16436f0018c9b86845a66e687d89d037be896b9663140",
     },
+    normalization: "none",
     tag: "v1.18.21",
   })
 })
@@ -240,7 +242,7 @@ import { writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 export default async function CandidateFixture(input, options) {
-  await writeFile(join(options.certification.root, "desktop-daemon.json"), "{}\\n")
+  await writeFile(join(options.certification.root, "desktop-daemon-runtime.json"), "{}\\n")
   await writeFile(join(options.certification.root, "fixture-result.json"), JSON.stringify({
     binaryPath: options.binaryPath,
     certificationRoot: options.certification.root,
@@ -254,6 +256,7 @@ export default async function CandidateFixture(input, options) {
     dispose: async () => {},
   }
 }
+CandidateFixture.finalizeDesktopCertification = async () => {}
 `, platform: "linux-x64" | "windows-x64" = "windows-x64") {
   const temporary = await mkdtemp(join(tmpdir(), "cycle-cert-desktop-load-"))
   const certificationRoot = join(temporary, "certification")
@@ -414,7 +417,10 @@ test("bound Desktop config resolves and executes the candidate from the copied p
       },
       {
         binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
+        parentPid: process.pid,
+        parentStartTimeUnixMillis: fixture.binding.startedAtUnixMillis,
         pid: 4242,
+        processStartTimeUnixMillis: fixture.binding.startedAtUnixMillis,
         startToken: desktopCertificationProcessToken(fixture.binding),
         startedAtUnixMillis: fixture.binding.startedAtUnixMillis,
       },
@@ -660,6 +666,156 @@ test("a complete passing load transcript can never replace the activation marker
     await rm(root, { force: true, recursive: true })
   }
 })
+
+test("canonical candidate entry cannot publish activation before wrapper finalization", async () => {
+  const source = await readFile(
+    resolve(import.meta.dir, "../../packages/opencode-cycle/src/index.ts"),
+    "utf8",
+  )
+  expect(source).not.toContain("writeDesktopActivationMarker(")
+})
+
+test("activation remains absent until the durable candidate finalizer stage completes", async () => {
+  const certificationModule = pathToFileURL(
+    resolve(import.meta.dir, "../../packages/opencode-cycle/src/certification.ts"),
+  ).href
+  const fixture = await createDesktopLoadFixture(`
+import { access, writeFile } from "node:fs/promises"
+import { join } from "node:path"
+import {
+  desktopCertificationBindingDigest,
+  desktopCertificationProcessToken,
+  finalizeDesktopActivation,
+} from ${JSON.stringify(certificationModule)}
+
+let pending
+export default async function CandidateFixture(input, options) {
+  const daemon = {
+    binaryPath: options.binaryPath,
+    parentPid: process.ppid,
+    parentStartTimeUnixMillis: options.certification.startedAtUnixMillis,
+    pid: process.pid,
+    processStartTimeUnixMillis: options.certification.startedAtUnixMillis,
+    startToken: desktopCertificationProcessToken(options.certification),
+    startedAtUnixMillis: options.certification.startedAtUnixMillis,
+  }
+  await writeFile(
+    join(options.certification.root, "desktop-daemon-runtime.json"),
+    JSON.stringify({
+      daemon,
+      runDigest: desktopCertificationBindingDigest(options.certification),
+      schemaVersion: 1,
+      type: "opencode-cycle-desktop-daemon-runtime",
+    }) + "\\n",
+  )
+  pending = { binding: options.certification, daemon }
+  return { dispose: async () => {} }
+}
+
+CandidateFixture.finalizeDesktopCertification = async (_hooks, diagnosticsFile) => {
+  const root = pending.binding.root
+  await writeFile(join(root, "finalizer-ready"), "ready\\n", { flag: "wx" })
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (await access(join(root, "finalizer-release")).then(() => true, () => false)) break
+    await Bun.sleep(25)
+  }
+  if (!await access(join(root, "finalizer-release")).then(() => true, () => false)) {
+    throw new Error("finalizer release was not published")
+  }
+  await finalizeDesktopActivation(
+    pending.binding,
+    {
+      product_version: "1.0.0",
+      protocol_version: 1,
+      schema_mode: "read_write",
+      schema_version: 17,
+    },
+    pending.daemon,
+    diagnosticsFile,
+  )
+}
+`)
+  const launcherTemporary = await mkdtemp(join(tmpdir(), "cycle-host-proof-launcher-"))
+  const launcher = join(launcherTemporary, "launcher.ts")
+  const project = join(fixture.temporary, "race-project")
+  const request = join(fixture.temporary, "race-host-proof-request.json")
+  const result = join(fixture.temporary, "race-host-proof-result.json")
+  const activation = join(fixture.binding.root, "desktop-activation.json")
+  const ready = join(fixture.binding.root, "finalizer-ready")
+  const release = join(fixture.binding.root, "finalizer-release")
+  let child: ReturnType<typeof Bun.spawn> | undefined
+  try {
+    await Promise.all([
+      mkdir(project, { recursive: true }),
+      mkdir(fixture.environment.TEMP as string, { recursive: true }),
+    ])
+    await writeFile(launcher, `
+const [cwd, ...command] = Bun.argv.slice(2)
+if (!cwd || command.length === 0) throw new Error("launcher arguments are missing")
+const child = Bun.spawn(command, {
+  cwd,
+  env: process.env,
+  stderr: "ignore",
+  stdout: "ignore",
+})
+process.exit(await child.exited)
+`)
+    await writeFile(request, `${JSON.stringify({
+      binding: fixture.binding,
+      candidatePackageRoot: fixture.prepared.installedPlugin,
+      configFile: fixture.prepared.configFile,
+      directory: project,
+      resultFile: result,
+      worktree: project,
+    })}\n`)
+    child = Bun.spawn(
+      [
+        process.execPath,
+        launcher,
+        fixture.temporary,
+        process.execPath,
+        resolve(import.meta.dir, "opencode-1.18.21-host-proof.ts"),
+        "--request",
+        request,
+      ],
+      {
+        cwd: resolve(import.meta.dir, "../.."),
+        env: fixture.environment,
+        stderr: "ignore",
+        stdout: "ignore",
+      },
+    )
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      if (await access(ready).then(() => true, () => false)) break
+      if (child.exitCode !== null) throw new Error("host proof exited before finalizer synchronization")
+      await Bun.sleep(25)
+    }
+    expect(await access(ready).then(() => true, () => false)).toBe(true)
+    expect(await access(activation).then(() => true, () => false)).toBe(false)
+    expect(await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)).toBe(
+      "certification_env_prepared=passed, config_tree_prepared=passed, " +
+      "config_path_discovered=passed, plugin_specifier_resolved=passed, " +
+      "effective_env_validated=passed, candidate_module_resolved=passed, " +
+      "plugin_entry_started=passed, plugin_entry_completed=passed, " +
+      "daemon_identity_published=passed, activation_marker_verified=missing, " +
+      "daemon_cleanup_verified=missing",
+    )
+
+    await writeFile(release, "release\n", { flag: "wx" })
+    expect(await child.exited).toBe(0)
+    const marker = await waitForDesktopActivation(fixture.binding.root, fixture.binding, 1_000)
+    expect(marker.marker.daemon.pid).toBeGreaterThan(0)
+    expect(marker.marker.runDigest).toBe(desktopCertificationBindingDigest(fixture.binding))
+    expect(await access(result).then(() => true, () => false)).toBe(true)
+  } finally {
+    await writeFile(release, "release\n", { flag: "wx" }).catch(() => undefined)
+    if (child !== undefined && child.exitCode === null) await child.exited
+    await Promise.all([
+      rm(fixture.temporary, { force: true, recursive: true }),
+      rm(launcherTemporary, { force: true, recursive: true }),
+    ])
+  }
+}, 20_000)
 
 test("certification scratch directories are not treated as Desktop test profiles", () => {
   const scratch = join(tmpdir(), "opencode-cycle-desktop-certification-scratch")
