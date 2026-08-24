@@ -124,6 +124,8 @@ test("public validation sources exist while archives reject non-production paths
     "package/dist/tests/tool.js",
     "package/dist/example/tool.js",
     "package/dist/fixture/tool.js",
+    "package/scripts/ci/fixtures/opencode-1.18.21/LICENSE",
+    "package/scripts/ci/fixtures/opencode-1.18.21/PROVENANCE.json",
     "package/dist/index.js.map",
     "package/coverage/index.js",
     "package/docs/guide.md",

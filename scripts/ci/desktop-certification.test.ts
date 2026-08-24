@@ -27,6 +27,7 @@ function daemonIdentity(binding: DesktopCertificationBinding) {
 import {
   activationScanRoots,
   certificationEnvironment,
+  cleanupDesktopCertificationProcesses,
   completeDesktopDaemonCleanupDiagnostic,
   desktopLoadDiagnosticSummary,
   desktopOutputSummary,
@@ -74,6 +75,45 @@ test("Desktop cleanup terminates the complete Unix process group", async () => {
 
   expect(() => process.kill(-child.pid, 0)).toThrow()
 })
+
+for (const platform of ["windows-x64", "linux-x64"] as const) {
+  for (const scenario of ["success", "activation-failure", "no-marker", "shutdown-failure"] as const) {
+    test(`${platform} ${scenario} teardown attempts daemon cleanup before Desktop termination`, async () => {
+      const events: string[] = []
+      const activationFailure = scenario === "activation-failure" || scenario === "no-marker"
+        ? new Error("activation failed")
+        : undefined
+      const cleanup = {
+        exitMarkerPublished: scenario !== "no-marker",
+        markerPublished: scenario !== "no-marker",
+        processAbsent: scenario !== "no-marker",
+        shutdownAuthenticated: scenario !== "no-marker",
+        terminated: scenario !== "no-marker",
+      }
+      const result = await cleanupDesktopCertificationProcesses({
+        cleanupDaemon: async () => {
+          events.push("daemon")
+          if (scenario === "shutdown-failure") throw new Error("authenticated shutdown failed")
+          return cleanup
+        },
+        desktopProcess: { pid: 4242 } as Bun.Subprocess,
+        existingError: activationFailure,
+        platform,
+        terminateDesktop: async () => { events.push("desktop") },
+      })
+
+      expect(events).toEqual(["daemon", "desktop"])
+      if (scenario === "shutdown-failure") {
+        expect(result.error).toBeInstanceOf(Error)
+        expect((result.error as Error).message).toContain("authenticated shutdown failed")
+        expect(result.daemonCleanup).toBeUndefined()
+      } else {
+        expect(result.error).toBe(activationFailure)
+        expect(result.daemonCleanup).toEqual(cleanup)
+      }
+    })
+  }
+}
 
 const asset: DesktopAsset = {
   name: "opencode-desktop-win-x64.exe",
@@ -147,7 +187,13 @@ test("canonical OpenCode 1.18.21 LF fixtures and upstream authorities are checks
       "packages/opencode/src/plugin/loader.ts": "a7eba2d328a36a2486b50245ad98ef0daa769d4109c9e50470d8493b0936c4c0",
       "packages/opencode/src/plugin/shared.ts": "1ada9e15915e47bbb7b16436f0018c9b86845a66e687d89d037be896b9663140",
     },
+    license: {
+      path: "LICENSE",
+      sha256: "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+    },
     normalization: "none",
+    repository: "https://github.com/anomalyco/opencode",
+    scope: "test-only canonical copies excluded from production archives",
     tag: "v1.18.21",
   })
 })

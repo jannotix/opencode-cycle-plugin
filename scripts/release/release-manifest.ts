@@ -264,9 +264,8 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       daemon.exitMarkerPublished !== true ||
       daemon.markerPublished !== true ||
       daemon.processAbsent !== true ||
-      typeof daemon.terminated !== "boolean" ||
-      typeof daemon.shutdownAuthenticated !== "boolean" ||
-      daemon.terminated !== daemon.shutdownAuthenticated ||
+      daemon.terminated !== true ||
+      daemon.shutdownAuthenticated !== true ||
       typeof daemon.parentPid !== "number" ||
       !Number.isSafeInteger(daemon.parentPid) ||
       daemon.parentPid < 1 ||

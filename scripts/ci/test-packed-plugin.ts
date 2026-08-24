@@ -166,6 +166,7 @@ process.exit(await child.exited)
     !hostReceipt.tupleOptions
   ) throw new Error("Packed plugin host proof receipt is invalid")
   const activation = await waitForDesktopActivation(certificationRoot, binding, 5_000)
+  if (proof.exitCode !== null) throw new Error("Packed plugin host exited before daemon shutdown")
   const cleanup = await cleanupCertifiedDaemon({
     binding,
     dataDirectory,
@@ -173,7 +174,14 @@ process.exit(await child.exited)
     expectedDaemon: activation.marker.daemon,
     platform,
   })
-  if (!cleanup.markerPublished) throw new Error("Packed plugin did not publish daemon ownership")
+  if (
+    !cleanup.markerPublished ||
+    !cleanup.exitMarkerPublished ||
+    !cleanup.processAbsent ||
+    !cleanup.shutdownAuthenticated ||
+    !cleanup.terminated
+  ) throw new Error("Packed plugin did not complete authenticated daemon shutdown")
+  if (proof.exitCode !== null) throw new Error("Packed plugin host exited during daemon shutdown")
   await writeFile(proofRelease, "release\n", { flag: "wx" })
   if ((await proof.exited) !== 0) throw new Error("OpenCode 1.18.21 host proof exited after cleanup")
   await completeDesktopDaemonCleanupDiagnostic(prepared.diagnosticsFile, binding, "passed")

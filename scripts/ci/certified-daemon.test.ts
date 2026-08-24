@@ -52,7 +52,7 @@ async function lifecycle(root: string) {
 }
 
 for (const platform of ["windows-x64", "linux-x64"] as const) {
-  test(`authenticated ${platform} cleanup accepts the daemon-owned marker after sidecar death`, async () => {
+  test(`authenticated ${platform} cleanup uses the daemon-owned marker before Desktop termination`, async () => {
     const root = await mkdtemp(join(tmpdir(), `cycle-auth-shutdown-${platform}-`))
     const fixture = await lifecycle(root)
     let shutdownCalls = 0
@@ -100,10 +100,72 @@ for (const platform of ["windows-x64", "linux-x64"] as const) {
     expect(await access(root).then(() => true, () => false)).toBe(false)
   })
 
-  test(`${platform} parent-death cleanup accepts only the daemon-owned exit identity`, async () => {
+  test(`${platform} activation failure still authenticates cleanup from the runtime marker`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `cycle-activation-failure-${platform}-`))
+    const fixture = await lifecycle(root)
+    let shutdownCalls = 0
+    try {
+      await expect(cleanupCertifiedDaemon({
+        binding: fixture.run,
+        dataDirectory: join(root, "data"),
+        expectedBinaryPath: fixture.binary,
+        platform,
+        shutdownAdapter: {
+          async shutdown() {
+            shutdownCalls += 1
+            return {
+              pid: fixture.runtime.daemon.pid,
+              processStartTimeUnixMillis: fixture.runtime.daemon.processStartTimeUnixMillis,
+              runDigest: fixture.runtime.runDigest,
+            }
+          },
+          async waitForExit() { return fixture.exit },
+          async waitForProcessAbsence() {},
+        },
+      })).resolves.toMatchObject({
+        markerPublished: true,
+        processAbsent: true,
+        shutdownAuthenticated: true,
+      })
+      expect(shutdownCalls).toBe(1)
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  test(`${platform} no-marker teardown skips authenticated shutdown`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `cycle-no-marker-${platform}-`))
+    const run = binding(root)
+    let shutdownCalls = 0
+    try {
+      await expect(cleanupCertifiedDaemon({
+        binding: run,
+        dataDirectory: join(root, "data"),
+        expectedBinaryPath: join(root, "missing-workflowd"),
+        platform,
+        shutdownAdapter: {
+          async shutdown() { shutdownCalls += 1; throw new Error("must not run") },
+          async waitForExit() { throw new Error("must not run") },
+          async waitForProcessAbsence() { throw new Error("must not run") },
+        },
+      })).resolves.toEqual({
+        exitMarkerPublished: false,
+        markerPublished: false,
+        processAbsent: false,
+        shutdownAuthenticated: false,
+        terminated: false,
+      })
+      expect(shutdownCalls).toBe(0)
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  test(`${platform} cleanup never converts authenticated shutdown failure into success`, async () => {
     const root = await mkdtemp(join(tmpdir(), `cycle-parent-death-${platform}-`))
     const fixture = await lifecycle(root)
     let waits = 0
+    let absenceChecks = 0
     try {
       await expect(cleanupCertifiedDaemon({
         binding: fixture.run,
@@ -114,17 +176,11 @@ for (const platform of ["windows-x64", "linux-x64"] as const) {
         shutdownAdapter: {
           async shutdown() { throw new Error("sidecar already exited") },
           async waitForExit() { waits += 1; return fixture.exit },
-          async waitForProcessAbsence(identity) {
-            expect(identity).toEqual(fixture.runtime.daemon)
-          },
+          async waitForProcessAbsence() { absenceChecks += 1 },
         },
-      })).resolves.toMatchObject({
-        exitMarkerPublished: true,
-        processAbsent: true,
-        shutdownAuthenticated: false,
-        terminated: false,
-      })
-      expect(waits).toBe(1)
+      })).rejects.toThrow("sidecar already exited")
+      expect(waits).toBe(0)
+      expect(absenceChecks).toBe(0)
     } finally {
       await rm(root, { force: true, recursive: true })
     }

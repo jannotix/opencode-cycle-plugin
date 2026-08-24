@@ -70,24 +70,13 @@ export async function cleanupCertifiedDaemon(input: {
     input.binding,
     expectedBinaryPath,
   )
-  let receipt: CertifiedShutdownReceipt | undefined
-  let exit: DesktopDaemonExitMarker | undefined
-  try {
-    receipt = await adapter.shutdown()
-  } catch (error) {
-    try {
-      exit = await adapter.waitForExit()
-    } catch {
-      throw error
-    }
-  }
+  const receipt = await adapter.shutdown()
   if (
-    receipt !== undefined &&
     (receipt.pid !== runtime.daemon.pid ||
       receipt.processStartTimeUnixMillis !== runtime.daemon.processStartTimeUnixMillis ||
       receipt.runDigest !== runtime.runDigest)
   ) throw new Error("Authenticated workflowd shutdown identity mismatch")
-  exit ??= await adapter.waitForExit()
+  const exit = await adapter.waitForExit()
   if (
     exit.runDigest !== runtime.runDigest ||
     !sameDaemonIdentity(exit.daemon, runtime.daemon)
@@ -103,10 +92,10 @@ export async function cleanupCertifiedDaemon(input: {
     processAbsent: true,
     processStartTimeUnixMillis: runtime.daemon.processStartTimeUnixMillis,
     runDigest: runtime.runDigest,
-    shutdownAuthenticated: receipt !== undefined,
+    shutdownAuthenticated: true,
     startedAtUnixMillis: runtime.daemon.startedAtUnixMillis,
     startTokenSha256: createHash("sha256").update(runtime.daemon.startToken).digest("hex"),
-    terminated: receipt !== undefined,
+    terminated: true,
   }
 }
 

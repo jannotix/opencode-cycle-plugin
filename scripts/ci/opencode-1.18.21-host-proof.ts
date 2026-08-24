@@ -13,7 +13,6 @@ import {
 
 export const OPENCODE_11821_HOST_PROOF_PROVENANCE = {
   commit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
-  normalization: "none",
   files: {
     "packages/core/src/v1/config/plugin.ts": "b45a25d030b253b92449050538433c8ab4dd53db9d2c81228cd6133f4d94837c",
     "packages/opencode/src/config/config.ts": "b0fd57d860661ce70e7fbd06e7f2cc24417c70d3db4207ad97129ac1b649997e",
@@ -23,6 +22,13 @@ export const OPENCODE_11821_HOST_PROOF_PROVENANCE = {
     "packages/opencode/src/plugin/loader.ts": "a7eba2d328a36a2486b50245ad98ef0daa769d4109c9e50470d8493b0936c4c0",
     "packages/opencode/src/plugin/shared.ts": "1ada9e15915e47bbb7b16436f0018c9b86845a66e687d89d037be896b9663140",
   },
+  license: {
+    path: "LICENSE",
+    sha256: "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+  },
+  normalization: "none",
+  repository: "https://github.com/anomalyco/opencode",
+  scope: "test-only canonical copies excluded from production archives",
   tag: "v1.18.21",
 } as const
 
@@ -177,6 +183,16 @@ async function buildCanonicalApplyModule(scratch: string, shared: Record<string,
 }
 
 export async function verifyCanonicalFixture(): Promise<void> {
+  const declared = JSON.parse(await readFile(join(fixtureRoot, "PROVENANCE.json"), "utf8")) as unknown
+  if (JSON.stringify(declared) !== JSON.stringify(OPENCODE_11821_HOST_PROOF_PROVENANCE)) {
+    throw new Error("Canonical OpenCode fixture provenance drifted")
+  }
+  const license = await readFile(join(fixtureRoot, OPENCODE_11821_HOST_PROOF_PROVENANCE.license.path))
+  if (
+    license.includes(0x0d) ||
+    (license[0] === 0xef && license[1] === 0xbb && license[2] === 0xbf) ||
+    createHash("sha256").update(license).digest("hex") !== OPENCODE_11821_HOST_PROOF_PROVENANCE.license.sha256
+  ) throw new Error("Canonical OpenCode fixture license drifted")
   for (const [path, expected] of Object.entries(OPENCODE_11821_HOST_PROOF_PROVENANCE.files)) {
     const bytes = await readFile(join(fixtureRoot, path))
     if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {

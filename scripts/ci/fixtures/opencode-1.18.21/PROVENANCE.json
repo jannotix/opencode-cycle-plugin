@@ -1,0 +1,20 @@
+{
+  "commit": "826d9ad46a22bef0294998e08daa3c4904fea28f",
+  "files": {
+    "packages/core/src/v1/config/plugin.ts": "b45a25d030b253b92449050538433c8ab4dd53db9d2c81228cd6133f4d94837c",
+    "packages/opencode/src/config/config.ts": "b0fd57d860661ce70e7fbd06e7f2cc24417c70d3db4207ad97129ac1b649997e",
+    "packages/opencode/src/config/paths.ts": "cd86a34461b27caf1042f8cba140fbbed47790c4f30cd9691f87298e8d4d4444",
+    "packages/opencode/src/config/plugin.ts": "8c450d5c8fdee1811bb93788462958c7e58ea551c73e18a4173c19917c734f6e",
+    "packages/opencode/src/plugin/index.ts": "47c62b7cfae891d268e6b239edb0f1c46df5cb35eb11ccfd8bd4186c156024e9",
+    "packages/opencode/src/plugin/loader.ts": "a7eba2d328a36a2486b50245ad98ef0daa769d4109c9e50470d8493b0936c4c0",
+    "packages/opencode/src/plugin/shared.ts": "1ada9e15915e47bbb7b16436f0018c9b86845a66e687d89d037be896b9663140"
+  },
+  "license": {
+    "path": "LICENSE",
+    "sha256": "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b"
+  },
+  "normalization": "none",
+  "repository": "https://github.com/anomalyco/opencode",
+  "scope": "test-only canonical copies excluded from production archives",
+  "tag": "v1.18.21"
+}

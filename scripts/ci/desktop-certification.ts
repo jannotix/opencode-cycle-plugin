@@ -497,35 +497,44 @@ async function main(): Promise<void> {
   } catch (error: unknown) {
     mainError = error
   } finally {
-    if (desktopProcess !== undefined) {
-      try {
-        await terminateDesktopProcess(desktopProcess, options.platform)
-      } catch (error) {
-        mainError = combineCertificationErrors(mainError, error, "Desktop process cleanup failed")
-      }
-    }
+    const preparedForCleanup = preparedLoad
+    const processCleanup = await cleanupDesktopCertificationProcesses({
+      ...(preparedForCleanup === undefined
+        ? {}
+        : {
+            cleanupDaemon: () => cleanupCertifiedDaemon({
+              binding: certification,
+              dataDirectory: join(scratch, "workflow-data"),
+              expectedBinaryPath: join(
+                preparedForCleanup.installedPlugin,
+                "bin",
+                options.platform === "windows-x64" ? "workflowd.exe" : "workflowd",
+              ),
+              ...(activationDaemon === undefined ? {} : { expectedDaemon: activationDaemon }),
+              platform: options.platform,
+            }),
+          }),
+      ...(desktopProcess === undefined ? {} : { desktopProcess }),
+      existingError: mainError,
+      platform: options.platform,
+    })
+    mainError = processCleanup.error
+    daemonCleanup = processCleanup.daemonCleanup
     if (preparedLoad !== undefined) {
-      try {
-        daemonCleanup = await cleanupCertifiedDaemon({
-          binding: certification,
-          dataDirectory: join(scratch, "workflow-data"),
-          expectedBinaryPath: join(
-            preparedLoad.installedPlugin,
-            "bin",
-            options.platform === "windows-x64" ? "workflowd.exe" : "workflowd",
-          ),
-          ...(activationDaemon === undefined ? {} : { expectedDaemon: activationDaemon }),
-          platform: options.platform,
-        })
-        if (mainError === undefined && !daemonCleanup.markerPublished) {
-          throw new Error("Successful Desktop certification did not publish daemon ownership")
-        }
-        await completeDesktopDaemonCleanupDiagnostic(
-          preparedLoad.diagnosticsFile,
-          certification,
-          "passed",
-        )
-        if (mainError === undefined) {
+      if (daemonCleanup !== undefined && receiptEvidence !== undefined) {
+        try {
+          if (
+            !daemonCleanup.markerPublished ||
+            !daemonCleanup.exitMarkerPublished ||
+            !daemonCleanup.processAbsent ||
+            !daemonCleanup.shutdownAuthenticated ||
+            !daemonCleanup.terminated
+          ) throw new Error("Successful Desktop certification did not complete authenticated daemon cleanup")
+          await completeDesktopDaemonCleanupDiagnostic(
+            preparedLoad.diagnosticsFile,
+            certification,
+            "passed",
+          )
           const diagnostics = await readVerifiedRegularFile(preparedLoad.diagnosticsFile, {
             maxBytes: 64 * 1024,
             root: certification.root,
@@ -534,18 +543,24 @@ async function main(): Promise<void> {
             bytes: diagnostics.content.length,
             sha256: diagnostics.sha256,
           }
+        } catch (error) {
+          await completeDesktopDaemonCleanupDiagnostic(
+            preparedLoad.diagnosticsFile,
+            certification,
+            "failed",
+          ).catch(() => undefined)
+          mainError = combineCertificationErrors(
+            mainError,
+            error,
+            "Desktop certification daemon evidence failed",
+          )
         }
-      } catch (error) {
+      } else if (daemonCleanup === undefined) {
         await completeDesktopDaemonCleanupDiagnostic(
           preparedLoad.diagnosticsFile,
           certification,
           "failed",
         ).catch(() => undefined)
-        mainError = combineCertificationErrors(
-          mainError,
-          error,
-          "Desktop certification and daemon cleanup failed",
-        )
       }
     }
     if (windowsProtocol !== undefined) {
@@ -620,6 +635,35 @@ function sanitizeDesktopFailure(error: unknown): string {
 
 function combineCertificationErrors(existing: unknown, next: unknown, message: string): unknown {
   return existing === undefined ? next : new AggregateError([existing, next], message)
+}
+
+export async function cleanupDesktopCertificationProcesses(input: {
+  readonly cleanupDaemon?: () => Promise<CertifiedDaemonCleanup>
+  readonly desktopProcess?: Bun.Subprocess
+  readonly existingError: unknown
+  readonly platform: CertifiedPlatform
+  readonly terminateDesktop?: (process: Bun.Subprocess, platform: CertifiedPlatform) => Promise<void>
+}): Promise<{ readonly daemonCleanup?: CertifiedDaemonCleanup; readonly error: unknown }> {
+  let error = input.existingError
+  let daemonCleanup: CertifiedDaemonCleanup | undefined
+  if (input.cleanupDaemon !== undefined) {
+    try {
+      daemonCleanup = await input.cleanupDaemon()
+    } catch (cleanupError) {
+      error = combineCertificationErrors(error, cleanupError, "Desktop daemon cleanup failed")
+    }
+  }
+  if (input.desktopProcess !== undefined) {
+    try {
+      await (input.terminateDesktop ?? terminateDesktopProcess)(input.desktopProcess, input.platform)
+    } catch (desktopError) {
+      error = combineCertificationErrors(error, desktopError, "Desktop process cleanup failed")
+    }
+  }
+  return {
+    ...(daemonCleanup === undefined ? {} : { daemonCleanup }),
+    error,
+  }
 }
 
 export async function prepareDesktopCertificationLoad(input: {

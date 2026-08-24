@@ -374,6 +374,7 @@ describe("release manifest", () => {
       { ...evidence, daemon: { ...daemon, exitMarkerPublished: false } },
       { ...evidence, daemon: { ...daemon, processStartTimeUnixMillis: 0 } },
       { ...evidence, daemon: { ...daemon, shutdownAuthenticated: false } },
+      { ...evidence, daemon: { ...daemon, shutdownAuthenticated: false, terminated: false } },
       { ...evidence, daemon: { ...daemon, runDigest: "bad" } },
       { ...evidence, daemon: { ...daemon, startTokenSha256: "bad" } },
       { ...evidence, loadDiagnostics: { ...loadDiagnostics, bytes: 0 } },
