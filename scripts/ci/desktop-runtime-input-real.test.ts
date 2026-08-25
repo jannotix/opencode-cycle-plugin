@@ -9,7 +9,11 @@ import { fileURLToPath } from "node:url"
 
 import { packageNative } from "../packaging/native-package.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
-import { openDesktopDependencyTreeVerification } from "./desktop-dependency-tree.js"
+import {
+  openDesktopDependencyTreeVerification,
+  parseDesktopDependencyTreeManifest,
+  serializeDesktopDependencyTreeManifest,
+} from "./desktop-dependency-tree.js"
 import { bundledDesktopRuntimeLinker } from "./desktop-runtime-linker.js"
 
 test.skipIf(process.platform !== "win32")(
@@ -59,6 +63,13 @@ test.skipIf(process.platform !== "win32")(
         expect(input.runtimeInputSerializedBytes).toBe(25_382_223)
         expect(input.runtimeInputSerializedBytes).toBeLessThan(input.fullTreeSerializedBytes)
         expect(input.runtimeInputSha256).toMatch(/^[0-9a-f]{64}$/u)
+        const dependencyManifest = serializeDesktopDependencyTreeManifest({
+          contentTreeSha256: verification.contentTreeSha256,
+          dependencyTree: verification.receipt,
+          files: verification.contentManifest,
+        })
+        expect(dependencyManifest.byteLength).toBeLessThan(16 * 1024 * 1024)
+        expect(parseDesktopDependencyTreeManifest(dependencyManifest).files).toHaveLength(5_931)
 
         const entry = join(installedPlugin, "dist", "index.js")
         const resultFile = join(temporary, "result.json")

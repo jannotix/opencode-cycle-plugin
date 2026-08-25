@@ -5,7 +5,11 @@ import { join } from "node:path"
 
 import {
   DESKTOP_LINKER_INPUT_MAGIC,
+  desktopDependencyContentTreeSha256,
+  normalizeDesktopDependencyFileIdentity,
   openDesktopDependencyTreeVerification,
+  parseDesktopDependencyTreeManifest,
+  serializeDesktopDependencyTreeManifest,
 } from "./desktop-dependency-tree.js"
 
 test("open dependency proof rejects late directory membership additions", async () => {
@@ -152,6 +156,111 @@ test("runtime input fails before serialization when a required package manifest 
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
+})
+
+test("dependency evidence normalizes Linux and Windows identities for strict JSON round trips", () => {
+  const linuxIdentity = normalizeDesktopDependencyFileIdentity({
+    ctimeNs: 1_787_665_604_123_456_789n,
+    dev: 18_446_744_073_709_551_615n,
+    ino: 9_223_372_036_854_775_807n,
+    mode: 33_188n,
+    mtimeNs: 1_787_665_600_987_654_321n,
+    nlink: 1n,
+    size: 42n,
+  })
+  const windowsIdentity = normalizeDesktopDependencyFileIdentity({
+    ctimeMs: 1_787_665_604_125,
+    dev: 0,
+    ino: 4_294_967_295,
+    mode: 33_206,
+    mtimeMs: 1_787_665_600_875,
+    nlink: 1,
+    size: 84,
+  })
+  expect(linuxIdentity).toEqual({
+    changedNanoseconds: "1787665604123456789",
+    device: "18446744073709551615",
+    inode: "9223372036854775807",
+    linkCount: "1",
+    mode: "33188",
+    modifiedNanoseconds: "1787665600987654321",
+    size: "42",
+  })
+  expect(windowsIdentity).toEqual({
+    changedNanoseconds: "1787665604125000000",
+    device: "0",
+    inode: "4294967295",
+    linkCount: "1",
+    mode: "33206",
+    modifiedNanoseconds: "1787665600875000000",
+    size: "84",
+  })
+  const files = [
+    { identity: windowsIdentity, path: "package.json", sha256: "b".repeat(64) },
+    { identity: linuxIdentity, path: "dist/index.js", sha256: "a".repeat(64) },
+  ]
+  const contentTreeSha256 = desktopDependencyContentTreeSha256(files)
+  const bytes = serializeDesktopDependencyTreeManifest({
+    contentTreeSha256,
+    dependencyTree: {
+      dependencyFileCount: 0,
+      dependencyPackageCount: 0,
+      dependencyTotalBytes: 0,
+      dependencyTreeSha256: "c".repeat(64),
+      schemaVersion: 1,
+    },
+    files,
+  })
+  const parsed = parseDesktopDependencyTreeManifest(bytes)
+  expect(parsed.files.map((file) => file.path)).toEqual(["dist/index.js", "package.json"])
+  expect(parsed.contentTreeSha256).toBe(contentTreeSha256)
+  expect(JSON.parse(JSON.stringify(parsed))).toEqual(parsed)
+  expect(desktopDependencyContentTreeSha256(parsed.files)).toBe(contentTreeSha256)
+  expect(() => parseDesktopDependencyTreeManifest(Buffer.from(JSON.stringify({
+    ...parsed,
+    schemaVersion: 1,
+  })))).toThrow("schema")
+})
+
+test("dependency evidence rejects unsafe numeric truncation and malformed decimal identities", () => {
+  expect(() => normalizeDesktopDependencyFileIdentity({
+    ctimeNs: 1n,
+    dev: Number.MAX_SAFE_INTEGER + 1,
+    ino: 1,
+    mode: 1,
+    mtimeNs: 1n,
+    nlink: 1,
+    size: 1,
+  })).toThrow("unsafe")
+  const identity = normalizeDesktopDependencyFileIdentity({
+    ctimeNs: 1n,
+    dev: 1n,
+    ino: 1n,
+    mode: 1n,
+    mtimeNs: 1n,
+    nlink: 1n,
+    size: 1n,
+  })
+  const input = {
+    contentTreeSha256: "d".repeat(64),
+    dependencyTree: {
+      dependencyFileCount: 0,
+      dependencyPackageCount: 0,
+      dependencyTotalBytes: 0,
+      dependencyTreeSha256: "c".repeat(64),
+      schemaVersion: 1 as const,
+    },
+    files: [{ identity: { ...identity, size: "01" }, path: "package.json", sha256: "b".repeat(64) }],
+  }
+  expect(() => serializeDesktopDependencyTreeManifest(input)).toThrow("malformed")
+  expect(() => serializeDesktopDependencyTreeManifest({
+    ...input,
+    files: [{
+      identity: { ...identity, inode: 1n } as never,
+      path: "package.json",
+      sha256: "b".repeat(64),
+    }],
+  })).toThrow()
 })
 
 async function dependencyFixture(label: string): Promise<{

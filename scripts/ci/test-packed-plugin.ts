@@ -17,6 +17,7 @@ import {
   waitForDesktopActivation,
   type DesktopModuleRuntimeEvidenceMaterial,
 } from "./desktop-certification.js"
+import { serializeDesktopDependencyTreeManifest } from "./desktop-dependency-tree.js"
 import {
   digestOfficialEvidenceError,
   openOfficialRuntimeEvidenceDirectory,
@@ -77,6 +78,7 @@ let launcherStop: string | undefined
 let proof: ReturnType<typeof Bun.spawn> | undefined
 let officialEvidence: OfficialRuntimeEvidenceSession | undefined
 let runtimeEvidence: DesktopModuleRuntimeEvidenceMaterial | undefined
+let dependencyTreeEvidence: Buffer | undefined
 let revision: string | undefined
 let currentStage = "gate-open"
 let runtimeFailureClass: string | undefined
@@ -263,6 +265,22 @@ process.exit(await child.exited)
     scratch,
   })
   await recordStage("runtime-guard-passed")
+  if (officialEvidence !== undefined) {
+    if (runtimeEvidence === undefined) {
+      throw new Error("Official Electron runtime evidence material was not captured")
+    }
+    await recordStage("evidence-material-preparing")
+    dependencyTreeEvidence = serializeDesktopDependencyTreeManifest({
+      contentTreeSha256: runtimeEvidence.contentTreeSha256,
+      dependencyTree: runtimeEvidence.dependencyTree,
+      files: runtimeEvidence.contentManifest,
+    })
+    await recordStage("evidence-material-prepared", {
+      dependencyManifestBytes: dependencyTreeEvidence.byteLength,
+      dependencyManifestSha256: digestBytes(dependencyTreeEvidence),
+    })
+  }
+  await recordStage("host-proof-started")
   const proofRequest = join(scratch, "host-proof-request.json")
   const proofResult = join(scratch, "host-proof-result.json")
   const proofRelease = join(certificationRoot, "host-proof-release")
@@ -337,7 +355,7 @@ process.exit(await child.exited)
   }
   await recordStage("daemon-cleanup-completed")
   if (officialEvidence !== undefined) {
-    if (runtimeEvidence === undefined) {
+    if (runtimeEvidence === undefined || dependencyTreeEvidence === undefined) {
       throw new Error("Official Electron runtime evidence material was not captured")
     }
     const receipt = runtimeEvidence.receipt
@@ -356,13 +374,7 @@ process.exit(await child.exited)
       material: {
         "candidate-entry.js": runtimeEvidence.candidateEntry,
         "candidate-wrapper.js": runtimeEvidence.loader,
-        "dependency-tree-manifest.json": jsonLine({
-          contentTreeSha256: runtimeEvidence.contentTreeSha256,
-          dependencyTree: runtimeEvidence.dependencyTree,
-          files: runtimeEvidence.contentManifest,
-          schemaVersion: 1,
-          type: "opencode-cycle-desktop-dependency-tree-manifest",
-        }),
+        "dependency-tree-manifest.json": dependencyTreeEvidence,
         "desktop-runtime-diagnostics.jsonl": runtimeEvidence.diagnostics,
         "desktop-runtime-linker.mjs": runtimeEvidence.linker,
         "desktop-runtime-result.json": runtimeEvidence.result,

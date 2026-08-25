@@ -9,6 +9,7 @@ import {
   readVerifiedFileDirectory,
   type VerifiedFile,
 } from "../release/verified-file.js"
+import { parseDesktopDependencyTreeManifest } from "./desktop-dependency-tree.js"
 import { writeReceiptAtomically } from "./receipt-output.js"
 
 export const OFFICIAL_RUNTIME_EVIDENCE_DIRECTORY_PREFIX =
@@ -372,6 +373,7 @@ export async function validateOfficialRuntimeEvidenceDirectory(path: string): Pr
       !stageValues.some((stage) => stage.stage === "runtime-completed")
     ) throw new Error("Official Electron success evidence stages are incomplete")
     validateRuntimeStages(stageValues, "none")
+    validateEvidenceMaterialStage(stageValues, byName.get("dependency-tree-manifest.json"))
     validateSuccessfulEvidence(byName, manifest, exit)
   } else {
     const finalStage = stageValues.at(-1)
@@ -379,12 +381,31 @@ export async function validateOfficialRuntimeEvidenceDirectory(path: string): Pr
       finalStage?.stage !== "gate-failed" || !isRecord(finalStage.details) ||
       finalStage.details.errorClass !== exit.errorClass
     ) throw new Error("Official Electron failure evidence stages are incomplete")
-    if (["output_limit", "runtime_exit", "timeout"].includes(String(exit.errorClass))) {
+    if (stageValues.some((stage) => stage.stage === "runtime-guard-passed")) {
+      validateRuntimeStages(stageValues, "none")
+    } else if (["output_limit", "runtime_exit", "timeout"].includes(String(exit.errorClass))) {
       validateRuntimeStages(stageValues, String(exit.errorClass))
     }
     validateFailedEvidence(exit)
   }
   for (const value of [manifest, exit, output]) assertNoSensitiveReceiptValue(value)
+}
+
+function validateEvidenceMaterialStage(
+  stages: readonly Record<string, unknown>[],
+  manifest: VerifiedFile | undefined,
+): void {
+  const prepared = stages.find((stage) => stage.stage === "evidence-material-prepared")
+  const details = isRecord(prepared?.details) ? prepared.details : undefined
+  if (
+    details === undefined || typeof details.dependencyManifestBytes !== "number" ||
+    !Number.isSafeInteger(details.dependencyManifestBytes) ||
+    details.dependencyManifestBytes < 1 || details.dependencyManifestBytes > 16 * 1024 * 1024 ||
+    typeof details.dependencyManifestSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(details.dependencyManifestSha256) || manifest === undefined ||
+    details.dependencyManifestBytes !== manifest.size ||
+    details.dependencyManifestSha256 !== manifest.sha256
+  ) throw new Error("Official Electron evidence material stage is invalid")
 }
 
 function validateRuntimeStages(
@@ -453,8 +474,9 @@ function validateSuccessfulEvidence(
   for (const name of OFFICIAL_RUNTIME_MATERIAL_NAMES) {
     if (!byName.has(name)) throw new Error("Official Electron success evidence is incomplete")
   }
-  const tree = assertJsonArtifact(byName, "dependency-tree-manifest.json", 1,
-    "opencode-cycle-desktop-dependency-tree-manifest", true)
+  const treeFile = byName.get("dependency-tree-manifest.json")
+  if (treeFile === undefined) throw new Error("Official Electron dependency tree evidence is missing")
+  const tree = parseDesktopDependencyTreeManifest(treeFile.content)
   assertJsonLines(byName.get("desktop-runtime-diagnostics.jsonl"))
   const result = assertJsonArtifact(byName, "desktop-runtime-result.json", 3,
     "opencode-cycle-desktop-module-link")
@@ -612,7 +634,6 @@ function assertJsonArtifact(
   name: string,
   schemaVersion: number,
   type: string,
-  allowRelativePaths = false,
 ): Record<string, unknown> {
   const file = files.get(name)
   if (file === undefined) throw new Error(`Official Electron evidence is missing ${name}`)
@@ -625,7 +646,7 @@ function assertJsonArtifact(
   if (!isRecord(value) || value.schemaVersion !== schemaVersion || value.type !== type) {
     throw new Error(`Official Electron evidence schema is invalid: ${name}`)
   }
-  if (!allowRelativePaths) assertNoSensitiveReceiptValue(value)
+  assertNoSensitiveReceiptValue(value)
   return value
 }
 

@@ -13,6 +13,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
+  desktopDependencyContentTreeSha256,
+  serializeDesktopDependencyTreeManifest,
+} from "./desktop-dependency-tree.js"
+import {
   OFFICIAL_RUNTIME_EVIDENCE_DIRECTORY_PREFIX,
   openOfficialRuntimeEvidenceDirectory,
   validateOfficialRuntimeEvidenceDirectory,
@@ -49,11 +53,12 @@ test("official evidence target rejects existing, nonempty, linked and nested dir
   }
 }, { timeout: 60_000 })
 
-test("throw, runtime timeout and output limit each leave complete durable failure evidence", async () => {
-  for (const [label, errorClass, runtime] of [
-    ["throw-before-runtime", "package_error", false],
-    ["runtime-timeout", "timeout", true],
-    ["runtime-output-limit", "output_limit", true],
+test("throw, runtime failures and post-runtime publication each leave complete durable evidence", async () => {
+  for (const [label, errorClass, runtime, runtimePassed] of [
+    ["throw-before-runtime", "package_error", false, false],
+    ["runtime-timeout", "timeout", true, false],
+    ["runtime-output-limit", "output_limit", true, false],
+    ["post-runtime-publication", "evidence_publication", true, true],
   ] as const) {
     const path = evidencePath(label)
     try {
@@ -62,7 +67,13 @@ test("throw, runtime timeout and output limit each leave complete durable failur
       if (runtime) {
         await session.recordStage("module-graph-prepared", runtimeInputPrepared())
         await session.recordStage("runtime-started", runtimeStarted())
-        await session.recordStage("runtime-completed", runtimeCompleted(errorClass))
+        await session.recordStage("runtime-completed", runtimeCompleted(
+          runtimePassed ? "none" : errorClass,
+        ))
+        if (runtimePassed) {
+          await session.recordStage("runtime-guard-passed")
+          await session.recordStage("evidence-material-preparing")
+        }
       }
       const publication = await session.finalizeFailure({
         errorClass,
@@ -78,7 +89,7 @@ test("throw, runtime timeout and output limit each leave complete durable failur
       await rm(path, { force: true, recursive: true })
     }
   }
-}, { timeout: 60_000 })
+}, { timeout: 180_000 })
 
 test("partial success publication becomes durable evidence_publication failure", async () => {
   const path = evidencePath("partial")
@@ -130,14 +141,16 @@ test("successful official evidence is durable, exact, path-free and cleanup-inde
   const internalScratch = await mkdtemp(join(tmpdir(), "cycle-official-internal-scratch-"))
   try {
     const session = await openOfficialRuntimeEvidenceDirectory(path)
+    const evidence = material()
     await session.recordStage("gate-started", { revision: "c".repeat(40) })
     await session.recordStage("module-graph-prepared", runtimeInputPrepared())
     await session.recordStage("runtime-started", runtimeStarted())
     await session.recordStage("runtime-completed", runtimeCompleted("none"))
+    await recordEvidenceMaterial(session, evidence)
     const publication = await session.publish({
       binding: binding(),
       gateOutput: emptyOutput(),
-      material: material(),
+      material: evidence,
     })
     expect(publication).toMatchObject({
       evidenceManifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
@@ -192,7 +205,21 @@ async function successfulSession(path: string) {
   await session.recordStage("module-graph-prepared", runtimeInputPrepared())
   await session.recordStage("runtime-started", runtimeStarted())
   await session.recordStage("runtime-completed", runtimeCompleted("none"))
+  await recordEvidenceMaterial(session, material())
   return session
+}
+
+async function recordEvidenceMaterial(
+  session: Awaited<ReturnType<typeof openOfficialRuntimeEvidenceDirectory>>,
+  evidence: ReturnType<typeof material>,
+): Promise<void> {
+  const manifest = evidence["dependency-tree-manifest.json"]
+  await session.recordStage("runtime-guard-passed")
+  await session.recordStage("evidence-material-preparing")
+  await session.recordStage("evidence-material-prepared", {
+    dependencyManifestBytes: manifest.byteLength,
+    dependencyManifestSha256: digest(manifest),
+  })
 }
 
 function runtimeInputPrepared() {
@@ -271,7 +298,29 @@ function material() {
   const linker = Buffer.from("export default true\n")
   const dependencyTreeSha256 = "4".repeat(64)
   const graphSha256 = "5".repeat(64)
-  const contentTreeSha256 = "e".repeat(64)
+  const identity = {
+    changedNanoseconds: "1000000",
+    device: "1",
+    inode: "2",
+    linkCount: "1",
+    mode: "33188",
+    modifiedNanoseconds: "1000000",
+    size: "20",
+  }
+  const contentFiles = [
+    { identity, path: "dist/index.js", sha256: "f".repeat(64) },
+    { identity, path: "node_modules/a/index.js", sha256: "1".repeat(64) },
+    { identity, path: "node_modules/a/package.json", sha256: "2".repeat(64) },
+    { identity, path: "package.json", sha256: "3".repeat(64) },
+  ]
+  const contentTreeSha256 = desktopDependencyContentTreeSha256(contentFiles)
+  const dependencyTree = {
+    dependencyFileCount: 2,
+    dependencyPackageCount: 1,
+    dependencyTotalBytes: 40,
+    dependencyTreeSha256,
+    schemaVersion: 1 as const,
+  }
   const candidateEntrySha256 = digest(candidate)
   const linkerSha256 = digest(linker)
   const loaderSha256 = digest(wrapper)
@@ -329,17 +378,10 @@ function material() {
   return {
     "candidate-entry.js": candidate,
     "candidate-wrapper.js": wrapper,
-    "dependency-tree-manifest.json": json({
+    "dependency-tree-manifest.json": serializeDesktopDependencyTreeManifest({
       contentTreeSha256,
-      dependencyTree: { dependencyTreeSha256 },
-      files: [
-        { path: "dist/index.js", sha256: "f".repeat(64), size: 20 },
-        { path: "node_modules/a/index.js", sha256: "1".repeat(64), size: 20 },
-        { path: "node_modules/a/package.json", sha256: "2".repeat(64), size: 20 },
-        { path: "package.json", sha256: "3".repeat(64), size: 20 },
-      ],
-      schemaVersion: 1,
-      type: "opencode-cycle-desktop-dependency-tree-manifest",
+      dependencyTree,
+      files: contentFiles,
     }),
     "desktop-runtime-diagnostics.jsonl": json({
       runDigest: "1".repeat(64),

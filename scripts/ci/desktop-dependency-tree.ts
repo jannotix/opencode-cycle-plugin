@@ -40,9 +40,27 @@ export interface DesktopDependencyTreeVerification {
 }
 
 export interface DesktopDependencyContentFile {
+  readonly identity: DesktopDependencyFileIdentity
   readonly path: string
   readonly sha256: string
-  readonly size: number
+}
+
+export interface DesktopDependencyFileIdentity {
+  readonly changedNanoseconds: string
+  readonly device: string
+  readonly inode: string
+  readonly linkCount: string
+  readonly mode: string
+  readonly modifiedNanoseconds: string
+  readonly size: string
+}
+
+export interface DesktopDependencyTreeManifest {
+  readonly contentTreeSha256: string
+  readonly dependencyTree: DesktopDependencyTreeReceipt
+  readonly files: readonly DesktopDependencyContentFile[]
+  readonly schemaVersion: 2
+  readonly type: "opencode-cycle-desktop-dependency-tree-manifest"
 }
 
 export interface DesktopDependencyLinkerInput {
@@ -61,6 +79,7 @@ export interface DesktopDependencyLinkerInput {
 interface HeldDependencyFile {
   readonly content: Buffer
   readonly handle: FileHandle
+  readonly identity: DesktopDependencyFileIdentity
   readonly metadata: string
   readonly path: string
   readonly relativePath: string
@@ -173,11 +192,11 @@ export async function openDesktopDependencyTreeVerification(
       abort: close,
       contentManifest: [...held]
         .map((file) => ({
+          identity: file.identity,
           path: file.relativePath,
           sha256: file.sha256,
-          size: file.content.byteLength,
         }))
-        .sort((left, right) => left.path.localeCompare(right.path)),
+        .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0),
       contentTreeSha256: initial.contentTreeSha256,
       openLinkerInput() {
         if (closed) throw new Error("Desktop dependency verification handles are closed")
@@ -318,14 +337,15 @@ async function captureDependencyMembership(
       if (membershipMetadata(after) !== membershipMetadata(details)) {
         throw new Error("Desktop dependency membership file changed identity")
       }
-      const metadata = membershipMetadata(after)
+      const identity = normalizeDesktopDependencyFileIdentity(after)
+      const metadata = identityMetadata(identity)
       const sha256 = createHash("sha256").update(content).digest("hex")
       records.push(
         `${name}\0file\0${metadata}\0${sha256}\n`,
       )
       contentRecords.push(`${name}\0${content.byteLength}\0${sha256}\n`)
       if (held === undefined) await handle.close()
-      else held.push({ content, handle, metadata, path, relativePath: name, sha256 })
+      else held.push({ content, handle, identity, metadata, path, relativePath: name, sha256 })
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error
@@ -460,26 +480,210 @@ function runtimeInputDigest(files: readonly RuntimeInputFile[]): string {
   return createHash("sha256").update(canonical).digest("hex")
 }
 
-function membershipMetadata(details: Awaited<ReturnType<typeof lstat>>): string {
-  const value = details as unknown as {
-    readonly ctimeNs?: bigint
-    readonly dev: bigint | number
-    readonly ino: bigint | number
-    readonly mode: bigint | number
-    readonly mtimeMs: number
-    readonly mtimeNs?: bigint
-    readonly nlink: bigint | number
-    readonly size: bigint | number
+export function normalizeDesktopDependencyFileIdentity(
+  value: unknown,
+): DesktopDependencyFileIdentity {
+  if (!isRecord(value)) throw new Error("Desktop dependency file identity is invalid")
+  const identity = {
+    changedNanoseconds: nanoseconds(value.ctimeNs, value.ctimeMs),
+    device: decimalInteger(value.dev),
+    inode: decimalInteger(value.ino),
+    linkCount: decimalInteger(value.nlink),
+    mode: decimalInteger(value.mode),
+    modifiedNanoseconds: nanoseconds(value.mtimeNs, value.mtimeMs),
+    size: decimalInteger(value.size),
   }
+  validateDesktopDependencyFileIdentity(identity, false)
+  return identity
+}
+
+export function desktopDependencyContentTreeSha256(
+  files: readonly DesktopDependencyContentFile[],
+): string {
+  const normalized = normalizeContentManifest(files)
+  const canonical = normalized.map((file) =>
+    `${file.path}\0${file.identity.size}\0${file.sha256}\n`).sort().join("")
+  return createHash("sha256").update(canonical).digest("hex")
+}
+
+export function serializeDesktopDependencyTreeManifest(input: {
+  readonly contentTreeSha256: string
+  readonly dependencyTree: DesktopDependencyTreeReceipt
+  readonly files: readonly DesktopDependencyContentFile[]
+}): Buffer {
+  const manifest = normalizedDependencyTreeManifest({
+    ...input,
+    schemaVersion: 2,
+    type: "opencode-cycle-desktop-dependency-tree-manifest",
+  })
+  return Buffer.from(`${JSON.stringify(manifest)}\n`)
+}
+
+export function parseDesktopDependencyTreeManifest(
+  content: Uint8Array,
+): DesktopDependencyTreeManifest {
+  let value: unknown
+  try {
+    value = JSON.parse(Buffer.from(content).toString("utf8")) as unknown
+  } catch {
+    throw new Error("Desktop dependency tree manifest JSON is malformed")
+  }
+  return normalizedDependencyTreeManifest(value)
+}
+
+function normalizedDependencyTreeManifest(value: unknown): DesktopDependencyTreeManifest {
+  if (!isRecord(value)) throw new Error("Desktop dependency tree manifest is invalid")
+  assertExactKeys(value, ["contentTreeSha256", "dependencyTree", "files", "schemaVersion", "type"])
+  if (
+    value.schemaVersion !== 2 || value.type !== "opencode-cycle-desktop-dependency-tree-manifest" ||
+    typeof value.contentTreeSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.contentTreeSha256) || !Array.isArray(value.files)
+  ) throw new Error("Desktop dependency tree manifest schema is invalid")
+  const files = normalizeContentManifest(value.files)
+  const dependencyTree = normalizeDependencyTreeReceipt(value.dependencyTree)
+  if (desktopDependencyContentTreeSha256(files) !== value.contentTreeSha256) {
+    throw new Error("Desktop dependency tree manifest content digest is invalid")
+  }
+  return {
+    contentTreeSha256: value.contentTreeSha256,
+    dependencyTree,
+    files,
+    schemaVersion: 2,
+    type: "opencode-cycle-desktop-dependency-tree-manifest",
+  }
+}
+
+function normalizeContentManifest(value: readonly unknown[]): DesktopDependencyContentFile[] {
+  if (value.length < 1 || value.length > MAX_DEPENDENCY_FILES) {
+    throw new Error("Desktop dependency content manifest file count is invalid")
+  }
+  const files = value.map((item) => {
+    if (!isRecord(item)) throw new Error("Desktop dependency content manifest entry is invalid")
+    assertExactKeys(item, ["identity", "path", "sha256"])
+    if (
+      typeof item.path !== "string" || item.path.includes("\\") || item.path.includes("\0") ||
+      item.path.split("/").some((segment) => segment === "" || segment === "." || segment === "..") ||
+      typeof item.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(item.sha256)
+    ) throw new Error("Desktop dependency content manifest entry is invalid")
+    const identity = normalizedIdentityRecord(item.identity)
+    return { identity, path: item.path, sha256: item.sha256 }
+  }).sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+  if (files.some((file, index) => index > 0 && files[index - 1]?.path === file.path)) {
+    throw new Error("Desktop dependency content manifest contains a duplicate path")
+  }
+  return files
+}
+
+function normalizedIdentityRecord(value: unknown): DesktopDependencyFileIdentity {
+  if (!isRecord(value)) throw new Error("Desktop dependency content identity is invalid")
+  assertExactKeys(value, [
+    "changedNanoseconds",
+    "device",
+    "inode",
+    "linkCount",
+    "mode",
+    "modifiedNanoseconds",
+    "size",
+  ])
+  const identity = {
+    changedNanoseconds: decimalString(value.changedNanoseconds),
+    device: decimalString(value.device),
+    inode: decimalString(value.inode),
+    linkCount: decimalString(value.linkCount),
+    mode: decimalString(value.mode),
+    modifiedNanoseconds: decimalString(value.modifiedNanoseconds),
+    size: decimalString(value.size),
+  }
+  validateDesktopDependencyFileIdentity(identity)
+  return identity
+}
+
+function validateDesktopDependencyFileIdentity(
+  identity: DesktopDependencyFileIdentity,
+  requirePrivate = true,
+): void {
+  if (
+    (requirePrivate && identity.linkCount !== "1") ||
+    BigInt(identity.size) > BigInt(MAX_DEPENDENCY_FILE_BYTES)
+  ) throw new Error("Desktop dependency file identity is outside its bound")
+}
+
+function normalizeDependencyTreeReceipt(value: unknown): DesktopDependencyTreeReceipt {
+  if (!isRecord(value)) throw new Error("Desktop dependency tree receipt is invalid")
+  assertExactKeys(value, [
+    "dependencyFileCount",
+    "dependencyPackageCount",
+    "dependencyTotalBytes",
+    "dependencyTreeSha256",
+    "schemaVersion",
+  ])
+  if (
+    value.schemaVersion !== 1 || typeof value.dependencyFileCount !== "number" ||
+    !Number.isSafeInteger(value.dependencyFileCount) || value.dependencyFileCount < 0 ||
+    typeof value.dependencyPackageCount !== "number" ||
+    !Number.isSafeInteger(value.dependencyPackageCount) || value.dependencyPackageCount < 0 ||
+    typeof value.dependencyTotalBytes !== "number" ||
+    !Number.isSafeInteger(value.dependencyTotalBytes) || value.dependencyTotalBytes < 0 ||
+    typeof value.dependencyTreeSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.dependencyTreeSha256)
+  ) throw new Error("Desktop dependency tree receipt is invalid")
+  return value as unknown as DesktopDependencyTreeReceipt
+}
+
+function assertExactKeys(value: Readonly<Record<string, unknown>>, expected: readonly string[]): void {
+  const actual = Object.keys(value).sort()
+  const keys = [...expected].sort()
+  if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
+    throw new Error("Desktop dependency manifest has missing or unknown fields")
+  }
+}
+
+function decimalInteger(value: unknown): string {
+  if (typeof value === "bigint") {
+    if (value < 0n) throw new Error("Desktop dependency identity integer is negative")
+    return value.toString(10)
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Desktop dependency identity number is unsafe")
+    }
+    return String(value)
+  }
+  if (typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value)) return value
+  throw new Error("Desktop dependency identity decimal is malformed")
+}
+
+function decimalString(value: unknown): string {
+  if (typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value)) return value
+  throw new Error("Desktop dependency identity decimal is malformed")
+}
+
+function nanoseconds(nanosecondValue: unknown, millisecondValue: unknown): string {
+  if (nanosecondValue !== undefined) return decimalInteger(nanosecondValue)
+  if (typeof millisecondValue === "bigint") return (millisecondValue * 1_000_000n).toString(10)
+  if (
+    typeof millisecondValue !== "number" || !Number.isFinite(millisecondValue) ||
+    millisecondValue < 0 || !Number.isSafeInteger(Math.trunc(millisecondValue))
+  ) throw new Error("Desktop dependency identity timestamp is unsafe")
+  const whole = Math.trunc(millisecondValue)
+  const fraction = Math.round((millisecondValue - whole) * 1_000_000)
+  return (BigInt(whole) * 1_000_000n + BigInt(fraction)).toString(10)
+}
+
+function identityMetadata(identity: DesktopDependencyFileIdentity): string {
   return [
-    String(value.dev),
-    String(value.ino),
-    String(value.size),
-    value.mtimeNs === undefined ? String(value.mtimeMs) : String(value.mtimeNs),
-    value.ctimeNs === undefined ? "unavailable" : String(value.ctimeNs),
-    String(value.nlink),
-    String(value.mode),
+    identity.device,
+    identity.inode,
+    identity.size,
+    identity.modifiedNanoseconds,
+    identity.changedNanoseconds,
+    identity.linkCount,
+    identity.mode,
   ].join("\0")
+}
+
+function membershipMetadata(details: Awaited<ReturnType<typeof lstat>>): string {
+  return identityMetadata(normalizeDesktopDependencyFileIdentity(details))
 }
 
 async function rejectAncestorDependencyRoots(root: string): Promise<void> {
