@@ -87,11 +87,9 @@ process.exit(await child.exited)
   await run(["tar", "-xf", archive, "-C", extracted], root)
   const installedPackage = join(extracted, "package")
   await run(
-    ["bun", "install", "--ignore-scripts", "--production", "--no-save", native.archive],
+    ["bun", "install", "--backend=copyfile", "--ignore-scripts", "--linker=hoisted", "--production", "--no-save", native.archive],
     installedPackage,
   )
-  const node = Bun.which("node")
-  if (node === null) throw new Error("Packed plugin Node runtime is unavailable")
   const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
   const certificationRoot = join(scratch, "certification")
   const dataDirectory = join(scratch, "runtime-data")
@@ -125,31 +123,21 @@ process.exit(await child.exited)
     scratch,
   })
   const officialRuntime = process.env.CYCLE_OFFICIAL_ELECTRON_RUNTIME
-  let runtimeCommand: string[]
-  if (officialRuntime !== undefined) {
-    const runtime = resolve(officialRuntime)
-    if (!isAbsolute(officialRuntime) || runtime !== officialRuntime) {
-      throw new Error("Official Electron runtime path must be canonical and absolute")
-    }
-    await access(runtime)
-    runtimeCommand = [runtime]
-  } else {
-    const fakeRuntime = join(scratch, "fake-electron-runtime.mjs")
-    await writeFile(fakeRuntime, `
-import { pathToFileURL } from "node:url"
-Object.defineProperty(process.versions, "electron", { value: "42.3.3" })
-Object.defineProperty(process.versions, "node", { value: "24.15.0" })
-await import(pathToFileURL(process.argv[2]).href)
-`)
-    runtimeCommand = [node, fakeRuntime]
+  if (officialRuntime === undefined) {
+    throw new Error("Packed plugin gate requires an official Electron runtime")
   }
+  const runtime = resolve(officialRuntime)
+  if (!isAbsolute(officialRuntime) || runtime !== officialRuntime) {
+    throw new Error("Official Electron runtime path must be canonical and absolute")
+  }
+  await access(runtime)
   await verifyDesktopModuleRuntime({
     binding,
     cwd: project,
     environment,
     hostVersion: "1.18.21",
     prepared,
-    runtimeCommand,
+    runtimeCommand: [runtime],
     scratch,
   })
   const proofRequest = join(scratch, "host-proof-request.json")

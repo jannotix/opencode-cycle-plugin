@@ -35,6 +35,10 @@ Supported platform values are `windows-x64` and `linux-x64`. The command downloa
 
 For an offline or repeated run, append `--desktop-asset <path>`. A supplied file is copied into the disposable certification workspace and must match the same pinned byte count and SHA-256; local input never bypasses authenticity or compatibility checks.
 
+Before Desktop launch, certification materializes a private copyfile dependency tree inside the isolated plugin root and rejects ancestor resolution, links, hard links and path escapes. The official Electron/Node process runs a trusted supervisor, which imports the candidate only in a separate same-runtime child and accepts one challenge-bound acknowledgement after import. Desktop evidence retains the supervisor, child wrapper, runtime executable, generated loader, candidate entry and dependency-tree digests.
+
+The packed-plugin gate never fabricates Electron or Node identity. Set `CYCLE_OFFICIAL_ELECTRON_RUNTIME` to the canonical absolute path of the retained official runtime when running `bun run test:package`; the gate fails closed when that runtime is absent.
+
 ## Publication order
 
 Native packages are published before the plugin so its optional platform dependency is resolvable. The plugin is published last. GitHub release creation occurs only after package publication succeeds. npm and GitHub publication use a protected `release` environment; local developer machines are not an authorized publication path.

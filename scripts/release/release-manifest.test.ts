@@ -110,6 +110,30 @@ function certificationEvidence(targetRevision = revision): Record<string, unknow
       version: "1.18.21",
     },
     loadDiagnostics: { bytes: 1024, sha256: "8".repeat(64) },
+    moduleRuntime: {
+      acknowledgementSha256: "a".repeat(64),
+      bindingDigest: "4".repeat(64),
+      candidateEntrySha256: "b".repeat(64),
+      childExitCode: 0,
+      childWrapperSha256: "c".repeat(64),
+      dependencyFileCount: 100,
+      dependencyPackageCount: 10,
+      dependencyTotalBytes: 10_000,
+      dependencyTreeSha256: "d".repeat(64),
+      electronVersion: "42.3.3",
+      loaderSha256: "e".repeat(64),
+      moduleResolved: true,
+      nativePackageSha256,
+      nodeVersion: "24.15.0",
+      pluginPackageSha256,
+      productVersion: "1.18.21",
+      revision: targetRevision,
+      runtimeExecutableSha256: "f".repeat(64),
+      schemaVersion: 2,
+      supervisorSha256: "0".repeat(64),
+      type: "opencode-cycle-desktop-runtime-guard",
+    },
+
     nativePackageSha256,
     platform,
     pluginPackageSha256,
@@ -361,6 +385,7 @@ describe("release manifest", () => {
     const controlPlane = evidence.controlPlane as Record<string, unknown>
     const daemon = evidence.daemon as Record<string, unknown>
     const loadDiagnostics = evidence.loadDiagnostics as Record<string, unknown>
+    const moduleRuntime = evidence.moduleRuntime as Record<string, unknown>
     const mutations: unknown[] = [
       { ...evidence, unexpected: true },
       { ...evidence, activationNonce: "not-a-nonce" },
@@ -379,6 +404,12 @@ describe("release manifest", () => {
       { ...evidence, daemon: { ...daemon, startTokenSha256: "bad" } },
       { ...evidence, loadDiagnostics: { ...loadDiagnostics, bytes: 0 } },
       { ...evidence, loadDiagnostics: { ...loadDiagnostics, sha256: "bad" } },
+      { ...evidence, moduleRuntime: undefined },
+      { ...evidence, moduleRuntime: { ...moduleRuntime, childExitCode: 1 } },
+      { ...evidence, moduleRuntime: { ...moduleRuntime, dependencyTreeSha256: "bad" } },
+      { ...evidence, moduleRuntime: { ...moduleRuntime, runtimeExecutableSha256: "bad" } },
+      { ...evidence, moduleRuntime: { ...moduleRuntime, revision: otherRevision } },
+      { ...evidence, moduleRuntime: { ...moduleRuntime, unexpected: true } },
       { ...evidence, desktop: { ...desktop, version: "1.18.20" } },
       { ...evidence, desktop: { ...desktop, sha256: "f".repeat(64) } },
       { ...evidence, desktop: { ...desktop, size: 1 } },

@@ -42,6 +42,31 @@ import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile }
 import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
 import { prepareReceiptOutput, publishReceiptAtomically } from "./receipt-output.js"
 import { cleanupCertifiedDaemon, type CertifiedDaemonCleanup } from "./certified-daemon.js"
+import {
+  verifyDesktopDependencyTree,
+  type DesktopDependencyTreeReceipt,
+} from "./desktop-dependency-tree.js"
+
+export { verifyDesktopDependencyTree }
+
+import {
+  createDesktopRuntimeAcknowledgement,
+  desktopRuntimeChildEnvironment,
+  validateDesktopRuntimeChildResult,
+} from "./desktop-runtime-supervisor.js"
+
+export {
+  createDesktopRuntimeAcknowledgement,
+  desktopRuntimeChildEnvironment,
+  validateDesktopRuntimeChildResult,
+}
+
+import {
+  desktopRuntimeChildSource,
+  desktopRuntimeSupervisorSource,
+  type DesktopRuntimeSupervisorSourceExpected,
+} from "./desktop-runtime-source.js"
+
 
 export interface DesktopAsset {
   readonly name: string
@@ -72,7 +97,7 @@ type DesktopAuthenticity =
 
 const DESKTOP_LOAD_DIAGNOSTIC_FILE = "desktop-load-diagnostics.jsonl"
 const DESKTOP_RUNTIME_GUARD_DIAGNOSTIC_FILE = "desktop-runtime-guard-diagnostics.jsonl"
-const DESKTOP_RUNTIME_GUARD_FILE = "desktop-runtime-guard.json"
+const DESKTOP_RUNTIME_GUARD_FILE_PREFIX = "desktop-runtime-guard-"
 const DESKTOP_RUNTIME_GUARD_TYPE = "opencode-cycle-desktop-runtime-guard"
 const DESKTOP_RUNTIME_GUARD_ENV = "CYCLE_DESKTOP_RUNTIME_GUARD"
 const OFFICIAL_DESKTOP_RUNTIME = {
@@ -118,6 +143,7 @@ interface DesktopLoadDiagnostic {
 export interface PreparedDesktopCertificationLoad {
   readonly configDirectory: string
   readonly configFile: string
+  readonly dependencyTree: DesktopDependencyTreeReceipt
   readonly diagnosticsFile: string
   readonly installedPlugin: string
   readonly pluginLoader: string
@@ -126,8 +152,15 @@ export interface PreparedDesktopCertificationLoad {
 }
 
 export interface DesktopModuleRuntimeReceipt {
+  readonly acknowledgementSha256: string
   readonly bindingDigest: string
   readonly candidateEntrySha256: string
+  readonly childExitCode: 0
+  readonly childWrapperSha256: string
+  readonly dependencyFileCount: number
+  readonly dependencyPackageCount: number
+  readonly dependencyTotalBytes: number
+  readonly dependencyTreeSha256: string
   readonly electronVersion: string
   readonly loaderSha256: string
   readonly moduleResolved: true
@@ -136,7 +169,9 @@ export interface DesktopModuleRuntimeReceipt {
   readonly pluginPackageSha256: string
   readonly productVersion: string
   readonly revision: string
-  readonly schemaVersion: 1
+  readonly runtimeExecutableSha256: string
+  readonly schemaVersion: 2
+  readonly supervisorSha256: string
   readonly type: typeof DESKTOP_RUNTIME_GUARD_TYPE
 }
 
@@ -386,6 +421,7 @@ async function main(): Promise<void> {
   let desktopProfile: string | undefined
   let preparedLoad: PreparedDesktopCertificationLoad | undefined
   let receiptEvidence: Record<string, unknown> | undefined
+  let moduleRuntimeEvidence: DesktopModuleRuntimeReceipt | undefined
   let activationDaemon: DesktopDaemonIdentity | undefined
   let daemonCleanup: CertifiedDaemonCleanup | undefined
   let loadDiagnosticsEvidence: { readonly bytes: number; readonly sha256: string } | undefined
@@ -425,7 +461,7 @@ async function main(): Promise<void> {
     )
     if (options.platform !== "windows-x64") await chmod(nativeExecutable, 0o755)
     await run(
-      ["bun", "install", "--ignore-scripts", "--production", "--no-save", nativeArchive],
+      ["bun", "install", "--backend=copyfile", "--ignore-scripts", "--linker=hoisted", "--production", "--no-save", nativeArchive],
       installedPlugin,
       environment,
     )
@@ -451,7 +487,7 @@ async function main(): Promise<void> {
     })
 
     const desktop = await prepareDesktop(options.platform, assetPath, scratch, environment)
-    await verifyDesktopModuleRuntime({
+    moduleRuntimeEvidence = await verifyDesktopModuleRuntime({
       binding: certification,
       cwd: project,
       environment,
@@ -532,6 +568,7 @@ async function main(): Promise<void> {
         size: asset.size,
         version: matrix.version,
       },
+      moduleRuntime: moduleRuntimeEvidence,
       nativePackageSha256,
       platform: options.platform,
       pluginPackageSha256,
@@ -1049,7 +1086,14 @@ export default async function OpenCodeCyclePlugin(input, options) {
     }, null, 2)}\n`,
     { encoding: "utf8", flag: "wx", mode: 0o600 },
   )
-  return { configDirectory, configFile, installedPlugin: installRoot, pluginLoader }
+  const dependencyTree = await verifyDesktopDependencyTree(installRoot)
+  return {
+    configDirectory,
+    configFile,
+    dependencyTree,
+    installedPlugin: installRoot,
+    pluginLoader,
+}
 }
 
 function desktopLoadDiagnosticWriterSource(
@@ -1248,13 +1292,44 @@ export async function completeDesktopDaemonCleanupDiagnostic(
   )
 }
 
-async function copyDirectory(from: string, to: string): Promise<void> {
+async function copyDirectory(
+  from: string,
+  to: string,
+  sourceRoot?: string,
+  ancestors = new Set<string>(),
+): Promise<void> {
+  const root = sourceRoot ?? await realpath(resolve(from))
+  const realSource = await realpath(resolve(from))
+  if (!isDesktopHarnessPath(realSource, root)) {
+    throw new Error("Desktop package material escapes its install source")
+  }
+  if (ancestors.has(realSource)) {
+    throw new Error("Desktop package material contains a directory cycle")
+  }
+  const details = await stat(realSource)
+  if (!details.isDirectory()) {
+    throw new Error("Desktop package material root is not a directory")
+  }
+  const nextAncestors = new Set(ancestors)
+  nextAncestors.add(realSource)
   await mkdir(to, { recursive: true })
-  for (const entry of await readdir(from, { withFileTypes: true })) {
-    const source = join(from, entry.name)
+  const entries = await readdir(realSource, { withFileTypes: true })
+  entries.sort((left, right) => left.name.localeCompare(right.name))
+  for (const entry of entries) {
+    const source = join(realSource, entry.name)
     const destination = join(to, entry.name)
-    if (entry.isDirectory()) await copyDirectory(source, destination)
-    else await copyFile(source, destination)
+    const realEntry = await realpath(source)
+    if (!isDesktopHarnessPath(realEntry, root)) {
+      throw new Error("Desktop package material contains an external link")
+    }
+    const entryDetails = await stat(realEntry)
+    if (entryDetails.isDirectory()) {
+      await copyDirectory(realEntry, destination, root, nextAncestors)
+    } else if (entryDetails.isFile()) {
+      await copyFile(realEntry, destination)
+    } else {
+      throw new Error("Desktop package material contains a non-file entry")
+    }
   }
 }
 
@@ -1353,18 +1428,9 @@ async function verifyDesktopAssetFile(asset: DesktopAsset, path: string): Promis
   }
 }
 
-interface DesktopModuleRuntimeGuardExpected {
-  readonly binding: DesktopCertificationBinding
-  readonly bindingDigest: string
-  readonly candidateEntry: string
-  readonly candidateEntrySha256: string
-  readonly configFile: string
-  readonly electronVersion: string
-  readonly hostVersion: string
-  readonly loader: string
-  readonly loaderSha256: string
-  readonly nodeVersion: string
-  readonly resultFile: string
+interface DesktopModuleRuntimeGuardExpected extends DesktopRuntimeSupervisorSourceExpected {
+  readonly supervisor: string
+  readonly supervisorSha256: string
 }
 
 export interface DesktopModuleRuntimeGuardPlan {
@@ -1411,6 +1477,10 @@ export async function prepareDesktopModuleRuntimeGuard(input: {
   if (!isDesktopHarnessPath(candidateEntry, input.prepared.installedPlugin)) {
     throw new Error("Official Desktop module runtime guard candidate entry is outside its package")
   }
+  const dependencyTree = await verifyDesktopDependencyTree(input.prepared.installedPlugin)
+  if (JSON.stringify(dependencyTree) !== JSON.stringify(input.prepared.dependencyTree)) {
+    throw new Error("Official Desktop module runtime dependency tree changed")
+  }
   const [candidate, loader] = await Promise.all([
     readVerifiedRegularFile(candidateEntry, {
       maxBytes: 4 * 1024 * 1024,
@@ -1422,40 +1492,73 @@ export async function prepareDesktopModuleRuntimeGuard(input: {
     }),
   ])
   const bindingDigest = desktopCertificationBindingDigest(input.binding)
-  const resultFile = join(input.binding.root, DESKTOP_RUNTIME_GUARD_FILE)
-  const guardScript = join(
-    input.prepared.configDirectory,
-    "cycle-certification",
-    "desktop-runtime-guard.mjs",
+  const resultFile = join(
+    input.binding.root,
+    `${DESKTOP_RUNTIME_GUARD_FILE_PREFIX}${randomBytes(16).toString("hex")}.json`,
   )
-  const expected = {
+  const certificationDirectory = join(input.prepared.configDirectory, "cycle-certification")
+  const childWrapper = join(certificationDirectory, "desktop-runtime-child.mjs")
+  const supervisor = join(certificationDirectory, "desktop-runtime-supervisor.mjs")
+  await writeFile(
+    childWrapper,
+    desktopRuntimeChildSource({
+      candidateEntry,
+      candidateEntrySha256: candidate.sha256,
+      dependencyTreeSha256: dependencyTree.dependencyTreeSha256,
+      electronVersion: OFFICIAL_DESKTOP_RUNTIME.electronVersion,
+      nodeVersion: OFFICIAL_DESKTOP_RUNTIME.nodeVersion,
+    }),
+    { encoding: "utf8", flag: "wx", mode: 0o600 },
+  )
+  const child = await readVerifiedRegularFile(childWrapper, {
+    maxBytes: 256 * 1024,
+    root: certificationDirectory,
+  })
+  const sourceExpected: DesktopRuntimeSupervisorSourceExpected = {
     binding: input.binding,
     bindingDigest,
     candidateEntry,
     candidateEntrySha256: candidate.sha256,
+    childEnvironment: desktopRuntimeChildEnvironment(input.environment),
+    childWrapper,
+    childWrapperSha256: child.sha256,
+    configDirectory: input.prepared.configDirectory,
     configFile: input.prepared.configFile,
+    cwd: resolve(input.cwd),
+    dependencyTree,
+    diagnosticsFile: input.prepared.runtimeGuardDiagnosticsFile,
     electronVersion: OFFICIAL_DESKTOP_RUNTIME.electronVersion,
+    environmentBindings: environmentBindingsForLoader(input.environment),
     hostVersion: input.hostVersion,
     loader: input.prepared.pluginLoader,
     loaderSha256: loader.sha256,
     nodeVersion: OFFICIAL_DESKTOP_RUNTIME.nodeVersion,
     resultFile,
+    scratch: resolve(input.scratch),
   }
-  await writeFile(guardScript, desktopModuleRuntimeGuardSource(expected), {
+  await writeFile(supervisor, desktopRuntimeSupervisorSource(sourceExpected), {
     encoding: "utf8",
     flag: "wx",
     mode: 0o600,
   })
+  const supervisorFile = await readVerifiedRegularFile(supervisor, {
+    maxBytes: 512 * 1024,
+    root: certificationDirectory,
+  })
   return {
     binding: input.binding,
-    command: [...input.runtimeCommand, guardScript],
-    cwd: input.cwd,
+    command: [...input.runtimeCommand, supervisor],
+    cwd: resolve(input.cwd),
     environment: Object.fromEntries(Object.entries({
       ...input.environment,
       [DESKTOP_RUNTIME_GUARD_ENV]: bindingDigest,
       ELECTRON_RUN_AS_NODE: "1",
     }).flatMap(([key, value]) => typeof value === "string" ? [[key, value]] : [])),
-    expected,
+    expected: {
+      ...sourceExpected,
+      supervisor,
+      supervisorSha256: supervisorFile.sha256,
+    },
     runtimeGuardDiagnosticsFile: input.prepared.runtimeGuardDiagnosticsFile,
   }
 }
@@ -1478,26 +1581,36 @@ export async function verifyDesktopModuleRuntime(input: {
     windowsHide: true,
   })
   let timedOut = false
-  let outputExceeded = false
+  let timeout: ReturnType<typeof setTimeout> | undefined
   const exit = Promise.race([
     child.exited,
-    Bun.sleep(30_000).then(async () => {
-      timedOut = true
-      child.kill()
-      return child.exited
+    new Promise<number>((resolve) => {
+      timeout = setTimeout(() => {
+        timedOut = true
+        child.kill()
+        void child.exited.then(resolve)
+      }, 30_000)
     }),
   ])
-  const [exitCode, stdout, stderr] = await Promise.all([
-    exit,
-    readBoundedRuntimeOutput(child.stdout, () => {
-      outputExceeded = true
-      child.kill()
-    }),
-    readBoundedRuntimeOutput(child.stderr, () => {
-      outputExceeded = true
-      child.kill()
-    }),
-  ])
+  let exitCode: number
+  let stdout: Buffer
+  let stderr: Buffer
+  let outputExceeded = false
+  try {
+    ;[exitCode, stdout, stderr] = await Promise.all([
+      exit,
+      readBoundedRuntimeOutput(child.stdout, () => {
+        outputExceeded = true
+        child.kill()
+      }),
+      readBoundedRuntimeOutput(child.stderr, () => {
+        outputExceeded = true
+        child.kill()
+      }),
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
   return validateDesktopModuleRuntimeGuard(plan, {
     exitCode,
     outputExceeded,
@@ -1527,10 +1640,36 @@ export async function validateDesktopModuleRuntimeGuard(
       `Official Desktop module runtime guard failed: class=${errorClass}, code=${execution.exitCode}, output_sha256=${outputDigest}`,
     )
   }
-  const result = await readVerifiedRegularFile(plan.expected.resultFile, {
-    maxBytes: 64 * 1024,
-    root: plan.binding.root,
-  })
+  const [result, candidate, loader, child, supervisor, dependencyTree] = await Promise.all([
+    readVerifiedRegularFile(plan.expected.resultFile, {
+      maxBytes: 64 * 1024,
+      root: plan.binding.root,
+    }),
+    readVerifiedRegularFile(plan.expected.candidateEntry, {
+      maxBytes: 4 * 1024 * 1024,
+      root: dirname(plan.expected.candidateEntry),
+    }),
+    readVerifiedRegularFile(plan.expected.loader, {
+      maxBytes: 256 * 1024,
+      root: dirname(plan.expected.loader),
+    }),
+    readVerifiedRegularFile(plan.expected.childWrapper, {
+      maxBytes: 256 * 1024,
+      root: dirname(plan.expected.childWrapper),
+    }),
+    readVerifiedRegularFile(plan.expected.supervisor, {
+      maxBytes: 512 * 1024,
+      root: dirname(plan.expected.supervisor),
+    }),
+    verifyDesktopDependencyTree(dirname(dirname(plan.expected.candidateEntry))),
+  ])
+  if (
+    candidate.sha256 !== plan.expected.candidateEntrySha256 ||
+    loader.sha256 !== plan.expected.loaderSha256 ||
+    child.sha256 !== plan.expected.childWrapperSha256 ||
+    supervisor.sha256 !== plan.expected.supervisorSha256 ||
+    JSON.stringify(dependencyTree) !== JSON.stringify(plan.expected.dependencyTree)
+  ) throw new Error("Official Desktop module runtime material changed during proof")
   const receipt = JSON.parse(result.content.toString("utf8")) as unknown
   assertDesktopModuleRuntimeReceipt(receipt, plan.expected)
   const guardDiagnostics = await readDesktopLoadTranscript(
@@ -1543,73 +1682,6 @@ export async function validateDesktopModuleRuntimeGuard(
     guardDiagnostics[5]?.stage !== "candidate_module_resolved"
   ) throw new Error("Official Desktop module runtime guard diagnostics are incomplete")
   return receipt as DesktopModuleRuntimeReceipt
-}
-
-function desktopModuleRuntimeGuardSource(expected: Record<string, unknown>): string {
-  return `import { createHash } from "node:crypto"
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs"
-import { isAbsolute, resolve } from "node:path"
-import { pathToFileURL } from "node:url"
-
-const expected = ${JSON.stringify(expected)}
-const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex")
-const bindingDigest = createHash("sha256").update(JSON.stringify({
-  nativePackageSha256: expected.binding.nativePackageSha256,
-  nonce: expected.binding.nonce,
-  pluginPackageSha256: expected.binding.pluginPackageSha256,
-  revision: expected.binding.revision,
-  root: expected.binding.root,
-  startedAtUnixMillis: expected.binding.startedAtUnixMillis,
-})).digest("hex")
-if (
-  process.versions.electron !== expected.electronVersion ||
-  process.versions.node !== expected.nodeVersion ||
-  process.env.${DESKTOP_RUNTIME_GUARD_ENV} !== expected.bindingDigest ||
-  bindingDigest !== expected.bindingDigest
-) throw new Error("runtime identity")
-const config = JSON.parse(readFileSync(expected.configFile, "utf8"))
-if (!Array.isArray(config.plugin) || config.plugin.length !== 1 || !Array.isArray(config.plugin[0])) {
-  throw new Error("config tuple")
-}
-const [specifier, options] = config.plugin[0]
-if (
-  specifier !== pathToFileURL(expected.loader).href ||
-  !options || typeof options !== "object" || Array.isArray(options) ||
-  Object.keys(options).sort().join(",") !== "binaryPath,certification,dataDirectory,hostVersion" ||
-  JSON.stringify(options.certification) !== JSON.stringify(expected.binding) ||
-  options.hostVersion !== expected.hostVersion ||
-  !isAbsolute(options.binaryPath) || !isAbsolute(options.dataDirectory)
-) throw new Error("config binding")
-const manifest = JSON.parse(readFileSync(resolve(expected.candidateEntry, "..", "..", "package.json"), "utf8"))
-if (manifest?.exports?.["."] !== "./dist/index.js") throw new Error("candidate export")
-if (digest(expected.candidateEntry) !== expected.candidateEntrySha256) throw new Error("candidate digest")
-if (digest(expected.loader) !== expected.loaderSha256) throw new Error("loader digest")
-const loaded = await import(pathToFileURL(expected.loader).href)
-if (Object.keys(loaded).sort().join(",") !== "default" || typeof loaded.default !== "function") {
-  throw new Error("module export")
-}
-const receipt = {
-  bindingDigest: expected.bindingDigest,
-  candidateEntrySha256: expected.candidateEntrySha256,
-  electronVersion: process.versions.electron,
-  loaderSha256: expected.loaderSha256,
-  moduleResolved: true,
-  nativePackageSha256: expected.binding.nativePackageSha256,
-  nodeVersion: process.versions.node,
-  pluginPackageSha256: expected.binding.pluginPackageSha256,
-  productVersion: expected.hostVersion,
-  revision: expected.binding.revision,
-  schemaVersion: 1,
-  type: ${JSON.stringify(DESKTOP_RUNTIME_GUARD_TYPE)},
-}
-const handle = openSync(expected.resultFile, "wx", 0o600)
-try {
-  writeSync(handle, JSON.stringify(receipt) + "\\n", undefined, "utf8")
-  fsyncSync(handle)
-} finally {
-  closeSync(handle)
-}
-`
 }
 
 async function readBoundedRuntimeOutput(
@@ -1635,22 +1707,21 @@ async function readBoundedRuntimeOutput(
 
 function assertDesktopModuleRuntimeReceipt(
   value: unknown,
-  expected: {
-    readonly binding: DesktopCertificationBinding
-    readonly bindingDigest: string
-    readonly candidateEntrySha256: string
-    readonly electronVersion: string
-    readonly hostVersion: string
-    readonly loaderSha256: string
-    readonly nodeVersion: string
-  },
+  expected: DesktopModuleRuntimeGuardExpected,
 ): asserts value is DesktopModuleRuntimeReceipt {
+  const tree = expected.dependencyTree
   if (
     !isRecord(value) ||
     Object.keys(value).sort().join(",") !==
-      "bindingDigest,candidateEntrySha256,electronVersion,loaderSha256,moduleResolved,nativePackageSha256,nodeVersion,pluginPackageSha256,productVersion,revision,schemaVersion,type" ||
+      "acknowledgementSha256,bindingDigest,candidateEntrySha256,childExitCode,childWrapperSha256,dependencyFileCount,dependencyPackageCount,dependencyTotalBytes,dependencyTreeSha256,electronVersion,loaderSha256,moduleResolved,nativePackageSha256,nodeVersion,pluginPackageSha256,productVersion,revision,runtimeExecutableSha256,schemaVersion,supervisorSha256,type" ||
     value.bindingDigest !== expected.bindingDigest ||
     value.candidateEntrySha256 !== expected.candidateEntrySha256 ||
+    value.childExitCode !== 0 ||
+    value.childWrapperSha256 !== expected.childWrapperSha256 ||
+    value.dependencyFileCount !== tree.dependencyFileCount ||
+    value.dependencyPackageCount !== tree.dependencyPackageCount ||
+    value.dependencyTotalBytes !== tree.dependencyTotalBytes ||
+    value.dependencyTreeSha256 !== tree.dependencyTreeSha256 ||
     value.electronVersion !== expected.electronVersion ||
     value.loaderSha256 !== expected.loaderSha256 ||
     value.moduleResolved !== true ||
@@ -1659,8 +1730,13 @@ function assertDesktopModuleRuntimeReceipt(
     value.pluginPackageSha256 !== expected.binding.pluginPackageSha256 ||
     value.productVersion !== expected.hostVersion ||
     value.revision !== expected.binding.revision ||
-    value.schemaVersion !== 1 ||
-    value.type !== DESKTOP_RUNTIME_GUARD_TYPE
+    value.schemaVersion !== 2 ||
+    value.supervisorSha256 !== expected.supervisorSha256 ||
+    value.type !== DESKTOP_RUNTIME_GUARD_TYPE ||
+    typeof value.acknowledgementSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.acknowledgementSha256) ||
+    typeof value.runtimeExecutableSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.runtimeExecutableSha256)
   ) throw new Error("Official Desktop module runtime guard receipt is invalid")
 }
 

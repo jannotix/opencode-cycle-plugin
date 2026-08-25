@@ -198,6 +198,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "daemon",
         "desktop",
         "loadDiagnostics",
+        "moduleRuntime",
         "nativePackageSha256",
         "platform",
         "pluginPackageSha256",
@@ -240,6 +241,34 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       ["bytes", "sha256"],
       "Desktop load diagnostics evidence",
     )
+    const moduleRuntime = requireExactRecord(
+      evidence.moduleRuntime,
+      [
+        "acknowledgementSha256",
+        "bindingDigest",
+        "candidateEntrySha256",
+        "childExitCode",
+        "childWrapperSha256",
+        "dependencyFileCount",
+        "dependencyPackageCount",
+        "dependencyTotalBytes",
+        "dependencyTreeSha256",
+        "electronVersion",
+        "loaderSha256",
+        "moduleResolved",
+        "nativePackageSha256",
+        "nodeVersion",
+        "pluginPackageSha256",
+        "productVersion",
+        "revision",
+        "runtimeExecutableSha256",
+        "schemaVersion",
+        "supervisorSha256",
+        "type",
+      ],
+      "Desktop module runtime evidence",
+    )
+
     const asset = DESKTOP_ASSET_METADATA[platform]
     if (
       evidence.activationMarker !== PRODUCT_IDENTITY.activationMarker ||
@@ -292,6 +321,34 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       loadDiagnostics.bytes < 1 ||
       loadDiagnostics.bytes > 64 * 1024 ||
       typeof loadDiagnostics.sha256 !== "string" ||
+      moduleRuntime.childExitCode !== 0 ||
+      moduleRuntime.moduleResolved !== true ||
+      moduleRuntime.electronVersion !== "42.3.3" ||
+      moduleRuntime.nodeVersion !== "24.15.0" ||
+      moduleRuntime.productVersion !== OPENCODE_DESKTOP_VERSION ||
+      moduleRuntime.schemaVersion !== 2 ||
+      moduleRuntime.type !== "opencode-cycle-desktop-runtime-guard" ||
+      typeof moduleRuntime.dependencyFileCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.dependencyFileCount) ||
+      moduleRuntime.dependencyFileCount < 1 ||
+      typeof moduleRuntime.dependencyPackageCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.dependencyPackageCount) ||
+      moduleRuntime.dependencyPackageCount < 1 ||
+      typeof moduleRuntime.dependencyTotalBytes !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.dependencyTotalBytes) ||
+      moduleRuntime.dependencyTotalBytes < 1 ||
+      typeof moduleRuntime.acknowledgementSha256 !== "string" ||
+      typeof moduleRuntime.bindingDigest !== "string" ||
+      typeof moduleRuntime.candidateEntrySha256 !== "string" ||
+      typeof moduleRuntime.childWrapperSha256 !== "string" ||
+      typeof moduleRuntime.dependencyTreeSha256 !== "string" ||
+      typeof moduleRuntime.loaderSha256 !== "string" ||
+      typeof moduleRuntime.nativePackageSha256 !== "string" ||
+      typeof moduleRuntime.pluginPackageSha256 !== "string" ||
+      typeof moduleRuntime.revision !== "string" ||
+      typeof moduleRuntime.runtimeExecutableSha256 !== "string" ||
+      typeof moduleRuntime.supervisorSha256 !== "string" ||
+
       typeof evidence.nativePackageSha256 !== "string" ||
       typeof evidence.pluginPackageSha256 !== "string"
     ) {
@@ -309,11 +366,25 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(daemon.startTokenSha256)
     validateDigest(daemon.runDigest)
     validateDigest(loadDiagnostics.sha256)
+    validateDigest(moduleRuntime.acknowledgementSha256)
+    validateDigest(moduleRuntime.bindingDigest)
+    validateDigest(moduleRuntime.candidateEntrySha256)
+    validateDigest(moduleRuntime.childWrapperSha256)
+    validateDigest(moduleRuntime.dependencyTreeSha256)
+    validateDigest(moduleRuntime.loaderSha256)
+    validateDigest(moduleRuntime.runtimeExecutableSha256)
+    validateDigest(moduleRuntime.supervisorSha256)
+    validateRevision(moduleRuntime.revision)
+
     if (
       evidence.activationRevision !== evidence.revision ||
       evidence.activationPluginPackageSha256 !== evidence.pluginPackageSha256 ||
       evidence.activationNativePackageSha256 !== evidence.nativePackageSha256 ||
-      evidence.activationRunDigest !== daemon.runDigest
+      evidence.activationRunDigest !== daemon.runDigest ||
+      moduleRuntime.bindingDigest !== evidence.activationRunDigest ||
+      moduleRuntime.nativePackageSha256 !== evidence.nativePackageSha256 ||
+      moduleRuntime.pluginPackageSha256 !== evidence.pluginPackageSha256 ||
+      moduleRuntime.revision !== evidence.revision
     ) {
       throw new Error("Desktop activation binding does not match the receipt")
     }

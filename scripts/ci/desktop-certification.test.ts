@@ -52,6 +52,7 @@ const {
   fetchDesktopAsset,
   parseWindowsProtocolRegistration,
   prepareDesktopCertificationLoad,
+  prepareDesktopModuleRuntimeGuard,
   stageDesktopAsset,
   terminateDesktopProcess,
   validateDesktopAsset,
@@ -445,59 +446,187 @@ test("native certification requires an official Electron module-runtime guard be
   expect(launch).toBeGreaterThan(guard)
 })
 
-test("Desktop module runtime guard validates exact wrapper, package and runtime bindings", async () => {
+test("Desktop runtime guard isolates candidate import from the trusted supervisor", async () => {
   const node = Bun.which("node")
   expect(node).toBeString()
-  for (const electronVersion of ["42.3.3", "0.0.0"] as const) {
-    const fixture = await createDesktopLoadFixture()
-    try {
-      const runtime = join(fixture.temporary, `fake-electron-${electronVersion}.mjs`)
-      await writeFile(runtime, `
-import { pathToFileURL } from "node:url"
-Object.defineProperty(process.versions, "electron", { value: ${JSON.stringify(electronVersion)} })
-Object.defineProperty(process.versions, "node", { value: "24.15.0" })
-await import(pathToFileURL(process.argv[2]).href)
-`)
-      const proof = verifyDesktopModuleRuntime({
-        binding: fixture.binding,
-        cwd: fixture.temporary,
-        environment: fixture.environment,
-        hostVersion: "1.18.21",
-        prepared: fixture.prepared,
-        runtimeCommand: [node as string, runtime],
-        scratch: fixture.temporary,
-      })
-      if (electronVersion === "42.3.3") {
-        const receipt = await proof
-        expect(receipt).toMatchObject({
-          electronVersion,
-          moduleResolved: true,
-          nodeVersion: "24.15.0",
-          productVersion: "1.18.21",
-          revision: fixture.binding.revision,
-          type: "opencode-cycle-desktop-runtime-guard",
+  const fixture = await createDesktopLoadFixture()
+  try {
+    const plan = await prepareDesktopModuleRuntimeGuard({
+      binding: fixture.binding,
+      cwd: fixture.temporary,
+      environment: fixture.environment,
+      hostVersion: "1.18.21",
+      prepared: fixture.prepared,
+      runtimeCommand: [node as string],
+      scratch: fixture.temporary,
+    })
+    const [childSource, supervisorSource] = await Promise.all([
+      readFile(plan.expected.childWrapper, "utf8"),
+      readFile(plan.expected.supervisor, "utf8"),
+    ])
+    const syntaxExits = await Promise.all(
+      [plan.expected.childWrapper, plan.expected.supervisor].map(async (path) => {
+        const child = Bun.spawn([node as string, "--check", path], {
+          stderr: "ignore",
+          stdout: "ignore",
+          windowsHide: true,
         })
-        expect(await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)).toContain(
-          "config_path_discovered=missing",
-        )
-      } else {
-        let failure: unknown
-        try {
-          await proof
-        } catch (error) {
-          failure = error
-        }
-        expect(failure).toBeInstanceOf(Error)
-        expect((failure as Error).message).toMatch(
-          /^Official Desktop module runtime guard failed: class=runtime_exit, code=1, output_sha256=[0-9a-f]{64}$/u,
-        )
-        expect((failure as Error).message).not.toContain(fixture.temporary)
-      }
-    } finally {
-      await rm(fixture.temporary, { force: true, recursive: true })
-    }
+        return child.exited
+      }),
+    )
+    expect(syntaxExits).toEqual([0, 0])
+
+    const encodedResultFile = JSON.stringify(plan.expected.resultFile).slice(1, -1)
+    const encodedBindingRoot = JSON.stringify(fixture.binding.root).slice(1, -1)
+    expect(plan.command).toEqual([node as string, plan.expected.supervisor])
+    expect(supervisorSource).toContain("fork(expected.childWrapper")
+    expect(supervisorSource).toContain(encodedResultFile)
+    expect(childSource).toContain("await import(pathToFileURL(expected.candidateEntry).href)")
+    expect(childSource).not.toContain(encodedResultFile)
+    expect(childSource).not.toContain(encodedBindingRoot)
+    expect(childSource).not.toContain(fixture.binding.nonce)
+    expect(Object.keys(plan.expected.childEnvironment).some((key) =>
+      key.startsWith("CYCLE_") || key.startsWith("OPENCODE_")
+    )).toBe(false)
+    expect(plan.expected.dependencyTree).toEqual(fixture.prepared.dependencyTree)
+    expect(plan.expected.childWrapperSha256).toMatch(/^[0-9a-f]{64}$/u)
+    expect(plan.expected.supervisorSha256).toMatch(/^[0-9a-f]{64}$/u)
+  } finally {
+    await rm(fixture.temporary, { force: true, recursive: true })
   }
-}, 20_000)
+})
+
+test("runtime child acknowledgement cannot be replaced by exit zero or predictable output", async () => {
+  const module = await import("./desktop-certification.js") as Record<string, unknown>
+  const acknowledge = module.createDesktopRuntimeAcknowledgement
+  const validate = module.validateDesktopRuntimeChildResult
+  const childEnvironment = module.desktopRuntimeChildEnvironment
+  expect(acknowledge).toBeFunction()
+  expect(validate).toBeFunction()
+  expect(childEnvironment).toBeFunction()
+  if (
+    typeof acknowledge !== "function" ||
+    typeof validate !== "function" ||
+    typeof childEnvironment !== "function"
+  ) return
+  const challenge = Buffer.from("11".repeat(32), "hex")
+  const payload = {
+    candidateEntrySha256: "a".repeat(64),
+    childWrapperSha256: "b".repeat(64),
+    dependencyTreeSha256: "c".repeat(64),
+    electronVersion: "42.3.3",
+    nodeVersion: "24.15.0",
+    runtimeExecutableSha256: "d".repeat(64),
+  }
+  const createAck = acknowledge as (challenge: Buffer, payload: Record<string, unknown>) => string
+  const verify = validate as (input: Record<string, unknown>) => void
+  const acknowledgement = createAck(challenge, payload)
+
+  expect(() => verify({
+    challenge,
+    exitCode: 0,
+    expectedPayload: payload,
+    stderr: Buffer.alloc(0),
+    stdout: Buffer.alloc(0),
+  })).toThrow("acknowledgement")
+  expect(() => verify({
+    challenge,
+    exitCode: 0,
+    expectedPayload: payload,
+    stderr: Buffer.alloc(0),
+    stdout: Buffer.from(JSON.stringify({
+      acknowledgement: "0".repeat(64),
+      payload,
+      type: "runtime-imported",
+    }) + "\n"),
+  })).toThrow("acknowledgement")
+  expect(() => verify({
+    challenge,
+    exitCode: 0,
+    expectedPayload: payload,
+    stderr: Buffer.alloc(0),
+    stdout: Buffer.from(JSON.stringify({
+      acknowledgement,
+      payload,
+      type: "runtime-imported",
+    }) + "\n"),
+  })).not.toThrow()
+
+  const privateEnvironment = (childEnvironment as (
+    environment: NodeJS.ProcessEnv,
+  ) => Record<string, string>)({
+    CYCLE_CERTIFICATION_NONCE: "private",
+    CYCLE_CERTIFICATION_ROOT: "private-root",
+    CYCLE_DESKTOP_RUNTIME_GUARD: "private-guard",
+    OPENCODE_CONFIG: "private-config",
+    PATH: "safe-path",
+    SystemRoot: "C:\\Windows",
+  })
+  expect(privateEnvironment).toEqual(expect.objectContaining({
+    ELECTRON_RUN_AS_NODE: "1",
+    PATH: "safe-path",
+    SystemRoot: "C:\\Windows",
+  }))
+  expect(Object.keys(privateEnvironment).some((key) =>
+    key.startsWith("CYCLE_") || key.startsWith("OPENCODE_")
+  )).toBe(false)
+})
+
+test("Desktop dependency proof rejects ancestor fallback and binds a contained tree", async () => {
+  const module = await import("./desktop-certification.js") as Record<string, unknown>
+  const verifyTree = module.verifyDesktopDependencyTree
+  expect(verifyTree).toBeFunction()
+  if (typeof verifyTree !== "function") return
+  const temporary = await mkdtemp(join(tmpdir(), "cycle-contained-dependencies-"))
+  const installed = join(temporary, "stage", "opencode-cycle")
+  const ancestorDependency = join(temporary, "node_modules", "fixture-dependency")
+  try {
+    await Promise.all([
+      mkdir(join(installed, "dist"), { recursive: true }),
+      mkdir(ancestorDependency, { recursive: true }),
+    ])
+    await Promise.all([
+      writeFile(join(installed, "package.json"), JSON.stringify({
+        dependencies: { "fixture-dependency": "1.0.0" },
+        exports: { ".": "./dist/index.js" },
+        type: "module",
+      }) + "\n"),
+      writeFile(join(installed, "dist", "index.js"), "export default () => ({})\n"),
+      writeFile(join(ancestorDependency, "package.json"), JSON.stringify({
+        name: "fixture-dependency",
+        version: "1.0.0",
+      }) + "\n"),
+      writeFile(join(ancestorDependency, "index.js"), "export default true\n"),
+    ])
+    await expect((verifyTree as (root: string) => Promise<unknown>)(installed))
+      .rejects.toThrow("contained")
+    await rm(join(temporary, "node_modules"), { force: true, recursive: true })
+
+    const contained = join(installed, "node_modules", "fixture-dependency")
+    await mkdir(contained, { recursive: true })
+    await Promise.all([
+      writeFile(join(contained, "package.json"), JSON.stringify({
+        name: "fixture-dependency",
+        version: "1.0.0",
+      }) + "\n"),
+      writeFile(join(contained, "index.js"), "export default true\n"),
+    ])
+    const receipt = await (verifyTree as (root: string) => Promise<Record<string, unknown>>)(installed)
+    expect(receipt).toMatchObject({
+      dependencyFileCount: 2,
+      dependencyPackageCount: 1,
+      schemaVersion: 1,
+    })
+    expect(receipt.dependencyTreeSha256).toMatch(/^[0-9a-f]{64}$/u)
+  } finally {
+    await rm(temporary, { force: true, recursive: true })
+  }
+})
+
+test("package unit coverage never overwrites process runtime identity", async () => {
+  const source = await readFile(resolve(import.meta.dir, "test-packed-plugin.ts"), "utf8")
+  expect(source).not.toContain("Object.defineProperty(process.versions")
+})
 
 test("production Desktop helpers expose no optional verified-file reader overrides", async () => {
   const source = await readFile(resolve(import.meta.dir, "desktop-certification.ts"), "utf8")
