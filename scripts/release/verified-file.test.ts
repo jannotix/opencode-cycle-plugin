@@ -1,13 +1,33 @@
 import { expect, test } from "bun:test"
-import { link, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { link, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
   assertStableOpenFile,
+  assertNoReparseMaterial,
   createVerifiedFileReaderForTests,
   readVerifiedFileDirectory,
 } from "./verified-file.js"
+
+test("Windows reparse verification accepts an existing extended-length regular file", async () => {
+  if (process.platform !== "win32") return
+  const root = await mkdtemp(join(tmpdir(), "cycle-verified-long-"))
+  try {
+    let directory = root
+    while (join(directory, "artifact.tgz").length <= 260) {
+      directory = join(directory, "contained-segment-0123456789")
+      await mkdir(directory)
+    }
+    const path = join(directory, "artifact.tgz")
+    await writeFile(path, "artifact")
+    expect((await lstat(path)).isFile()).toBe(true)
+    expect(path.length).toBeGreaterThan(260)
+    await expect(assertNoReparseMaterial([path])).resolves.toBeUndefined()
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
 
 test("verified file directory rejects hard links and linked roots", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "cycle-verified-files-"))

@@ -231,7 +231,7 @@ async function assertNoWindowsReparse(paths: readonly string[]): Promise<void> {
       SystemRoot: systemRoot,
     },
     stderr: "pipe",
-    stdin: Buffer.from(JSON.stringify({ paths })),
+    stdin: Buffer.from(JSON.stringify({ paths: paths.map(windowsExtendedLengthPath) })),
     stdout: "pipe",
   })
   const [exitCode, stdout, stderr] = await Promise.all([
@@ -250,6 +250,13 @@ async function assertNoWindowsReparse(paths: readonly string[]): Promise<void> {
     throw new Error("Windows reparse detection returned malformed output")
   }
   if (value.values.some(Boolean)) throw new Error("Release material contains a Windows reparse point")
+}
+
+function windowsExtendedLengthPath(path: string): string {
+  const absolute = win32.resolve(path)
+  if (absolute.startsWith("\\\\?\\")) return absolute
+  if (absolute.startsWith("\\\\")) return `\\\\?\\UNC\\${absolute.slice(2)}`
+  return `\\\\?\\${absolute}`
 }
 
 function assertRegularSingleLink(stats: BigIntStats, name: string): void {

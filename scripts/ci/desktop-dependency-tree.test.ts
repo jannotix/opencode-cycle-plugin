@@ -33,6 +33,18 @@ test("open dependency proof rejects a same-size path replacement", async () => {
   }
 })
 
+test("open dependency proof fails closed when a verified member is removed", async () => {
+  const fixture = await dependencyFixture("removed-member")
+  const session = await openDesktopDependencyTreeVerification(fixture.installedPlugin)
+  try {
+    await rm(join(fixture.dependency, "index.js"))
+    await expect(session.verifyAndClose()).rejects.toThrow("changed")
+  } finally {
+    await session.abort()
+    await rm(fixture.temporary, { force: true, recursive: true })
+  }
+})
+
 async function dependencyFixture(label: string): Promise<{
   readonly dependency: string
   readonly installedPlugin: string
