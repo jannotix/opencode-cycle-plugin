@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
+import { TRUSTED_BROWSER_RUNTIME_BOUNDARY_HEADER } from "./browser-runtime-boundary.js"
+
 test("browser runtime bundle excludes the unrelated Puppeteer CLI loader graph", async () => {
   const root = resolve(import.meta.dir, "../..")
   const pluginManifest = JSON.parse(await readFile(
@@ -38,22 +40,24 @@ test("browser runtime bundle excludes the unrelated Puppeteer CLI loader graph",
   expect({ exitCode, stderr, stdout }).toEqual({ exitCode: 0, stderr: "", stdout: "" })
 
   const bundle = await readFile(
-    resolve(root, "packages", "opencode-cycle", "dist", "browser", "managed-browser-session.cjs"),
+    resolve(root, "packages", "opencode-cycle", "dist", "browser", "managed-browser-worker.mjs"),
     "utf8",
   )
   const wrapper = await readFile(
     resolve(root, "packages", "opencode-cycle", "dist", "browser", "managed-browser-session.js"),
     "utf8",
   )
+  expect(bundle.startsWith(TRUSTED_BROWSER_RUNTIME_BOUNDARY_HEADER)).toBeTrue()
   expect(bundle).not.toContain("createRequire")
   expect(bundle).not.toContain("yargs")
   expect(bundle).not.toContain('import("proxy-agent")')
-  expect(bundle).toContain('require("@puppeteer/browsers/lib/launch.js")')
-  expect(wrapper).toBe([
-    'import runtime from "./managed-browser-session.cjs"',
-    "export const { ManagedBrowserSessionFactory } = runtime",
-    "",
-  ].join("\n"))
+  expect(bundle).toContain('from "@puppeteer/browsers/lib/launch.js"')
+  expect(wrapper).toContain('import.meta.resolve("./managed-browser-worker.mjs")')
+  expect(wrapper).toContain("spawn(process.execPath")
+  expect(wrapper).not.toContain("managed-browser-session.cjs")
+  expect(await readFile(
+    resolve(root, "packages", "opencode-cycle", "dist", "browser", "managed-browser-session.cjs"),
+  ).then(() => true, () => false)).toBeFalse()
   const node = Bun.which("node")
   expect(node).toBeString()
   const moduleUrl = pathToFileURL(resolve(

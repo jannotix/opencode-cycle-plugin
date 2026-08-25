@@ -3,6 +3,7 @@ import type { Dir } from "node:fs"
 import { lstat, mkdir, opendir, readdir, realpath, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 
 import {
   assertNoReparseMaterial,
@@ -16,11 +17,9 @@ export const OFFICIAL_RUNTIME_EVIDENCE_DIRECTORY_PREFIX =
   "opencode-cycle-official-evidence-"
 
 export const OFFICIAL_RUNTIME_MATERIAL_NAMES = [
-  "candidate-entry.js",
-  "candidate-wrapper.js",
   "dependency-tree-manifest.json",
   "desktop-runtime-diagnostics.jsonl",
-  "desktop-runtime-linker.mjs",
+  "desktop-runtime-provenance.json",
   "desktop-runtime-result.json",
   "runtime-output-summary.json",
   "runtime-receipt.json",
@@ -34,11 +33,9 @@ const STAGE_FILE = /^stage-(\d{3})-([a-z][a-z0-9-]*)\.json$/u
 type OfficialRuntimeMaterialName = typeof OFFICIAL_RUNTIME_MATERIAL_NAMES[number]
 
 const MATERIAL_LIMITS: Readonly<Record<OfficialRuntimeMaterialName, number>> = {
-  "candidate-entry.js": 4 * 1024 * 1024,
-  "candidate-wrapper.js": 256 * 1024,
   "dependency-tree-manifest.json": 16 * 1024 * 1024,
   "desktop-runtime-diagnostics.jsonl": 64 * 1024,
-  "desktop-runtime-linker.mjs": 2 * 1024 * 1024,
+  "desktop-runtime-provenance.json": 64 * 1024,
   "desktop-runtime-result.json": 64 * 1024,
   "runtime-output-summary.json": 64 * 1024,
   "runtime-receipt.json": 64 * 1024,
@@ -61,6 +58,32 @@ export interface OfficialGateOutputSummary {
   readonly stdoutBytes: number
   readonly stdoutSha256: string
   readonly stdoutTruncated: boolean
+}
+
+export interface OfficialRuntimeSensitiveValues {
+  readonly absolutePaths?: readonly string[]
+  readonly nonce?: string
+}
+
+export interface OfficialRuntimeProvenanceInput {
+  readonly candidateEntry: Uint8Array
+  readonly linker: Uint8Array
+  readonly loader: Uint8Array
+}
+
+export function serializeOfficialRuntimeProvenance(
+  input: OfficialRuntimeProvenanceInput,
+): Buffer {
+  const artifacts = [
+    provenanceArtifact("candidate-entry", input.candidateEntry),
+    provenanceArtifact("candidate-wrapper", input.loader),
+    provenanceArtifact("trusted-linker", input.linker),
+  ].sort((left, right) => left.name.localeCompare(right.name))
+  return jsonLine({
+    artifacts,
+    schemaVersion: 1,
+    type: "opencode-cycle-official-electron-runtime-provenance",
+  })
 }
 
 export interface OfficialRuntimeEvidencePublication {
@@ -87,10 +110,12 @@ export interface OfficialRuntimeEvidenceSession {
     stage: string,
     details?: Readonly<Record<string, boolean | number | string | null>>,
   ) => Promise<void>
+  readonly registerSensitiveValues: (input: OfficialRuntimeSensitiveValues) => void
 }
 
 export async function openOfficialRuntimeEvidenceDirectory(
   requestedPath: string,
+  initialSensitiveValues: OfficialRuntimeSensitiveValues = {},
 ): Promise<OfficialRuntimeEvidenceSession> {
   const allowedRoot = resolve(tmpdir())
   const target = resolve(requestedPath)
@@ -115,6 +140,8 @@ export async function openOfficialRuntimeEvidenceDirectory(
   let lastStage: string | undefined
   let nextStage = 0
   const startedAtUnixMillis = Date.now()
+  const sensitiveValues = new Set<string>()
+  registerSensitiveValues(sensitiveValues, initialSensitiveValues)
   const closeHandle = async (): Promise<void> => {
     if (directoryHandle === undefined) return
     const handle = directoryHandle
@@ -128,13 +155,15 @@ export async function openOfficialRuntimeEvidenceDirectory(
   }
   const writeOutputSummary = async (summary: OfficialGateOutputSummary): Promise<void> => {
     validateGateOutput(summary)
+    const content = jsonLine({
+      ...summary,
+      schemaVersion: 2,
+      type: "opencode-cycle-official-electron-gate-output",
+    })
+    assertNoSensitiveDurableContent(content, sensitiveValues)
     await writeReceiptAtomically(
       { directory: target, path: join(target, GATE_OUTPUT_NAME) },
-      jsonLine({
-        ...summary,
-        schemaVersion: 2,
-        type: "opencode-cycle-official-electron-gate-output",
-      }),
+      content,
     )
   }
   const recordStage: OfficialRuntimeEvidenceSession["recordStage"] = async (stage, details = {}) => {
@@ -144,19 +173,21 @@ export async function openOfficialRuntimeEvidenceDirectory(
     }
     assertNoSensitiveReceiptValue(details)
     const sequence = nextStage
+    const content = jsonLine({
+      atUnixMillis: Date.now(),
+      details,
+      schemaVersion: 1,
+      sequence,
+      stage,
+      type: "opencode-cycle-official-electron-stage",
+    })
+    assertNoSensitiveDurableContent(content, sensitiveValues)
     await writeReceiptAtomically(
       {
         directory: target,
         path: join(target, `stage-${String(sequence).padStart(3, "0")}-${stage}.json`),
       },
-      jsonLine({
-        atUnixMillis: Date.now(),
-        details,
-        schemaVersion: 1,
-        sequence,
-        stage,
-        type: "opencode-cycle-official-electron-stage",
-      }),
+      content,
     )
     nextStage += 1
     lastStage = stage
@@ -166,21 +197,24 @@ export async function openOfficialRuntimeEvidenceDirectory(
     readonly pluginPackageSha256?: string
     readonly revision?: string
   }): Promise<VerifiedFile> => {
+    await assertDurableEvidenceFilesSafe(target, sensitiveValues)
     const files = await readVerifiedFileDirectory(target)
     const artifacts = files
       .filter((file) => file.name !== EVIDENCE_MANIFEST_NAME && file.name !== EXIT_RECEIPT_NAME)
       .map((file) => ({ bytes: file.size, name: file.name, sha256: file.sha256 }))
       .sort((left, right) => left.name.localeCompare(right.name))
+    const content = jsonLine({
+      artifacts,
+      nativePackageSha256: binding.nativePackageSha256 ?? null,
+      pluginPackageSha256: binding.pluginPackageSha256 ?? null,
+      revision: binding.revision ?? null,
+      schemaVersion: 3,
+      type: "opencode-cycle-official-electron-evidence-manifest",
+    })
+    assertNoSensitiveDurableContent(content, sensitiveValues)
     return writeReceiptAtomically(
       { directory: target, path: join(target, EVIDENCE_MANIFEST_NAME) },
-      jsonLine({
-        artifacts,
-        nativePackageSha256: binding.nativePackageSha256 ?? null,
-        pluginPackageSha256: binding.pluginPackageSha256 ?? null,
-        revision: binding.revision ?? null,
-        schemaVersion: 2,
-        type: "opencode-cycle-official-electron-evidence-manifest",
-      }),
+      content,
     )
   }
   const finish = async (
@@ -188,19 +222,22 @@ export async function openOfficialRuntimeEvidenceDirectory(
     manifest: VerifiedFile,
     passed: boolean,
   ): Promise<OfficialRuntimeEvidencePublication> => {
-    const exit = await writeReceiptAtomically(
-      { directory: target, path: join(target, EXIT_RECEIPT_NAME) },
-      jsonLine({
+    await assertDurableEvidenceFilesSafe(target, sensitiveValues)
+    const exitContent = jsonLine({
         ...exitValue,
         durationMillis: Date.now() - startedAtUnixMillis,
         evidenceManifestSha256: manifest.sha256,
         passed,
         schemaVersion: 2,
         type: "opencode-cycle-official-electron-package-gate-exit",
-      }),
+    })
+    assertNoSensitiveDurableContent(exitContent, sensitiveValues)
+    const exit = await writeReceiptAtomically(
+      { directory: target, path: join(target, EXIT_RECEIPT_NAME) },
+      exitContent,
     )
     try {
-      await validateOfficialRuntimeEvidenceDirectory(target)
+      await validateOfficialRuntimeEvidenceDirectory(target, sensitiveValues)
     } catch (error) {
       const cleanupFailures: unknown[] = []
       for (const path of [join(target, EXIT_RECEIPT_NAME), join(target, EVIDENCE_MANIFEST_NAME)]) {
@@ -260,7 +297,7 @@ export async function openOfficialRuntimeEvidenceDirectory(
         if (lastStage !== "evidence-publishing") await recordStage("evidence-publishing")
         validateBinding(input.binding)
         validateGateOutput(input.gateOutput)
-        validateMaterial(input.material)
+        validateMaterial(input.material, sensitiveValues)
         for (const name of OFFICIAL_RUNTIME_MATERIAL_NAMES) {
           await writeReceiptAtomically(
             { directory: target, path: join(target, name) },
@@ -289,16 +326,21 @@ export async function openOfficialRuntimeEvidenceDirectory(
       }
     },
     recordStage,
+    registerSensitiveValues: (input) => registerSensitiveValues(sensitiveValues, input),
   }
 }
 
-export async function validateOfficialRuntimeEvidenceDirectory(path: string): Promise<void> {
+export async function validateOfficialRuntimeEvidenceDirectory(
+  path: string,
+  sensitiveValues: ReadonlySet<string> = new Set(),
+): Promise<void> {
   const files = await readVerifiedFileDirectory(path)
+  for (const file of files) assertNoSensitiveDurableContent(file.content, sensitiveValues)
   const byName = new Map(files.map((file) => [file.name, file]))
   const manifest = assertJsonArtifact(
     byName,
     EVIDENCE_MANIFEST_NAME,
-    2,
+    3,
     "opencode-cycle-official-electron-evidence-manifest",
   )
   const exit = assertJsonArtifact(
@@ -534,20 +576,22 @@ function validateSuccessfulEvidence(
   if (treeFile === undefined) throw new Error("Official Electron dependency tree evidence is missing")
   const tree = parseDesktopDependencyTreeManifest(treeFile.content)
   assertJsonLines(byName.get("desktop-runtime-diagnostics.jsonl"))
-  const result = assertJsonArtifact(byName, "desktop-runtime-result.json", 3,
+  const result = assertJsonArtifact(byName, "desktop-runtime-result.json", 4,
     "opencode-cycle-desktop-module-link")
   const runtimeOutput = assertJsonArtifact(byName, "runtime-output-summary.json", 1,
     "opencode-cycle-official-electron-runtime-output")
-  const runtime = assertJsonArtifact(byName, "runtime-receipt.json", 5,
+  const runtime = assertJsonArtifact(byName, "runtime-receipt.json", 6,
     "opencode-cycle-desktop-runtime-guard")
-  const candidate = byName.get("candidate-entry.js")
-  const linker = byName.get("desktop-runtime-linker.mjs")
-  const loader = byName.get("candidate-wrapper.js")
+  const provenance = assertJsonArtifact(byName, "desktop-runtime-provenance.json", 1,
+    "opencode-cycle-official-electron-runtime-provenance")
+  const provenanceArtifacts = Array.isArray(provenance.artifacts) ? provenance.artifacts : []
+  const candidate = requireProvenanceArtifact(provenanceArtifacts, "candidate-entry")
+  const linker = requireProvenanceArtifact(provenanceArtifacts, "trusted-linker")
+  const loader = requireProvenanceArtifact(provenanceArtifacts, "candidate-wrapper")
   const dependencyTree = isRecord(tree.dependencyTree) ? tree.dependencyTree : undefined
   if (
-    candidate === undefined || linker === undefined || loader === undefined ||
     !isRecord(dependencyTree) ||
-    runtime.candidateEntrySha256 !== candidate.sha256 ||
+    runtime.candidateEntrySha256 !== candidate.sha256 || candidate.bytes < 1 ||
     runtime.linkerSha256 !== linker.sha256 ||
     runtime.loaderSha256 !== loader.sha256 ||
     runtime.dependencyTreeSha256 !== dependencyTree.dependencyTreeSha256 ||
@@ -563,11 +607,20 @@ function validateSuccessfulEvidence(
     result.dependencyTreeSha256 !== runtime.dependencyTreeSha256 ||
     result.graphFileCount !== runtime.graphFileCount ||
     result.graphSha256 !== runtime.graphSha256 ||
+    result.isolatedRuntimeBoundaryCount !== runtime.isolatedRuntimeBoundaryCount ||
+    result.isolatedRuntimeBoundarySha256 !== runtime.isolatedRuntimeBoundarySha256 ||
+    result.moduleLoadingProof !== runtime.moduleLoadingProof ||
+    result.unverifiedPluginHostModuleLoadingRejected !== true ||
     result.linkedEsmModuleCount !== runtime.linkedEsmModuleCount ||
     result.verifiedCommonJsModuleCount !== runtime.verifiedCommonJsModuleCount ||
     result.verifiedJsonModuleCount !== runtime.verifiedJsonModuleCount ||
     result.verifiedAssetFileCount !== runtime.verifiedAssetFileCount ||
     typeof runtime.graphFileCount !== "number" ||
+    runtime.isolatedRuntimeBoundaryCount !== 1 ||
+    typeof runtime.isolatedRuntimeBoundarySha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(runtime.isolatedRuntimeBoundarySha256) ||
+    runtime.moduleLoadingProof !== "static-literal-plugin-host-with-isolated-worker-v1" ||
+    runtime.unverifiedPluginHostModuleLoadingRejected !== true ||
     typeof runtime.runtimeInputContentBytes !== "number" ||
     typeof runtime.runtimeInputFileCount !== "number" ||
     runtime.runtimeInputFileCount < runtime.graphFileCount ||
@@ -609,6 +662,7 @@ function validateFailedEvidence(exit: Record<string, unknown>): void {
 
 function validateMaterial(
   material: Readonly<Record<OfficialRuntimeMaterialName, Uint8Array>>,
+  sensitiveValues: ReadonlySet<string>,
 ): void {
   const keys = Object.keys(material).sort()
   if (JSON.stringify(keys) !== JSON.stringify([...OFFICIAL_RUNTIME_MATERIAL_NAMES].sort())) {
@@ -620,6 +674,7 @@ function validateMaterial(
       content.byteLength > MATERIAL_LIMITS[name]) {
       throw new Error(`Official Electron evidence material is outside its bound: ${name}`)
     }
+    assertNoSensitiveDurableContent(content, sensitiveValues)
   }
 }
 
@@ -742,6 +797,104 @@ function assertNoSensitiveReceiptValue(value: unknown, key = ""): void {
     for (const [childKey, item] of Object.entries(value)) {
       assertNoSensitiveReceiptValue(item, childKey)
     }
+  }
+}
+
+function provenanceArtifact(name: string, content: Uint8Array): {
+  readonly bytes: number
+  readonly name: string
+  readonly sha256: string
+} {
+  if (!(content instanceof Uint8Array) || content.byteLength < 1) {
+    throw new Error("Official Electron provenance input is empty")
+  }
+  return {
+    bytes: content.byteLength,
+    name,
+    sha256: createHash("sha256").update(content).digest("hex"),
+  }
+}
+
+function requireProvenanceArtifact(
+  artifacts: readonly unknown[],
+  name: string,
+): { readonly bytes: number; readonly sha256: string } {
+  const matches = artifacts.filter((value) => isRecord(value) && value.name === name)
+  const value = matches[0]
+  if (
+    matches.length !== 1 || !isRecord(value) ||
+    typeof value.bytes !== "number" || !Number.isSafeInteger(value.bytes) || value.bytes < 1 ||
+    typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.sha256)
+  ) throw new Error("Official Electron runtime provenance is invalid")
+  return { bytes: value.bytes, sha256: value.sha256 }
+}
+
+function registerSensitiveValues(
+  target: Set<string>,
+  input: OfficialRuntimeSensitiveValues,
+): void {
+  if (input.nonce !== undefined) {
+    if (!/^[0-9a-f]{64}$/u.test(input.nonce)) {
+      throw new Error("Official Electron evidence nonce is invalid")
+    }
+    target.add(input.nonce)
+  }
+  for (const value of input.absolutePaths ?? []) {
+    if (!isAbsolute(value) || resolve(value) !== value || value.includes("\0")) {
+      throw new Error("Official Electron evidence sensitive path is invalid")
+    }
+    for (const variant of [
+      value,
+      value.replaceAll("\\", "/"),
+      value.replaceAll("/", "\\"),
+      JSON.stringify(value).slice(1, -1),
+      pathToFileURL(value).href,
+    ]) target.add(variant)
+  }
+}
+
+async function assertDurableEvidenceFilesSafe(
+  directory: string,
+  sensitiveValues: ReadonlySet<string>,
+): Promise<void> {
+  for (const file of await readVerifiedFileDirectory(directory)) {
+    assertNoSensitiveDurableContent(file.content, sensitiveValues)
+  }
+}
+
+function assertNoSensitiveDurableContent(
+  content: Uint8Array,
+  sensitiveValues: ReadonlySet<string>,
+): void {
+  const text = Buffer.from(content).toString("utf8")
+  const lower = text.toLowerCase()
+  for (const value of sensitiveValues) {
+    if (value.length > 0 && (text.includes(value) || lower.includes(value.toLowerCase()))) {
+      throw new Error("Official Electron durable evidence contains an exact sensitive value")
+    }
+  }
+  if (/[A-Za-z]:[\\/]|file:(?:\/\/)?|\\\\(?:[?.]\\)?/u.test(text)) {
+    throw new Error("Official Electron durable evidence contains a local path pattern")
+  }
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return
+  let parsed = false
+  try {
+    const value = JSON.parse(trimmed) as unknown
+    assertNoSensitiveReceiptValue(value)
+    parsed = true
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Official Electron receipt")) throw error
+  }
+  if (parsed) return
+  for (const line of trimmed.split("\n")) {
+    let value: unknown
+    try {
+      value = JSON.parse(line) as unknown
+    } catch {
+      continue
+    }
+    assertNoSensitiveReceiptValue(value)
   }
 }
 

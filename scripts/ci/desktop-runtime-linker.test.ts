@@ -171,6 +171,81 @@ test("trusted module linker rejects require aliases and generated evaluation loa
   }
 }, { timeout: 30_000 })
 
+test("trusted module linker rejects computed, reflected and passed loader capabilities", async () => {
+  for (const [label, source] of [
+    ["reviewer-create-require", [
+      'const load = process.getBuiltinModule("node:module")["createRequire"](import.meta.url)',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["aliased-get-builtin-module", [
+      'const builtin = process["getBuiltin" + "Module"]',
+      'const load = builtin("node:module")["create" + "Require"](import.meta.url)',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["destructured-get-builtin-module", [
+      "const { getBuiltinModule: builtin } = process",
+      'const load = builtin("node:module")["createRequire"](import.meta.url)',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["reflected-create-require", [
+      'const make = Reflect.get(process.getBuiltinModule("node:module"), "createRequire")',
+      "const load = make(import.meta.url)",
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["computed-eval", [
+      'const execute = globalThis["ev" + "al"]',
+      'execute("require(\\"./unverified.js\\")")',
+      "export default execute",
+    ].join("\n")],
+    ["computed-function", [
+      'const Constructor = globalThis["Fun" + "ction"]',
+      'const load = Constructor("return process.getBuiltinModule(\\"node:module\\")[\\"createRequire\\"](import.meta.url)")()',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["proxied-process", [
+      "const facade = new Proxy(process, {})",
+      'const load = facade["getBuiltinModule"]("node:module")["createRequire"](import.meta.url)',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["passed-get-builtin-module", [
+      "const pass = (value) => value",
+      'const load = pass(process.getBuiltinModule)("node:module")["createRequire"](import.meta.url)',
+      'load("./unverified.js")',
+      "export default load",
+    ].join("\n")],
+    ["destructured-computed-eval", [
+      'const { ["ev" + "al"]: execute } = globalThis',
+      'execute("require(\\"./unverified.js\\")")',
+      "export default execute",
+    ].join("\n")],
+  ] as const) {
+    const temporary = await mkdtemp(join(tmpdir(), `cycle-link-capability-${label}-`))
+    try {
+      const installedPlugin = join(temporary, "opencode-cycle")
+      const entry = join(installedPlugin, "dist", "index.js")
+      const resultFile = join(temporary, "result.json")
+      await mkdir(join(installedPlugin, "dist"), { recursive: true })
+      await Promise.all([
+        writeFile(join(installedPlugin, "package.json"), `${JSON.stringify({
+          exports: { ".": "./dist/index.js" }, type: "module",
+        })}\n`),
+        writeFile(entry, source),
+      ])
+      const execution = await runLinker({ entry, installedPlugin, resultFile })
+      expect(execution.exitCode, label).not.toBe(0)
+      expect(await readFile(resultFile).then(() => true, () => false), label).toBe(false)
+    } finally {
+      await rm(temporary, { force: true, recursive: true })
+    }
+  }
+}, { timeout: 60_000 })
+
 test("trusted module linker recursively links ESM reached only through CommonJS", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "cycle-link-cjs-esm-"))
   try {

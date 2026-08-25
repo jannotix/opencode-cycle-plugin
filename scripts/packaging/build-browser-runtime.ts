@@ -1,5 +1,15 @@
-import { readFile, readdir, realpath, writeFile } from "node:fs/promises"
+import { readFile, readdir, realpath, rm, writeFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
+
+import { TRUSTED_BROWSER_RUNTIME_BOUNDARY_HEADER } from "./browser-runtime-boundary.js"
+import {
+  rewriteTrustedBrowserBundleLiteralImports,
+  trustedBrowserBundleModuleSpecifiers,
+} from "./browser-runtime-boundary-proof.js"
+import {
+  browserRuntimeClientSource,
+  browserRuntimeWorkerSource,
+} from "./browser-runtime-worker-source.js"
 
 const root = resolve(import.meta.dir, "../..")
 const packageRoot = resolve(root, "packages", "opencode-cycle")
@@ -10,7 +20,8 @@ const browsersFacade = resolve(
   "browser",
   "puppeteer-browsers-runtime.js",
 )
-const output = resolve(packageRoot, "dist", "browser", "managed-browser-session.cjs")
+const legacyOutput = resolve(packageRoot, "dist", "browser", "managed-browser-session.cjs")
+const worker = resolve(packageRoot, "dist", "browser", "managed-browser-worker.mjs")
 const wrapper = resolve(packageRoot, "dist", "browser", "managed-browser-session.js")
 
 const javaScriptSources = (await readdir(resolve(packageRoot, "src"), { recursive: true }))
@@ -56,25 +67,25 @@ const build = await Bun.build({
 if (!build.success || build.outputs.length !== 1) {
   throw new Error(`Browser runtime bundle failed: ${build.logs.map((log) => log.message).join("; ")}`)
 }
-const bundle = Buffer.from(await build.outputs[0]!.arrayBuffer())
-if (bundle.byteLength < 1 || bundle.byteLength > 16 * 1024 * 1024) {
+const rawBundle = Buffer.from(await build.outputs[0]!.arrayBuffer())
+const bundleText = rewriteTrustedBrowserBundleLiteralImports(rawBundle.toString("utf8"))
+if (Buffer.byteLength(bundleText) < 1 || Buffer.byteLength(bundleText) > 16 * 1024 * 1024) {
   throw new Error("Browser runtime bundle size is outside its production bound")
 }
-const bundleText = bundle.toString("utf8")
 if (bundleText.includes("createRequire") || bundleText.includes("yargs")) {
   throw new Error("Browser runtime bundle contains a generated module loader")
 }
+const specifiers = trustedBrowserBundleModuleSpecifiers(bundleText)
+const workerSource = browserRuntimeWorkerSource(bundleText, specifiers)
+const wrapperSource = browserRuntimeClientSource()
+if (!workerSource.startsWith(TRUSTED_BROWSER_RUNTIME_BOUNDARY_HEADER) ||
+  Buffer.byteLength(workerSource) > 20 * 1024 * 1024 || Buffer.byteLength(wrapperSource) > 64 * 1024) {
+  throw new Error("Browser runtime isolated boundary is invalid")
+}
 await Promise.all([
-  writeFile(output, bundle),
-  writeFile(
-    wrapper,
-    [
-      'import runtime from "./managed-browser-session.cjs"',
-      "export const { ManagedBrowserSessionFactory } = runtime",
-      "",
-    ].join("\n"),
-    "utf8",
-  ),
+  rm(legacyOutput, { force: true }),
+  writeFile(worker, workerSource, "utf8"),
+  writeFile(wrapper, wrapperSource, "utf8"),
 ])
 
 async function readManifest(path: string): Promise<{

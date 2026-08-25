@@ -8,7 +8,13 @@ import {
   assertNoReparseMaterial,
   createVerifiedFileReaderForTests,
   readVerifiedFileDirectory,
+  sameCanonicalPath,
 } from "./verified-file.js"
+
+test("canonical Windows paths accept only equivalent case and extended forms", () => {
+  expect(sameCanonicalPath("C:\\Temp\\Cycle", "\\\\?\\c:\\temp\\cycle", "win32")).toBe(true)
+  expect(sameCanonicalPath("C:\\Temp\\Cycle", "C:\\Temp\\Other", "win32")).toBe(false)
+})
 
 test("Windows reparse verification accepts an existing extended-length regular file", async () => {
   if (process.platform !== "win32") return

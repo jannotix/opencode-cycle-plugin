@@ -1,0 +1,5 @@
+export const TRUSTED_BROWSER_RUNTIME_BOUNDARY_HEADER =
+  "/* OPENCODE_CYCLE_TRUSTED_BROWSER_RUNTIME_BOUNDARY_V1 */\n"
+
+export const TRUSTED_BROWSER_RUNTIME_BOUNDARY_PATH =
+  "dist/browser/managed-browser-worker.mjs"

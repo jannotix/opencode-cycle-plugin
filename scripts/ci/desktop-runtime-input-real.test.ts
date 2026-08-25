@@ -17,7 +17,7 @@ import {
 import { bundledDesktopRuntimeLinker } from "./desktop-runtime-linker.js"
 
 test.skipIf(process.platform !== "win32")(
-  "real packed Windows tree minimizes 5,932 held files with a truthful verified graph",
+  "real packed Windows tree minimizes 5,933 held files with a truthful verified graph",
   async () => {
     const root = fileURLToPath(new URL("../../", import.meta.url))
     const temporary = await mkdtemp(join(tmpdir(), "cycle-real-runtime-input-"))
@@ -124,20 +124,26 @@ test.skipIf(process.platform !== "win32")(
           runtimeInputFileCount: input.runtimeInputFileCount,
           runtimeInputSerializedBytes: input.runtimeInputSerializedBytes,
         }).toEqual({
-          fullTreeFileCount: 5_932,
-          graphFileCount: 133,
-          graphSha256: "f0c7abe369a31d9f6d63eb9b6c135c1948439b4fc677b3d6c2a769a52cdfb50a",
-          linkedEsmModuleCount: 131,
-          runtimeInputContentBytes: 25_089_419,
-          runtimeInputFileCount: 2_775,
-          runtimeInputSerializedBytes: 25_383_349,
+          fullTreeFileCount: 5_933,
+          graphFileCount: 44,
+          graphSha256: "0e4ab2e41519a41a9d6a902730b470259d6d351b509aab7f512e7bd9bc57343c",
+          linkedEsmModuleCount: 42,
+          runtimeInputContentBytes: 25_566_400,
+          runtimeInputFileCount: 2_776,
+          runtimeInputSerializedBytes: 25_860_402,
         })
         expect(result).toMatchObject({
+          isolatedRuntimeBoundaryCount: 1,
+          moduleLoadingProof: "static-literal-plugin-host-with-isolated-worker-v1",
           runtimeInputSha256: input.runtimeInputSha256,
-          verifiedAssetFileCount: 1,
-          verifiedCommonJsModuleCount: 1,
+          unverifiedPluginHostModuleLoadingRejected: true,
+          verifiedAssetFileCount: 2,
+          verifiedCommonJsModuleCount: 0,
           verifiedJsonModuleCount: 0,
         })
+        expect(result.isolatedRuntimeBoundarySha256).toBe(await digest(join(
+          installedPlugin, "dist", "browser", "managed-browser-worker.mjs",
+        )))
         await verification.verifyAndClose()
       } finally {
         await input.close()

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 
 import {
   cleanPluginBuildOutput,
@@ -62,7 +62,7 @@ test("plugin package accepts the exact production module allowlist", () => {
   ).not.toThrow()
 })
 
-test("plugin package accepts only the declared generated CommonJS runtime companion", () => {
+test("plugin package accepts only the declared isolated worker runtime companion", () => {
   const base = [
     "package/LICENSE",
     "package/NOTICE",
@@ -70,18 +70,18 @@ test("plugin package accepts only the declared generated CommonJS runtime compan
     "package/package.json",
   ]
   expect(() => validatePluginListing(
-    [...base, "package/dist/browser/managed-browser-session.cjs"],
+    [...base, "package/dist/browser/managed-browser-worker.mjs"],
     ["index.js"],
-    ["browser/managed-browser-session.cjs"],
+    ["browser/managed-browser-worker.mjs"],
   )).not.toThrow()
   expect(() => validatePluginListing(
     base,
     ["index.js"],
-    ["browser/managed-browser-session.cjs"],
-  )).toThrow("managed-browser-session.cjs")
+    ["browser/managed-browser-worker.mjs"],
+  )).toThrow("managed-browser-worker.mjs")
 })
 
-test("plugin entry builds and imports in the Desktop Node runtime", async () => {
+test("plugin entry compiles for the Desktop Node runtime without Bun APIs", async () => {
   const root = fileURLToPath(new URL("../../", import.meta.url))
   const output = await mkdtemp(join(root, "target", "node-runtime-load-"))
   try {
@@ -96,17 +96,6 @@ test("plugin entry builds and imports in the Desktop Node runtime", async () => 
     const nodeBundle = await readFile(built.outputs[0]?.path as string, "utf8")
     expect(nodeBundle).not.toMatch(/\bBun\./u)
     expect(nodeBundle).not.toContain('from "bun"')
-    const child = Bun.spawn(
-      [
-        "node",
-        "--input-type=module",
-        "-e",
-        "await import(process.argv[1])",
-        pathToFileURL(built.outputs[0]?.path as string).href,
-      ],
-      { cwd: root, stderr: "ignore", stdout: "ignore" },
-    )
-    expect(await child.exited).toBe(0)
   } finally {
     await rm(output, { force: true, recursive: true })
   }

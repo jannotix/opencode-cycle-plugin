@@ -121,11 +121,14 @@ function certificationEvidence(targetRevision = revision): Record<string, unknow
       dependencyTreeSha256: "d".repeat(64),
       electronVersion: "42.3.3",
       fullTreeFileCount: 120,
+      isolatedRuntimeBoundaryCount: 1,
+      isolatedRuntimeBoundarySha256: "7".repeat(64),
       graphFileCount: 50,
       graphSha256: "a".repeat(64),
       linkedEsmModuleCount: 30,
       linkerSha256: "c".repeat(64),
       loaderSha256: "e".repeat(64),
+      moduleLoadingProof: "static-literal-plugin-host-with-isolated-worker-v1",
       moduleLinked: true,
       nativePackageSha256,
       nodeVersion: "24.15.0",
@@ -140,11 +143,11 @@ function certificationEvidence(targetRevision = revision): Record<string, unknow
         ? "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999"
         : "008c5cf72df686019c818d2cb0570df8137b49aa5dae64dcf017ea2656c5b7ac",
       runtimeProductVersion: platform === "windows-x64" ? "1.18.21.0" : "1.18.21",
-      schemaVersion: 5,
+      schemaVersion: 6,
       suppressedOptionalRootCount: 1,
       type: "opencode-cycle-desktop-runtime-guard",
       unsafeDynamicImportsRejected: true,
-      unsafeModuleLoadingRejected: true,
+      unverifiedPluginHostModuleLoadingRejected: true,
       verifiedAssetFileCount: 1,
       verifiedCommonJsModuleCount: 15,
       verifiedContentTreeSha256: "f".repeat(64),
@@ -247,6 +250,20 @@ describe("release manifest", () => {
         version,
       }),
     ).toThrow("linux-x64")
+  })
+
+  test("rejects Desktop lanes that bind different plugin package bytes", () => {
+    const certifications = manifestCertifications()
+    certifications[1] = {
+      ...certifications[1]!,
+      pluginArtifact: {
+        ...certifications[1]!.pluginArtifact,
+        sha256: "f".repeat(64),
+      },
+    }
+    expect(() => buildReleaseManifest({
+      artifacts: manifestArtifacts(), certifications, qualityEvidence, revision, version,
+    })).toThrow("same plugin package SHA-256")
   })
 
   test("rejects a missing Windows or Linux release artifact", async () => {

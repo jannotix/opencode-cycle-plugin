@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { spawn } from "node:child_process"
 import { constants } from "node:fs"
 import type { BigIntStats } from "node:fs"
 import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises"
@@ -42,6 +43,14 @@ interface VerifiedFileReader {
 }
 
 const productionReader = createReader({})
+let windowsInspector: WindowsReparseInspector | undefined
+const windowsInspectorReady = process.platform === "win32"
+  ? Promise.resolve().then(async () => {
+    windowsInspector = new WindowsReparseInspector()
+    await windowsInspector.inspect([])
+  })
+  : Promise.resolve()
+await windowsInspectorReady
 
 export function readVerifiedFileDirectory(directory: string): Promise<VerifiedFile[]> {
   return productionReader.readDirectory(directory)
@@ -69,6 +78,15 @@ export function assertStableOpenFile(before: BigIntStats, after: BigIntStats): v
   }
 }
 
+export function sameCanonicalPath(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "win32") return left === right
+  return normalizeWindowsPath(left) === normalizeWindowsPath(right)
+}
+
 function createReader(hooks: ReaderHooks): VerifiedFileReader {
   const reparseCheck = hooks.assertNoReparse ?? assertNoWindowsReparse
 
@@ -79,7 +97,12 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
       throw new Error("Release root must be a real directory, not a file, link or alias")
     }
     const realPath = await realpath(path)
-    if (realPath !== path) {
+    const realStats = await lstat(realPath, { bigint: true })
+    await reparseCheck([path, realPath])
+    if (
+      !sameCanonicalPath(realPath, path) &&
+      (process.platform !== "win32" || !sameIdentity(stats, realStats))
+    ) {
       throw new Error("Release root must not be a symlink, junction, reparse point or alias")
     }
     return { path, realPath, stats }
@@ -94,7 +117,7 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
     const stats = await lstat(path, { bigint: true })
     assertRegularSingleLink(stats, name)
     const realPath = await realpath(path)
-    if (realPath !== resolve(root.realPath, name)) {
+    if (!sameCanonicalPath(realPath, resolve(root.realPath, name))) {
       throw new Error(`Release file escapes its root through a link or alias: ${name}`)
     }
     return { name, path, realPath, stats }
@@ -110,7 +133,7 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
       }
     }
     const snapshots = await Promise.all(sorted.map((entry) => snapshotEntry(root, entry.name)))
-    await reparseCheck([root.path, ...snapshots.map((entry) => entry.path)])
+    await reparseCheck(snapshots.map((entry) => entry.path))
     return { entries: snapshots, root }
   }
 
@@ -119,7 +142,7 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
     if (!after.isDirectory() || after.isSymbolicLink()) {
       throw new Error("Release root changed into a link or alias while it was read")
     }
-    if (await realpath(root.path) !== root.realPath) {
+    if (!sameCanonicalPath(await realpath(root.path), root.realPath)) {
       throw new Error("Release root realpath changed while it was read")
     }
     assertSameIdentity(root.stats, after, "Release root identity changed while it was read")
@@ -221,26 +244,9 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
 
 async function assertNoWindowsReparse(paths: readonly string[]): Promise<void> {
   if (process.platform !== "win32") return
-  const systemRoot = process.env.SystemRoot
-  if (systemRoot === undefined) throw new Error("Windows reparse detection requires SystemRoot")
-  const executable = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-  const script = "$ErrorActionPreference='Stop';$request=[Console]::In.ReadToEnd()|ConvertFrom-Json;$values=@();foreach($path in $request.paths){$item=Get-Item -LiteralPath $path -Force;$values += [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)};@{values=$values}|ConvertTo-Json -Compress"
-  const child = Bun.spawn([executable, "-NoProfile", "-NonInteractive", "-Command", script], {
-    env: {
-      PSModulePath: win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
-      SystemRoot: systemRoot,
-    },
-    stderr: "pipe",
-    stdin: Buffer.from(JSON.stringify({ paths: paths.map(windowsExtendedLengthPath) })),
-    stdout: "pipe",
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) throw new Error(`Windows reparse detection failed closed: ${stderr.trim()}`)
-  const value = JSON.parse(stdout) as unknown
+  await windowsInspectorReady
+  windowsInspector ??= new WindowsReparseInspector()
+  const value = await windowsInspector.inspect(paths.map(windowsExtendedLengthPath))
   if (
     !isRecord(value) ||
     !Array.isArray(value.values) ||
@@ -252,11 +258,86 @@ async function assertNoWindowsReparse(paths: readonly string[]): Promise<void> {
   if (value.values.some(Boolean)) throw new Error("Release material contains a Windows reparse point")
 }
 
+class WindowsReparseInspector {
+  readonly #child: ReturnType<typeof spawn>
+  #buffer = ""
+  #closed: unknown
+  #queue = Promise.resolve()
+  #stderr = ""
+  #waiters: Array<{ reject: (error: unknown) => void; resolve: (value: unknown) => void }> = []
+
+  constructor() {
+    const systemRoot = process.env.SystemRoot
+    if (systemRoot === undefined) throw new Error("Windows reparse detection requires SystemRoot")
+    const executable = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    const script = "$ErrorActionPreference='Stop';while($line=[Console]::In.ReadLine()){try{$request=$line|ConvertFrom-Json;$values=@();foreach($path in $request.paths){$item=Get-Item -LiteralPath $path -Force;$values += [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)};@{values=$values}|ConvertTo-Json -Compress}catch{@{error='failed'}|ConvertTo-Json -Compress}}"
+    this.#child = spawn(executable, ["-NoProfile", "-NonInteractive", "-Command", script], {
+      env: { PSModulePath: win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"), SystemRoot: systemRoot },
+      stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    })
+    if (this.#child.stdout === null || this.#child.stderr === null) {
+      this.close(new Error("Windows reparse detection failed closed: worker pipes are unavailable"))
+      return
+    }
+    this.#child.stdout.on("data", (chunk: Buffer) => this.consume(chunk.toString("utf8")))
+    this.#child.stderr.on("data", (chunk: Buffer) => { this.#stderr += chunk.toString("utf8") })
+    this.#child.once("error", (error) => this.close(error))
+    this.#child.once("exit", () => this.close(new Error(`Windows reparse detection failed closed: ${this.diagnostic()}`)))
+  }
+
+  inspect(paths: readonly string[]): Promise<unknown> {
+    const result = this.#queue.then(() => this.request(paths))
+    this.#queue = result.then(() => undefined, () => undefined)
+    return result
+  }
+
+  private request(paths: readonly string[]): Promise<unknown> {
+    if (this.#closed !== undefined || this.#child.stdin === null) return Promise.reject(this.#closed ?? new Error("Windows reparse detection failed closed"))
+    return new Promise((resolve, reject) => {
+      this.#waiters.push({ resolve, reject })
+      this.#child.stdin!.write(`${JSON.stringify({ paths })}\n`, "utf8", (error) => { if (error !== null) this.close(error) })
+    })
+  }
+
+  private consume(text: string): void {
+    this.#buffer += text
+    for (;;) {
+      const index = this.#buffer.indexOf("\n")
+      if (index < 0) return
+      const line = this.#buffer.slice(0, index); this.#buffer = this.#buffer.slice(index + 1)
+      const waiter = this.#waiters.shift()
+      if (waiter === undefined) { this.close(new Error("Windows reparse detection returned an unsolicited response")); return }
+      try { waiter.resolve(JSON.parse(line) as unknown) } catch { waiter.reject(new Error("Windows reparse detection returned malformed output")) }
+    }
+  }
+
+  private close(error: unknown): void {
+    if (this.#closed !== undefined) return
+    this.#closed = error
+    while (this.#waiters.length > 0) this.#waiters.shift()!.reject(error)
+  }
+
+  private diagnostic(): string {
+    const value = this.#stderr.replace(/[A-Za-z]:[^\s;]*/gu, "<path>").trim()
+    return value.length === 0 ? "worker exited without stderr" : value
+  }
+}
+
 function windowsExtendedLengthPath(path: string): string {
   const absolute = win32.resolve(path)
   if (absolute.startsWith("\\\\?\\")) return absolute
   if (absolute.startsWith("\\\\")) return `\\\\?\\UNC\\${absolute.slice(2)}`
   return `\\\\?\\${absolute}`
+}
+
+function normalizeWindowsPath(path: string): string {
+  const normalized = win32.normalize(path).replaceAll("/", "\\")
+  const withoutExtendedPrefix = normalized.startsWith("\\\\?\\UNC\\")
+    ? `\\\\${normalized.slice("\\\\?\\UNC\\".length)}`
+    : normalized.startsWith("\\\\?\\")
+      ? normalized.slice("\\\\?\\".length)
+      : normalized
+  return withoutExtendedPrefix.toLowerCase()
 }
 
 function assertRegularSingleLink(stats: BigIntStats, name: string): void {

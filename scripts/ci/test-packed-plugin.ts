@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url"
 import type { DesktopCertificationBinding } from "../../packages/opencode-cycle/src/certification.js"
 import { packageNative, type NativeTarget } from "../packaging/native-package.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
+import {
+  authoritativePluginPackageMode,
+  readAuthoritativePluginPackage,
+} from "./authoritative-plugin-package.js"
 import { cleanupCertifiedDaemon } from "./certified-daemon.js"
 import {
   certificationEnvironment,
@@ -22,6 +26,7 @@ import { serializeDesktopDependencyTreeManifest } from "./desktop-dependency-tre
 import {
   digestOfficialEvidenceError,
   openOfficialRuntimeEvidenceDirectory,
+  serializeOfficialRuntimeProvenance,
   type OfficialGateOutputSummary,
   type OfficialRuntimeEvidenceSession,
 } from "./official-runtime-evidence.js"
@@ -123,7 +128,20 @@ try {
   const officialEvidenceDirectory = process.env.CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR
   if (officialEvidenceDirectory !== undefined) {
     officialEvidence = await openOfficialRuntimeEvidenceDirectory(officialEvidenceDirectory)
+    officialEvidence.registerSensitiveValues({ absolutePaths: [root] })
     await recordStage("gate-started", { official: true })
+  }
+  const authoritativeArchive = process.env.CYCLE_OFFICIAL_PLUGIN_ARCHIVE
+  const authoritativeProvenance = process.env.CYCLE_OFFICIAL_PLUGIN_PROVENANCE
+  const pluginPackageMode = authoritativePluginPackageMode({
+    ...(authoritativeArchive === undefined ? {} : { archive: authoritativeArchive }),
+    official: officialEvidence !== undefined,
+    ...(authoritativeProvenance === undefined ? {} : { provenance: authoritativeProvenance }),
+  })
+  if (pluginPackageMode === "authoritative-prebuilt") {
+    officialEvidence?.registerSensitiveValues({
+      absolutePaths: [resolve(authoritativeArchive!), resolve(authoritativeProvenance!)],
+    })
   }
   revision = (await run(["git", "rev-parse", "HEAD"], root)).trim()
   if (!/^[0-9a-f]{40}$/u.test(revision)) throw new PackageGateFailure("source_binding")
@@ -132,6 +150,9 @@ try {
   launcherTemporary = await mkdtemp(join(tmpdir(), "opencode-cycle-host-launcher-"))
   launcher = join(launcherTemporary, "launcher.ts")
   launcherStop = join(launcherTemporary, "stop")
+  officialEvidence?.registerSensitiveValues({
+    absolutePaths: [scratch, launcherTemporary, launcher, launcherStop],
+  })
   const extracted = join(scratch, "extracted")
   const nativeArtifacts = join(scratch, "native")
   const secondPack = join(scratch, "second-pack")
@@ -164,17 +185,30 @@ process.exit(await child.exited)
     nativeArtifacts,
   )
   await recordStage("native-package-completed", { nativeTarget })
-  await run(["bun", "pm", "pack", "--destination", scratch], packageRoot)
-  const archiveName = (await readdir(scratch)).find((name) => name.endsWith(".tgz"))
-  if (archiveName === undefined) throw new Error("Plugin pack did not produce an archive")
-  const archive = join(scratch, archiveName)
-  await run(["bun", "pm", "pack", "--destination", secondPack], packageRoot)
-  const secondArchiveName = (await readdir(secondPack)).find((name) => name.endsWith(".tgz"))
-  if (secondArchiveName === undefined) throw new Error("Second plugin pack did not produce an archive")
-  if ((await digest(archive)) !== (await digest(join(secondPack, secondArchiveName)))) {
-    throw new Error("Plugin package is not reproducible from identical inputs")
+  let archive: string
+  if (pluginPackageMode === "authoritative-prebuilt") {
+    const input = await readAuthoritativePluginPackage({
+      archive: authoritativeArchive!,
+      provenance: authoritativeProvenance!,
+      revision,
+      root,
+    })
+    archive = join(scratch, input.name)
+    await writeFile(archive, input.content, { flag: "wx", mode: 0o600 })
+    await recordStage("plugin-prebuilt-validated", { pluginPackageSha256: input.sha256 })
+  } else {
+    await run(["bun", "pm", "pack", "--destination", scratch], packageRoot)
+    const archiveName = (await readdir(scratch)).find((name) => name.endsWith(".tgz"))
+    if (archiveName === undefined) throw new Error("Plugin pack did not produce an archive")
+    archive = join(scratch, archiveName)
+    await run(["bun", "pm", "pack", "--destination", secondPack], packageRoot)
+    const secondArchiveName = (await readdir(secondPack)).find((name) => name.endsWith(".tgz"))
+    if (secondArchiveName === undefined) throw new Error("Second plugin pack did not produce an archive")
+    if ((await digest(archive)) !== (await digest(join(secondPack, secondArchiveName)))) {
+      throw new Error("Plugin package is not reproducible from identical inputs")
+    }
+    await recordStage("plugin-pack-completed")
   }
-  await recordStage("plugin-pack-completed")
   const listing = (await run(["tar", "-tf", archive], root)).split(/\r?\n/u).filter(Boolean)
   for (const required of ["package/package.json", "package/dist/index.js", "package/LICENSE", "package/NOTICE"]) {
     if (!listing.includes(required)) throw new Error(`Packed plugin is missing ${required}`)
@@ -182,7 +216,7 @@ process.exit(await child.exited)
   const unexpected = listing.find(
     (path) =>
       !["package/package.json", "package/LICENSE", "package/NOTICE"].includes(path) &&
-      !/^package\/dist\/(?:[^/]+\/)*[^/]+\.(?:cjs|js)$/u.test(path),
+      !/^package\/dist\/(?:[^/]+\/)*[^/]+\.(?:cjs|js|mjs)$/u.test(path),
   )
   if (unexpected !== undefined) {
     throw new Error(`Packed plugin contains non-production file ${unexpected}`)
@@ -212,6 +246,19 @@ process.exit(await child.exited)
     startedAtUnixMillis: Date.now(),
   }
   const environment = certificationEnvironment(scratch, platform, process.env, binding)
+  officialEvidence?.registerSensitiveValues({
+    absolutePaths: [
+      archive,
+      certificationRoot,
+      dataDirectory,
+      environmentPath(environment, "OPENCODE_CONFIG"),
+      environmentPath(environment, "OPENCODE_CONFIG_DIR"),
+      installedPackage,
+      join(root, "target", "release", executable),
+      native.archive,
+    ],
+    nonce: binding.nonce,
+  })
   await Promise.all([
     mkdir(environment.HOME as string, { recursive: true }),
     mkdir(environment.TMPDIR as string, { recursive: true }),
@@ -239,6 +286,7 @@ process.exit(await child.exited)
   if (!isAbsolute(officialRuntime) || runtime !== officialRuntime) {
     throw new Error("Official Electron runtime path must be canonical and absolute")
   }
+  officialEvidence?.registerSensitiveValues({ absolutePaths: [runtime] })
   await access(runtime)
   await recordStage("runtime-guard-started")
   await verifyDesktopModuleRuntime({
@@ -407,11 +455,13 @@ process.exit(await child.exited)
       },
       gateOutput: gateOutput.summary(),
       material: {
-        "candidate-entry.js": runtimeEvidence.candidateEntry,
-        "candidate-wrapper.js": runtimeEvidence.loader,
         "dependency-tree-manifest.json": dependencyTreeEvidence,
         "desktop-runtime-diagnostics.jsonl": runtimeEvidence.diagnostics,
-        "desktop-runtime-linker.mjs": runtimeEvidence.linker,
+        "desktop-runtime-provenance.json": serializeOfficialRuntimeProvenance({
+          candidateEntry: runtimeEvidence.candidateEntry,
+          linker: runtimeEvidence.linker,
+          loader: runtimeEvidence.loader,
+        }),
         "desktop-runtime-result.json": runtimeEvidence.result,
         "runtime-output-summary.json": jsonLine({
           exitCode: runtimeEvidence.execution.exitCode,
@@ -527,6 +577,12 @@ async function recordHostDiagnosticStages(
 
 async function digest(path: string): Promise<string> {
   return digestBytes(Buffer.from(await Bun.file(path).arrayBuffer()))
+}
+
+function environmentPath(environment: NodeJS.ProcessEnv, name: string): string {
+  const value = environment[name]
+  if (value === undefined || !isAbsolute(value)) throw new Error(`Missing absolute ${name}`)
+  return resolve(value)
 }
 
 function digestBytes(value: Uint8Array): string {

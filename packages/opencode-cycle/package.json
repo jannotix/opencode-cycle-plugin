@@ -15,11 +15,12 @@
   "files": [
     "dist/**/*.js",
     "dist/**/*.cjs",
+    "dist/**/*.mjs",
     "LICENSE",
     "NOTICE"
   ],
   "scripts": {
-    "build": "tsc -b && bun ../../scripts/packaging/build-browser-runtime.ts",
+    "build": "tsc -b && bun ../../scripts/packaging/build-browser-runtime.ts && bun ../../scripts/packaging/build-tool-runtime.ts",
     "prepack": "bun run build && bun ../../scripts/packaging/prepare-plugin-package.ts",
     "typecheck": "tsc -b --pretty false"
   },

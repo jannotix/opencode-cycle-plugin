@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-import { tool, type ToolDefinition } from "@opencode-ai/plugin"
+import { tool, type ToolDefinition } from "./tool-runtime.js"
 
 import type { GoalControlAction, WorkflowControlPlane } from "./control-plane.js"
 import { renderCycleHelp } from "./help.js"

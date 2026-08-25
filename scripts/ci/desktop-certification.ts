@@ -42,6 +42,7 @@ import { PRODUCT_IDENTITY } from "../product-identity.js"
 import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile } from "../release/verified-file.js"
 import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
 import { prepareReceiptOutput, publishReceiptAtomically } from "./receipt-output.js"
+import { readAuthoritativePluginPackage } from "./authoritative-plugin-package.js"
 import { cleanupCertifiedDaemon, type CertifiedDaemonCleanup } from "./certified-daemon.js"
 import {
   openDesktopDependencyTreeVerification,
@@ -161,9 +162,12 @@ export interface DesktopModuleRuntimeReceipt {
   readonly fullTreeFileCount: number
   readonly graphFileCount: number
   readonly graphSha256: string
+  readonly isolatedRuntimeBoundaryCount: number
+  readonly isolatedRuntimeBoundarySha256: string | null
   readonly linkedEsmModuleCount: number
   readonly linkerSha256: string
   readonly loaderSha256: string
+  readonly moduleLoadingProof: "static-literal-plugin-host-v1" | "static-literal-plugin-host-with-isolated-worker-v1"
   readonly moduleLinked: true
   readonly nativePackageSha256: string
   readonly nodeVersion: string
@@ -176,10 +180,10 @@ export interface DesktopModuleRuntimeReceipt {
   readonly runtimeInputSha256: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
-  readonly schemaVersion: 5
+  readonly schemaVersion: 6
   readonly suppressedOptionalRootCount: number
   readonly type: typeof DESKTOP_RUNTIME_GUARD_TYPE
-  readonly unsafeModuleLoadingRejected: true
+  readonly unverifiedPluginHostModuleLoadingRejected: true
   readonly verifiedAssetFileCount: number
   readonly verifiedCommonJsModuleCount: number
   readonly verifiedContentTreeSha256: string
@@ -415,7 +419,12 @@ async function main(): Promise<void> {
   if (debugProfile) {
     console.error(`Desktop certification scratch root: ${scratch}`)
   }
-  const pluginInput = await archiveFile(options.pluginArchive)
+  const pluginInput = await readAuthoritativePluginPackage({
+    archive: resolve(options.pluginArchive),
+    provenance: resolve(options.pluginProvenance),
+    revision: options.revision,
+    root,
+  })
   const nativeInput = await archiveFile(options.nativeArchive)
   const pluginArchive = join(scratch, `plugin-${pluginInput.name}`)
   const nativeArchive = join(scratch, `native-${nativeInput.name}`)
@@ -1970,7 +1979,10 @@ export async function validateDesktopModuleRuntimeGuard(
     dependencyTotalBytes: tree.dependencyTotalBytes,
     dependencyTreeSha256: tree.dependencyTreeSha256,
     unsafeDynamicImportsRejected: true,
-    unsafeModuleLoadingRejected: true,
+    unverifiedPluginHostModuleLoadingRejected: true,
+    isolatedRuntimeBoundaryCount: linkReceipt.isolatedRuntimeBoundaryCount,
+    isolatedRuntimeBoundarySha256: linkReceipt.isolatedRuntimeBoundarySha256,
+    moduleLoadingProof: linkReceipt.moduleLoadingProof,
     electronVersion: linkReceipt.electronVersion,
     fullTreeFileCount: linkReceipt.fullTreeFileCount,
     graphFileCount: linkReceipt.graphFileCount,
@@ -1990,7 +2002,7 @@ export async function validateDesktopModuleRuntimeGuard(
     runtimeInputSha256: linkReceipt.runtimeInputSha256,
     runtimeExecutableSha256: linkReceipt.runtimeExecutableSha256,
     runtimeProductVersion: linkReceipt.runtimeProductVersion,
-    schemaVersion: 5,
+    schemaVersion: 6,
     suppressedOptionalRootCount: linkReceipt.suppressedOptionalRootCount,
     type: DESKTOP_RUNTIME_GUARD_TYPE,
     verifiedAssetFileCount: linkReceipt.verifiedAssetFileCount,
@@ -2008,6 +2020,10 @@ function assertDesktopModuleLinkReceipt(
   readonly fullTreeFileCount: number
   readonly graphFileCount: number
   readonly graphSha256: string
+  readonly isolatedRuntimeBoundaryCount: number
+  readonly isolatedRuntimeBoundarySha256: string | null
+  readonly moduleLoadingProof:
+    "static-literal-plugin-host-v1" | "static-literal-plugin-host-with-isolated-worker-v1"
   readonly linkedEsmModuleCount: number
   readonly nodeVersion: string
   readonly runtimeInputContentBytes: number
@@ -2016,6 +2032,7 @@ function assertDesktopModuleLinkReceipt(
   readonly runtimeInputSha256: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
+  readonly unverifiedPluginHostModuleLoadingRejected: true
   readonly suppressedOptionalRootCount: number
   readonly verifiedAssetFileCount: number
   readonly verifiedCommonJsModuleCount: number
@@ -2025,7 +2042,7 @@ function assertDesktopModuleLinkReceipt(
   if (
     !isRecord(value) ||
     Object.keys(value).sort().join(",") !==
-      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,fullTreeFileCount,graphFileCount,graphSha256,linkedEsmModuleCount,nodeVersion,runtimeExecutableSha256,runtimeInputContentBytes,runtimeInputFileCount,runtimeInputSerializedBytes,runtimeInputSha256,runtimeProductVersion,schemaVersion,suppressedOptionalRootCount,type,unsafeDynamicImportsRejected,unsafeModuleLoadingRejected,verifiedAssetFileCount,verifiedCommonJsModuleCount,verifiedContentTreeSha256,verifiedJsonModuleCount" ||
+      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,fullTreeFileCount,graphFileCount,graphSha256,isolatedRuntimeBoundaryCount,isolatedRuntimeBoundarySha256,linkedEsmModuleCount,moduleLoadingProof,nodeVersion,runtimeExecutableSha256,runtimeInputContentBytes,runtimeInputFileCount,runtimeInputSerializedBytes,runtimeInputSha256,runtimeProductVersion,schemaVersion,suppressedOptionalRootCount,type,unsafeDynamicImportsRejected,unverifiedPluginHostModuleLoadingRejected,verifiedAssetFileCount,verifiedCommonJsModuleCount,verifiedContentTreeSha256,verifiedJsonModuleCount" ||
     value.candidateDefaultExportLinked !== true ||
     value.candidateEntrySha256 !== expected.candidateEntrySha256 ||
     value.candidateEvaluated !== false ||
@@ -2060,11 +2077,20 @@ function assertDesktopModuleLinkReceipt(
     !Number.isSafeInteger(value.suppressedOptionalRootCount) ||
     value.suppressedOptionalRootCount < 0 ||
     value.verifiedContentTreeSha256 !== expected.verifiedContentTreeSha256 ||
-    value.unsafeModuleLoadingRejected !== true ||
+    value.unverifiedPluginHostModuleLoadingRejected !== true ||
+    typeof value.isolatedRuntimeBoundaryCount !== "number" ||
+    !Number.isSafeInteger(value.isolatedRuntimeBoundaryCount) ||
+    ![0, 1].includes(value.isolatedRuntimeBoundaryCount) ||
+    (value.isolatedRuntimeBoundaryCount === 0
+      ? value.isolatedRuntimeBoundarySha256 !== null ||
+        value.moduleLoadingProof !== "static-literal-plugin-host-v1"
+      : typeof value.isolatedRuntimeBoundarySha256 !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(value.isolatedRuntimeBoundarySha256) ||
+        value.moduleLoadingProof !== "static-literal-plugin-host-with-isolated-worker-v1") ||
     value.nodeVersion !== expected.nodeVersion ||
     value.runtimeExecutableSha256 !== expected.runtimeExecutableSha256 ||
     value.runtimeProductVersion !== expected.runtimeProductVersion ||
-    value.schemaVersion !== 3 ||
+    value.schemaVersion !== 4 ||
     value.type !== "opencode-cycle-desktop-module-link"
   ) throw new Error("Official Desktop module link receipt is invalid")
 }
@@ -2627,6 +2653,7 @@ function parseArguments(argumentsList: readonly string[]): {
   output: string
   platform: CertifiedPlatform
   pluginArchive: string
+  pluginProvenance: string
   revision: string
 } {
   const values = new Map<string, string>()
@@ -2644,7 +2671,7 @@ function parseArguments(argumentsList: readonly string[]): {
   if (!(SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS as readonly string[]).includes(platform)) {
     throw new Error("Desktop certification requires a supported --platform")
   }
-  for (const key of ["native-archive", "output", "plugin-archive", "revision"]) {
+  for (const key of ["native-archive", "output", "plugin-archive", "plugin-provenance", "revision"]) {
     if (!values.has(key)) throw new Error(`Desktop certification is missing --${key}`)
   }
   return {
@@ -2654,6 +2681,7 @@ function parseArguments(argumentsList: readonly string[]): {
     output: values.get("output") as string,
     platform,
     pluginArchive: values.get("plugin-archive") as string,
+    pluginProvenance: values.get("plugin-provenance") as string,
     revision: values.get("revision") as string,
   }
 }

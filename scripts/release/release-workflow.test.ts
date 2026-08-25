@@ -71,6 +71,37 @@ test("workflow-dispatch version is environment-bound, validated and never interp
   expect(allRuns.every((run) => !run.includes("${{ inputs.version }}"))).toBeTrue()
 })
 
+test("one canonical Linux plugin package is the immutable input to both Desktop lanes", async () => {
+  const candidate = await workflow("release-candidate.yml")
+  const pluginUploads = candidate.jobs.plugin?.steps.filter((step) =>
+    step.uses?.startsWith("actions/upload-artifact@")
+  ) ?? []
+  const archiveUpload = pluginUploads.find((step) => step.with?.name === "plugin-package")
+  const provenanceUpload = pluginUploads.find((step) =>
+    step.with?.name === "plugin-package-provenance"
+  )
+  expect(archiveUpload?.with?.path).toBe("candidate/plugin/*.tgz")
+  expect(provenanceUpload?.with?.path).toBe("candidate/plugin/*.provenance.json")
+
+  const desktopDownloads = candidate.jobs.desktop?.steps.filter((step) =>
+    step.uses?.startsWith("actions/download-artifact@")
+  ) ?? []
+  expect(desktopDownloads.some((step) => step.with?.name === "plugin-package")).toBeTrue()
+  expect(desktopDownloads.some((step) =>
+    step.with?.name === "plugin-package-provenance"
+  )).toBeTrue()
+
+  const desktopRuns = runs(candidate.jobs.desktop)
+  const certification = desktopRuns.find((run) => run.includes("desktop-certification.ts"))
+  expect(certification).toContain(
+    '--plugin-archive "candidate/plugin/opencode-cycle-$CANDIDATE_VERSION.tgz"',
+  )
+  expect(certification).toContain(
+    '--plugin-provenance "candidate/plugin/opencode-cycle-$CANDIDATE_VERSION.tgz.provenance.json"',
+  )
+  expect(desktopRuns.every((run) => !run.includes("bun pm pack"))).toBeTrue()
+})
+
 test("all workflow actions remain pinned to full commit SHAs", async () => {
   for (const name of ["release-candidate.yml", "publish.yml"]) {
     const value = await workflow(name)

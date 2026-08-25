@@ -8,6 +8,9 @@ import { SourceTextModule, SyntheticModule, type Module } from "node:vm"
 
 import type { DesktopRuntimeLinkerExpected } from "./desktop-runtime-linker.js"
 import { DESKTOP_LINKER_INPUT_MAGIC } from "./desktop-dependency-tree.js"
+import {
+  TRUSTED_BROWSER_RUNTIME_BOUNDARY_PATH,
+} from "../packaging/browser-runtime-boundary.js"
 
 type ModuleKind = "asset" | "commonjs" | "esm" | "json"
 type EdgeKind = "dynamic" | "require" | "resolve" | "static"
@@ -33,6 +36,7 @@ interface GraphNode {
   readonly kind: ModuleKind
   readonly path: string
   readonly sha256: string
+  readonly trustedBundledBoundary: boolean
 }
 
 interface HeldFile {
@@ -408,6 +412,7 @@ export async function runDesktopRuntimeLinker(
     if (held === undefined) throw new ResolutionError("MODULE_NOT_FOUND_TARGET")
     if (graph.size >= MAX_GRAPH_FILES) throw new Error("module linker graph exceeds its file limit")
     if (resolutionOnly) {
+      const relativePath = relative(root, absolute).split(sep).join("/")
       const asset: GraphNode = {
         bytes: held.bytes,
         commonJsExports: new Set(),
@@ -415,6 +420,7 @@ export async function runDesktopRuntimeLinker(
         kind: "asset",
         path: absolute,
         sha256: held.sha256,
+        trustedBundledBoundary: relativePath === TRUSTED_BROWSER_RUNTIME_BOUNDARY_PATH,
       }
       graph.set(key, asset)
       return asset
@@ -437,13 +443,15 @@ export async function runDesktopRuntimeLinker(
         kind,
         path: absolute,
         sha256: held.sha256,
+        trustedBundledBoundary: false,
       }
       graph.set(key, json)
       return json
     }
     let analysis: ReturnType<typeof analyzeJavaScript>
+    const source = held.bytes.toString("utf8")
     try {
-      analysis = analyzeJavaScript(held.bytes.toString("utf8"), absolute, kind)
+      analysis = analyzeJavaScript(source, absolute, kind)
     } catch (error) {
       const message = error instanceof Error ? error.message : "module parse failed"
       throw new Error(`${message}: ${relative(root, absolute).split(sep).join("/")}`)
@@ -455,6 +463,7 @@ export async function runDesktopRuntimeLinker(
       kind,
       path: absolute,
       sha256: held.sha256,
+      trustedBundledBoundary: false,
     }
     graph.set(key, node)
     for (const edge of node.edges) {
@@ -558,6 +567,11 @@ export async function runDesktopRuntimeLinker(
   const verifiedCommonJsModuleCount = nodes.filter((node) => node.kind === "commonjs").length
   const verifiedJsonModuleCount = nodes.filter((node) => node.kind === "json").length
   const verifiedAssetFileCount = nodes.filter((node) => node.kind === "asset").length
+  const isolatedRuntimeBoundaries = nodes.filter((node) => node.trustedBundledBoundary)
+  if (isolatedRuntimeBoundaries.length > 1) {
+    throw new Error("module linker isolated runtime boundary count is invalid")
+  }
+  const isolatedRuntimeBoundary = isolatedRuntimeBoundaries[0]
   if (
     linkedEsmModuleCount + verifiedCommonJsModuleCount + verifiedJsonModuleCount +
       verifiedAssetFileCount !== graph.size
@@ -585,7 +599,12 @@ export async function runDesktopRuntimeLinker(
     fullTreeFileCount: expected.fullTreeFileCount,
     graphFileCount: graph.size,
     graphSha256: digestBytes(graphCanonical),
+    isolatedRuntimeBoundaryCount: isolatedRuntimeBoundaries.length,
+    isolatedRuntimeBoundarySha256: isolatedRuntimeBoundary?.sha256 ?? null,
     linkedEsmModuleCount,
+    moduleLoadingProof: isolatedRuntimeBoundary === undefined
+      ? "static-literal-plugin-host-v1"
+      : "static-literal-plugin-host-with-isolated-worker-v1",
     nodeVersion: process.versions.node,
     runtimeInputContentBytes: expected.runtimeInputContentBytes,
     runtimeInputFileCount: expected.runtimeInputFileCount,
@@ -593,12 +612,12 @@ export async function runDesktopRuntimeLinker(
     runtimeInputSha256: expected.runtimeInputSha256,
     runtimeExecutableSha256: digestFile(process.execPath),
     runtimeProductVersion: expected.runtimeProductVersion,
-    schemaVersion: 3,
+    schemaVersion: 4,
     suppressedOptionalRootCount: nodes.flatMap((node) => node.edges)
       .filter((edge) => edge.suppressedOptionalRoot).length,
     type: "opencode-cycle-desktop-module-link",
     unsafeDynamicImportsRejected: true,
-    unsafeModuleLoadingRejected: true,
+    unverifiedPluginHostModuleLoadingRejected: true,
     verifiedAssetFileCount,
     verifiedCommonJsModuleCount,
     verifiedContentTreeSha256: expected.verifiedContentTreeSha256,
@@ -691,7 +710,7 @@ function readHeldFiles(
   return files
 }
 
-function analyzeJavaScript(
+export function analyzeJavaScript(
   source: string,
   parent: string,
   kind: "commonjs" | "esm",
@@ -701,6 +720,7 @@ function analyzeJavaScript(
     ecmaVersion: "latest",
     sourceType: kind === "esm" ? "module" : "script",
   }) as unknown as AstNode
+  const scopes = buildJavaScriptScopes(ast)
   const commonJsExports = new Set<string>()
   const edges: GraphEdge[] = []
   const addEdge = (
@@ -715,6 +735,8 @@ function analyzeJavaScript(
   }
   const visit = (node: AstNode, parentNode?: AstNode, parentKey?: string): void => {
     let skipCallee = false
+    const scope = scopes.get(node)
+    if (scope === undefined) throw new Error("module linker lexical scope is missing")
     if (node.type === "ImportDeclaration") {
       addEdge("static", literalString(node.source), importNames(node))
     } else if (node.type === "ExportNamedDeclaration" &&
@@ -727,6 +749,10 @@ function analyzeJavaScript(
     } else if (node.type === "CallExpression") {
       const callee = asNode(node.callee)
       const argumentsList = Array.isArray(node.arguments) ? node.arguments : []
+      if (callee?.type === "Identifier" && callee.name === "eval") {
+        throw new Error("generated module loading is forbidden")
+      }
+      if (callee?.type === "Identifier" && callee.name === "Proxy") throw new Error("module loader proxy is forbidden")
       if (callee?.type === "Identifier" && callee.name === "require") {
         if (kind !== "commonjs" || argumentsList.length !== 1) {
           throw new Error("unsafe require is forbidden")
@@ -743,10 +769,16 @@ function analyzeJavaScript(
         }
       }
       collectDefinedExport(node, commonJsExports)
-    } else if (node.type === "NewExpression" && forbiddenGeneratedCallee(asNode(node.callee))) {
-      const argumentsList = Array.isArray(node.arguments) ? node.arguments : []
-      if (generatedSourceCouldLoadModules(argumentsList)) {
-        throw new Error("generated module loading is forbidden")
+    } else if (node.type === "NewExpression") {
+      const callee = asNode(node.callee)
+      if (callee?.type === "Identifier" && callee.name === "Proxy") {
+        throw new Error("module loader proxy is forbidden")
+      }
+      if (forbiddenGeneratedCallee(callee)) {
+        const argumentsList = Array.isArray(node.arguments) ? node.arguments : []
+        if (generatedSourceCouldLoadModules(argumentsList)) {
+          throw new Error("generated module loading is forbidden")
+        }
       }
     } else if (node.type === "AssignmentExpression") {
       collectAssignedExports(node, commonJsExports)
@@ -758,11 +790,14 @@ function analyzeJavaScript(
       } else if (isForbiddenLoaderMember(node)) {
         throw new Error("generated module loading member is forbidden")
       }
-    } else if (node.type === "Identifier" &&
-      ["createRequire", "eval", "require"]
-        .includes(String(node.name))) {
-      if (!(node.name === "require" && parentNode?.type === "CallExpression" && parentKey === "callee")) {
-        throw new Error("module loader aliasing is forbidden")
+      if (isReflectSafeMember(node) &&
+        (parentNode?.type !== "CallExpression" || parentKey !== "callee")) {
+        throw new Error("reflection capability aliasing is forbidden")
+      }
+    } else if (node.type === "Identifier" && isIdentifierReference(parentNode, parentKey) &&
+      isSensitiveLoaderIdentifier(node, scope)) {
+      if (!isAllowedSensitiveIdentifierUse(node, parentNode, parentKey)) {
+        throw new Error(`module loader capability aliasing is forbidden: ${String(node.name)}`)
       }
     }
     for (const [key, value] of Object.entries(node)) {
@@ -826,9 +861,85 @@ function isImportMetaResolve(node: AstNode | undefined): boolean {
     asNode(object.property)?.name === "meta" && property?.name === "resolve"
 }
 
+interface JavaScriptScope {
+  readonly bindings: Set<string>
+  readonly kind: "block" | "function" | "program"
+  readonly parent?: JavaScriptScope
+}
+
+function isSensitiveLoaderIdentifier(node: AstNode, scope: JavaScriptScope): boolean {
+  const name = String(node.name)
+  if (isShadowedJavaScriptBinding(name, scope)) return false
+  return isSensitiveGlobalName(name)
+}
+
+function isSensitiveGlobalName(name: string): boolean {
+  return [
+    "AsyncFunction",
+    "Function",
+    "GeneratorFunction",
+    "Proxy",
+    "Reflect",
+    "createRequire",
+    "eval",
+    "getBuiltinModule",
+    "global",
+    "globalThis",
+    "module",
+    "process",
+    "require",
+  ].includes(name)
+}
+
+function isAllowedSensitiveIdentifierUse(
+  node: AstNode,
+  parent: AstNode | undefined,
+  parentKey: string | undefined,
+): boolean {
+  const name = String(node.name)
+  if (["AsyncFunction", "Function", "GeneratorFunction"].includes(name)) {
+    if ((parent?.type === "CallExpression" || parent?.type === "NewExpression") && parentKey === "callee") return true
+    return parent?.type === "MemberExpression" && parentKey === "object" &&
+      parent.computed !== true && memberName(parent) === "prototype"
+  }
+  if (name === "Reflect") {
+    return parent?.type === "MemberExpression" && parentKey === "object" && isReflectSafeMember(parent)
+  }
+  if (["global", "globalThis", "module", "process"].includes(name)) {
+    if (parent?.type === "UnaryExpression" && parent.operator === "typeof" &&
+      parentKey === "argument") return true
+    return parent?.type === "MemberExpression" && parentKey === "object" &&
+      !isForbiddenLoaderMember(parent)
+  }
+  return false
+}
+
+function isIdentifierReference(
+  parent: AstNode | undefined,
+  parentKey: string | undefined,
+): boolean {
+  if (parent === undefined) return true
+  if (parent.type === "MemberExpression" && parentKey === "property" &&
+    parent.computed !== true) return false
+  if (["Property", "MethodDefinition", "PropertyDefinition"].includes(parent.type) &&
+    parentKey === "key" && parent.computed !== true) return false
+  if (parent.type === "MetaProperty") return false
+  if (parent.type === "LabeledStatement" && parentKey === "label") return false
+  if (["BreakStatement", "ContinueStatement"].includes(parent.type) &&
+    parentKey === "label") return false
+  if (["ImportSpecifier", "ImportDefaultSpecifier", "ImportNamespaceSpecifier"].includes(
+    parent.type,
+  )) return false
+  if (parent.type === "ExportSpecifier" && parentKey === "exported") return false
+  if (["VariableDeclarator", "FunctionDeclaration", "FunctionExpression", "ClassDeclaration",
+    "ClassExpression", "CatchClause"].includes(parent.type) &&
+    ["id", "param", "params"].includes(String(parentKey))) return false
+  return true
+}
+
 function forbiddenGeneratedCallee(node: AstNode | undefined): boolean {
   if (node?.type === "Identifier") {
-    return ["AsyncFunction", "Function", "GeneratorFunction", "createRequire", "eval"].includes(
+    return ["AsyncFunction", "Function", "GeneratorFunction", "createRequire"].includes(
       String(node.name),
     )
   }
@@ -843,11 +954,14 @@ function generatedSourceCouldLoadModules(argumentsList: readonly unknown[]): boo
       if (generatedLoaderText(node.value)) return true
       continue
     }
-    if (node?.type === "TemplateLiteral" && Array.isArray(node.quasis)) {
+    if (node?.type === "TemplateLiteral" && Array.isArray(node.quasis) &&
+      Array.isArray(node.expressions)) {
+      if (node.expressions.length !== 0) return true
       const staticText = node.quasis.map((quasi) => {
         const valueNode = asNode(quasi)
         const cooked = isRecord(valueNode?.value) ? valueNode.value.cooked : undefined
-        return typeof cooked === "string" ? cooked : ""
+        if (typeof cooked !== "string") throw new Error("generated source is malformed")
+        return cooked
       }).join("")
       if (generatedLoaderText(staticText)) return true
       continue
@@ -858,25 +972,201 @@ function generatedSourceCouldLoadModules(argumentsList: readonly unknown[]): boo
 }
 
 function generatedLoaderText(value: string): boolean {
-  return /\b(?:createRequire|import\s*\(|module\s*\.\s*(?:_load|require)|require\b)/u.test(value)
+  return /\b(?:createRequire|eval|Function|getBuiltinModule|import\s*\(|module\s*\.\s*(?:_load|require)|Proxy|Reflect\s*\.\s*get|require\b)/u
+    .test(value)
 }
 
 function isForbiddenLoaderMember(node: AstNode): boolean {
   if (node.type !== "MemberExpression") return false
   const object = asNode(node.object)
-  const property = asNode(node.property)
-  const name = node.computed === true ? literalMemberName(property) : property?.name
-  if (name === "require") return true
+  const name = memberName(node)
+  const objectName = String(object?.name)
+  if (
+    node.computed === true && name === undefined &&
+    ["global", "globalThis", "module", "process", "Reflect", "require"].includes(objectName)
+  ) return true
+  if (["createRequire", "eval", "getBuiltinModule", "require"].includes(String(name))) return true
   if (name === "resolve") return object?.name === "require" || isImportMetaResolve(node)
-  if (name === "_load") return object?.name === "module"
+  if (name === "_load") return objectName === "module"
+  if (objectName === "Reflect") return !["apply", "ownKeys"].includes(String(name))
+  if (["global", "globalThis"].includes(objectName) &&
+    [
+      "AsyncFunction",
+      "Function",
+      "GeneratorFunction",
+      "Proxy",
+      "Reflect",
+      "createRequire",
+      "eval",
+      "module",
+      "process",
+      "require",
+    ].includes(String(name))) return true
   if (["compileFunction", "runInThisContext"].includes(String(name))) {
-    return object?.name === "vm"
+    return objectName === "vm"
   }
-  return name === "eval" && ["global", "globalThis"].includes(String(object?.name))
+  return false
+}
+
+function isReflectSafeMember(node: AstNode): boolean {
+  return node.type === "MemberExpression" && asNode(node.object)?.name === "Reflect" &&
+    node.computed !== true && ["apply", "ownKeys"].includes(String(memberName(node)))
+}
+
+function memberName(node: AstNode): string | undefined {
+  if (node.type !== "MemberExpression") return undefined
+  const property = asNode(node.property)
+  if (node.computed !== true) return typeof property?.name === "string" ? property.name : undefined
+  return staticStringValue(property)
 }
 
 function literalMemberName(node: AstNode | undefined): unknown {
-  return node?.type === "Literal" ? node.value : undefined
+  return staticStringValue(node)
+}
+
+function staticStringValue(node: AstNode | undefined): string | undefined {
+  if (node?.type === "Literal") return typeof node.value === "string" ? node.value : undefined
+  if (node?.type === "TemplateLiteral" && Array.isArray(node.expressions) &&
+    node.expressions.length === 0 && Array.isArray(node.quasis)) {
+    return node.quasis.map((value) => {
+      const quasi = asNode(value)
+      const cooked = isRecord(quasi?.value) ? quasi.value.cooked : undefined
+      return typeof cooked === "string" ? cooked : ""
+    }).join("")
+  }
+  if (node?.type === "BinaryExpression" && node.operator === "+") {
+    const left = staticStringValue(asNode(node.left))
+    const right = staticStringValue(asNode(node.right))
+    return left === undefined || right === undefined ? undefined : `${left}${right}`
+  }
+  return undefined
+}
+
+function buildJavaScriptScopes(ast: AstNode): WeakMap<object, JavaScriptScope> {
+  const scopes = new WeakMap<object, JavaScriptScope>()
+  const root: JavaScriptScope = { bindings: new Set(), kind: "program" }
+  const walk = (
+    node: AstNode,
+    inherited: JavaScriptScope,
+    parent?: AstNode,
+    parentKey?: string,
+  ): void => {
+    let scope = inherited
+    if (isFunctionNode(node)) {
+      if (node.type === "FunctionDeclaration") addPatternBindings(asNode(node.id), inherited)
+      scope = { bindings: new Set(), kind: "function", parent: inherited }
+      if (node.type === "FunctionExpression") addPatternBindings(asNode(node.id), scope)
+      if (Array.isArray(node.params)) {
+        for (const parameter of node.params) addPatternBindings(asNode(parameter), scope)
+      }
+    } else if (createsJavaScriptBlockScope(node, parent, parentKey)) {
+      scope = { bindings: new Set(), kind: "block", parent: inherited }
+    }
+    scopes.set(node, scope)
+    if (node.type === "VariableDeclaration" && Array.isArray(node.declarations)) {
+      const target = node.kind === "var" ? nearestFunctionScope(scope) : scope
+      for (const declaration of node.declarations) {
+        addPatternBindings(asNode(asNode(declaration)?.id), target)
+      }
+    } else if (node.type === "ClassDeclaration") {
+      addPatternBindings(asNode(node.id), scope)
+    } else if (node.type === "ClassExpression") {
+      addPatternBindings(asNode(node.id), scope)
+    } else if (node.type === "ImportDeclaration" && Array.isArray(node.specifiers)) {
+      for (const specifier of node.specifiers) {
+        addPatternBindings(asNode(asNode(specifier)?.local), scope)
+      }
+    } else if (node.type === "CatchClause") {
+      addPatternBindings(asNode(node.param), scope)
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (["end", "loc", "range", "start", "type"].includes(key)) continue
+      if (Array.isArray(value)) {
+        for (const child of value) {
+          const childNode = asNode(child)
+          if (childNode !== undefined) walk(childNode, scope, node, key)
+        }
+      } else {
+        const childNode = asNode(value)
+        if (childNode !== undefined) walk(childNode, scope, node, key)
+      }
+    }
+  }
+  walk(ast, root)
+  return scopes
+}
+
+function createsJavaScriptBlockScope(
+  node: AstNode,
+  parent: AstNode | undefined,
+  parentKey: string | undefined,
+): boolean {
+  if (node.type === "Program") return false
+  if (node.type === "BlockStatement") {
+    if (isFunctionNode(parent) && parentKey === "body") return false
+    if (parent?.type === "CatchClause" && parentKey === "body") return false
+    return true
+  }
+  return [
+    "CatchClause",
+    "ForInStatement",
+    "ForOfStatement",
+    "ForStatement",
+    "StaticBlock",
+    "SwitchStatement",
+  ].includes(node.type)
+}
+
+function isFunctionNode(node: AstNode | undefined): boolean {
+  return [
+    "ArrowFunctionExpression",
+    "FunctionDeclaration",
+    "FunctionExpression",
+  ].includes(String(node?.type))
+}
+
+function nearestFunctionScope(scope: JavaScriptScope): JavaScriptScope {
+  let current = scope
+  while (current.kind === "block" && current.parent !== undefined) current = current.parent
+  return current
+}
+
+function addPatternBindings(pattern: AstNode | undefined, scope: JavaScriptScope): void {
+  if (pattern === undefined) return
+  if (pattern.type === "Identifier" && typeof pattern.name === "string") {
+    scope.bindings.add(pattern.name)
+    return
+  }
+  if (pattern.type === "AssignmentPattern") {
+    addPatternBindings(asNode(pattern.left), scope)
+    return
+  }
+  if (pattern.type === "RestElement") {
+    addPatternBindings(asNode(pattern.argument), scope)
+    return
+  }
+  if (pattern.type === "ArrayPattern" && Array.isArray(pattern.elements)) {
+    for (const element of pattern.elements) addPatternBindings(asNode(element), scope)
+    return
+  }
+  if (pattern.type === "ObjectPattern" && Array.isArray(pattern.properties)) {
+    for (const value of pattern.properties) {
+      const property = asNode(value)
+      addPatternBindings(
+        property?.type === "RestElement" ? asNode(property.argument) : asNode(property?.value),
+        scope,
+      )
+    }
+  }
+}
+
+function isShadowedJavaScriptBinding(name: string, scope: JavaScriptScope): boolean {
+  let current: JavaScriptScope | undefined = scope
+  while (current !== undefined) {
+    if (current.bindings.has(name)) return true
+    current = current.parent
+  }
+  return false
 }
 
 function collectAssignedExports(node: AstNode, names: Set<string>): void {

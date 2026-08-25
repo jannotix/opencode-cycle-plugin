@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -19,6 +20,7 @@ import {
 import {
   OFFICIAL_RUNTIME_EVIDENCE_DIRECTORY_PREFIX,
   openOfficialRuntimeEvidenceDirectory,
+  serializeOfficialRuntimeProvenance,
   validateOfficialRuntimeEvidenceDirectory,
   type OfficialGateOutputSummary,
   type OfficialRuntimeEvidenceBinding,
@@ -106,7 +108,7 @@ test("partial success publication becomes durable evidence_publication failure",
   try {
     const session = await openOfficialRuntimeEvidenceDirectory(path)
     await session.recordStage("gate-started")
-    await writeFile(join(path, "desktop-runtime-linker.mjs"), "collision")
+    await writeFile(join(path, "desktop-runtime-provenance.json"), "collision")
     const publication = await session.publish({
       binding: binding(),
       gateOutput: emptyOutput(),
@@ -170,6 +172,18 @@ test("successful official evidence is durable, exact, path-free and cleanup-inde
     })
     await rm(internalScratch, { force: true, recursive: true })
     await expect(validateOfficialRuntimeEvidenceDirectory(path)).resolves.toBeUndefined()
+    const retainedNames = await readdir(path)
+    expect(retainedNames).toContain("desktop-runtime-provenance.json")
+    expect(retainedNames).not.toContain("candidate-entry.js")
+    expect(retainedNames).not.toContain("candidate-wrapper.js")
+    expect(retainedNames).not.toContain("desktop-runtime-linker.mjs")
+    for (const name of retainedNames) {
+      const content = await readFile(join(path, name))
+      const text = content.toString("utf8")
+      expect(text, name).not.toContain(internalScratch)
+      expect(text, name).not.toMatch(/[A-Za-z]:[\\/]/u)
+      expect(text, name).not.toContain("file://")
+    }
     for (const name of ["evidence-manifest.json", "package-gate-exit.json"]) {
       const receipt = await readFile(join(path, name), "utf8")
       expect(receipt).not.toContain(path)
@@ -180,6 +194,55 @@ test("successful official evidence is durable, exact, path-free and cleanup-inde
       rm(path, { force: true, recursive: true }),
       rm(internalScratch, { force: true, recursive: true }),
     ])
+  }
+}, { timeout: 120_000 })
+
+test("official evidence scans every durable byte against exact secrets and local paths", async () => {
+  const path = evidencePath("sensitive-material")
+  const nonce = "9".repeat(64)
+  const scratch = join(tmpdir(), `cycle-sensitive-${randomUUID()}`)
+  const configPath = join(scratch, "config", "opencode.json")
+  try {
+    const session = await openOfficialRuntimeEvidenceDirectory(path, {
+      absolutePaths: [scratch, configPath],
+      nonce,
+    })
+    await session.recordStage("gate-started")
+    await session.recordStage("module-graph-prepared", runtimeInputPrepared())
+    await session.recordStage("runtime-started", runtimeStarted())
+    await session.recordStage("runtime-completed", runtimeCompleted("none"))
+    const evidence = material()
+    await recordEvidenceMaterial(session, evidence)
+    const diagnostics = Buffer.from(`${JSON.stringify({
+      detail: `binding=${nonce}; config=${configPath}`,
+      runDigest: "1".repeat(64),
+      schemaVersion: 2,
+      sequence: 0,
+      stage: "certification_env_prepared",
+      status: "passed",
+      type: "opencode-cycle-desktop-load-diagnostic",
+    })}\n`)
+    const publication = await session.publish({
+      binding: binding(),
+      gateOutput: emptyOutput(),
+      material: {
+        ...evidence,
+        "desktop-runtime-diagnostics.jsonl": diagnostics,
+      },
+    })
+    expect(publication.passed).toBe(false)
+    const retainedNames = await readdir(path)
+    for (const name of retainedNames) {
+      const content = await readFile(join(path, name))
+      const text = content.toString("utf8")
+      expect(text, name).not.toContain(nonce)
+      expect(text, name).not.toContain(scratch)
+      expect(text, name).not.toContain(configPath)
+      expect(text, name).not.toMatch(/[A-Za-z]:[\\/]/u)
+    }
+    await expect(validateOfficialRuntimeEvidenceDirectory(path)).resolves.toBeUndefined()
+  } finally {
+    await rm(path, { force: true, recursive: true })
   }
 }, { timeout: 120_000 })
 
@@ -368,6 +431,9 @@ function material() {
     fullTreeFileCount: 4,
     graphFileCount: 3,
     graphSha256,
+    isolatedRuntimeBoundaryCount: 1,
+    isolatedRuntimeBoundarySha256: "7".repeat(64),
+    moduleLoadingProof: "static-literal-plugin-host-with-isolated-worker-v1",
     linkedEsmModuleCount: 2,
     nodeVersion: "24.15.0",
     runtimeInputContentBytes: 100,
@@ -376,11 +442,12 @@ function material() {
     runtimeInputSha256: "6".repeat(64),
     runtimeExecutableSha256: "d".repeat(64),
     runtimeProductVersion: "1.18.21.0",
-    schemaVersion: 3,
+    schemaVersion: 4,
+    unverifiedPluginHostModuleLoadingRejected: true,
     suppressedOptionalRootCount: 1,
     type: "opencode-cycle-desktop-module-link",
-    verifiedAssetFileCount: 0,
-    verifiedCommonJsModuleCount: 1,
+    verifiedAssetFileCount: 1,
+    verifiedCommonJsModuleCount: 0,
     verifiedContentTreeSha256: contentTreeSha256,
     verifiedJsonModuleCount: 0,
   }
@@ -394,6 +461,9 @@ function material() {
     linkedEsmModuleCount: 2,
     linkerSha256,
     loaderSha256,
+    isolatedRuntimeBoundaryCount: 1,
+    isolatedRuntimeBoundarySha256: "7".repeat(64),
+    moduleLoadingProof: "static-literal-plugin-host-with-isolated-worker-v1",
     nativePackageSha256: "a".repeat(64),
     nodeVersion: "24.15.0",
     pluginPackageSha256: "b".repeat(64),
@@ -404,17 +474,16 @@ function material() {
     runtimeInputSha256: "6".repeat(64),
     runtimeExecutableSha256: "d".repeat(64),
     runtimeProductVersion: "1.18.21.0",
-    schemaVersion: 5,
+    schemaVersion: 6,
+    unverifiedPluginHostModuleLoadingRejected: true,
     suppressedOptionalRootCount: 1,
     type: "opencode-cycle-desktop-runtime-guard",
-    verifiedAssetFileCount: 0,
-    verifiedCommonJsModuleCount: 1,
+    verifiedAssetFileCount: 1,
+    verifiedCommonJsModuleCount: 0,
     verifiedContentTreeSha256: contentTreeSha256,
     verifiedJsonModuleCount: 0,
   }
   return {
-    "candidate-entry.js": candidate,
-    "candidate-wrapper.js": wrapper,
     "dependency-tree-manifest.json": serializeDesktopDependencyTreeManifest({
       contentTreeSha256,
       dependencyTree,
@@ -428,7 +497,11 @@ function material() {
       status: "passed",
       type: "opencode-cycle-desktop-load-diagnostic",
     }),
-    "desktop-runtime-linker.mjs": linker,
+    "desktop-runtime-provenance.json": serializeOfficialRuntimeProvenance({
+      candidateEntry: candidate,
+      linker,
+      loader: wrapper,
+    }),
     "desktop-runtime-result.json": json(result),
     "runtime-output-summary.json": json({
       exitCode: 0,

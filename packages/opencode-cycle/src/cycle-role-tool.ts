@@ -1,4 +1,4 @@
-import { tool, type ToolDefinition } from "@opencode-ai/plugin"
+import { tool, type ToolDefinition } from "./tool-runtime.js"
 
 import {
   ROLE_CONSULTATION_OPERATIONS,

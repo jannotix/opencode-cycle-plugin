@@ -6,7 +6,10 @@ import { basename, join, resolve } from "node:path"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
 import { inspectTarGz } from "./tar-archive.js"
 
-const GENERATED_RUNTIME_MODULES = ["browser/managed-browser-session.cjs"] as const
+const GENERATED_RUNTIME_MODULES = ["browser/managed-browser-worker.mjs"] as const
+const AUTHORITATIVE_PLUGIN_PROVENANCE_TYPE =
+  "opencode-cycle-authoritative-plugin-package"
+const BUN_VERSION = "1.3.14"
 
 const NON_PRODUCTION_PATH =
   /(?:^|\/)(?:(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|[^/]*(?:\.(?:test|spec)(?:\.|$)|_(?:test|spec)_)[^/]*)|\.map$/iu
@@ -14,9 +17,13 @@ const NON_PRODUCTION_PATH =
 export interface PluginPackageResult {
   readonly archive: string
   readonly checksum: string
+  readonly provenance: string
 }
 
 export async function packagePlugin(root: string, output: string): Promise<PluginPackageResult> {
+  if (process.platform !== "linux" || process.arch !== "x64" || Bun.version !== BUN_VERSION) {
+    throw new Error("Authoritative plugin packages must be built by pinned Bun on Linux x64")
+  }
   const resolvedRoot = resolve(root)
   const packageRoot = join(resolvedRoot, "packages", PRODUCT_IDENTITY.mainPackage)
   const resolvedOutput = resolve(output)
@@ -41,8 +48,25 @@ export async function packagePlugin(root: string, output: string): Promise<Plugi
     const listing = inspectTarGz(await readFile(archive)).map((entry) => entry.name)
     validatePluginListing(listing, sourceModules, GENERATED_RUNTIME_MODULES)
     const checksum = await digest(archive)
+    const revision = (await run(["git", "rev-parse", "HEAD"], resolvedRoot)).trim()
+    if (!/^[0-9a-f]{40}$/u.test(revision)) throw new Error("Plugin package revision is invalid")
     await writeFile(`${archive}.sha256`, `${checksum}  ${basename(archive)}\n`, "utf8")
-    return { archive, checksum }
+    const provenance = `${archive}.provenance.json`
+    await writeFile(provenance, `${JSON.stringify({
+      archiveBytes: (await readFile(archive)).byteLength,
+      archiveName: basename(archive),
+      archiveSha256: checksum,
+      buildArch: process.arch,
+      buildPlatform: process.platform,
+      bunLockSha256: await digest(join(resolvedRoot, "bun.lock")),
+      bunVersion: Bun.version,
+      pluginManifestSha256: await digest(join(packageRoot, "package.json")),
+      revision,
+      schemaVersion: 1,
+      type: AUTHORITATIVE_PLUGIN_PROVENANCE_TYPE,
+      workspaceManifestSha256: await digest(join(resolvedRoot, "package.json")),
+    })}\n`, { flag: "wx", mode: 0o600 })
+    return { archive, checksum, provenance }
   } finally {
     await rm(scratch, { force: true, recursive: true })
   }

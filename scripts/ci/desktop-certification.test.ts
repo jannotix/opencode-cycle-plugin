@@ -1347,7 +1347,7 @@ test("desktop profile discovery scans certification roots", () => {
     LOCALAPPDATA: "C:\\local",
   }
   const discovered = desktopTestProfileRoots(roots)
-  expect(discovered).toEqual([
+  expect(discovered).toEqual([...new Set([
     tmpdir(),
     "/tmp",
     "/var/tmp",
@@ -1357,7 +1357,7 @@ test("desktop profile discovery scans certification roots", () => {
     "C:\\state",
     "C:\\local",
     "C:\\appdata",
-  ])
+  ])])
 })
 
 test("Windows signature verification uses the system PowerShell module host", () => {

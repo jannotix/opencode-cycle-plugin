@@ -51,20 +51,29 @@ export async function bundledDesktopRuntimeLinker(
       flag: "wx",
       mode: 0o600,
     })
-    const build = await Bun.build({
-      banner: `/* Bundled dependency: acorn@8.15.0\n${acornLicense}*/`,
-      entrypoints: [entry],
-      format: "esm",
-      minify: true,
-      sourcemap: "none",
-      target: "node",
-    })
-    if (!build.success || build.outputs.length !== 1) {
-      const messages = build.logs.map((log) => log.message).join("; ")
-      throw new Error(`Trusted Desktop linker bundle failed: ${messages}`)
-    }
-    return Buffer.from(await build.outputs[0]!.arrayBuffer())
+    const output = join(temporary, "desktop-runtime-linker.mjs")
+    const child = Bun.spawn([
+      process.execPath,
+      "build",
+      entry,
+      "--format=esm",
+      "--outfile",
+      output,
+      "--sourcemap=none",
+      "--target=node",
+    ], { stderr: "pipe", stdout: "ignore", windowsHide: true })
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    if (exitCode !== 0) throw new Error(`Trusted Desktop linker bundle failed: ${safeBuildFailure(stderr)}`)
+    return Buffer.concat([
+      Buffer.from(`/* Bundled dependency: acorn@8.15.0\n${acornLicense}*/\n`),
+      await readFile(output),
+    ])
   } finally {
     await rm(temporary, { force: true, recursive: true })
   }
+}
+
+function safeBuildFailure(stderr: string): string {
+  const sanitized = stderr.replace(/[A-Za-z]:[^\s;]*/gu, "<path>").trim()
+  return sanitized.length === 0 ? "no diagnostic" : sanitized
 }

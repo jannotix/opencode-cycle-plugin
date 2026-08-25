@@ -123,7 +123,8 @@ export async function resolveHostVersion(
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   try {
-    const fetch = options.fetch ?? globalThis.fetch.bind(globalThis)
+    const fetch = options.fetch ?? ((input: URL, init?: RequestInit) =>
+      globalThis.fetch(input, init))
     const authorization = authorizationHeader(options.env ?? process.env)
     const response = await fetch(new URL("/global/health", serverUrl), {
       cache: "no-store",

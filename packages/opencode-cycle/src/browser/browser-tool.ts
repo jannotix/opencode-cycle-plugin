@@ -1,4 +1,4 @@
-import { tool, type ToolDefinition } from "@opencode-ai/plugin"
+import { tool, type ToolDefinition } from "../tool-runtime.js"
 
 import { BROWSER_OPERATIONS, type BrowserCommand } from "./browser-manager.js"
 import type { WorkflowRole } from "../permissions.js"

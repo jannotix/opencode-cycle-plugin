@@ -136,6 +136,7 @@ export function buildReleaseManifest(input: ReleaseManifestInput): ReleaseManife
   const artifacts = new Map(input.artifacts.map((artifact) => [artifact.name, artifact]))
 
   const certificationPlatforms = new Set<CertifiedPlatform>()
+  let certifiedPluginSha256: string | undefined
   for (const item of input.certifications) {
     if (!(REQUIRED_CERTIFIED_PLATFORMS as readonly string[]).includes(item.platform)) {
       throw new Error(`Unsupported certification platform: ${item.platform}`)
@@ -149,6 +150,11 @@ export function buildReleaseManifest(input: ReleaseManifestInput): ReleaseManife
     validateRevision(item.revision)
     if (item.revision !== input.revision) {
       throw new Error(`Certification revision does not match: ${item.platform}`)
+    }
+    if (certifiedPluginSha256 === undefined) {
+      certifiedPluginSha256 = item.pluginArtifact.sha256
+    } else if (item.pluginArtifact.sha256 !== certifiedPluginSha256) {
+      throw new Error("Desktop certifications must bind the same plugin package SHA-256")
     }
     const expectedPlugin = archiveName(PRODUCT_IDENTITY.mainPackage, input.version)
     const expectedNative = nativeArtifactName(item.platform, input.version)
@@ -276,8 +282,11 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "graphFileCount",
         "graphSha256",
         "linkedEsmModuleCount",
+        "isolatedRuntimeBoundaryCount",
+        "isolatedRuntimeBoundarySha256",
         "linkerSha256",
         "loaderSha256",
+        "moduleLoadingProof",
         "moduleLinked",
         "nativePackageSha256",
         "nodeVersion",
@@ -294,7 +303,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "suppressedOptionalRootCount",
         "type",
         "unsafeDynamicImportsRejected",
-        "unsafeModuleLoadingRejected",
+        "unverifiedPluginHostModuleLoadingRejected",
         "verifiedAssetFileCount",
         "verifiedCommonJsModuleCount",
         "verifiedContentTreeSha256",
@@ -358,14 +367,19 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       moduleRuntime.candidateDefaultExportLinked !== true ||
       moduleRuntime.candidateEvaluated !== false ||
       moduleRuntime.unsafeDynamicImportsRejected !== true ||
-      moduleRuntime.unsafeModuleLoadingRejected !== true ||
+      moduleRuntime.unverifiedPluginHostModuleLoadingRejected !== true ||
       moduleRuntime.moduleLinked !== true ||
       moduleRuntime.electronVersion !== "42.3.3" ||
       moduleRuntime.nodeVersion !== "24.15.0" ||
       moduleRuntime.productVersion !== OPENCODE_DESKTOP_VERSION ||
       moduleRuntime.runtimeExecutableSha256 !== asset.runtimeExecutable.sha256 ||
       moduleRuntime.runtimeProductVersion !== asset.runtimeExecutable.productVersion ||
-      moduleRuntime.schemaVersion !== 5 ||
+      moduleRuntime.schemaVersion !== 6 ||
+      moduleRuntime.isolatedRuntimeBoundaryCount !== 1 ||
+      typeof moduleRuntime.isolatedRuntimeBoundarySha256 !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(moduleRuntime.isolatedRuntimeBoundarySha256) ||
+      moduleRuntime.moduleLoadingProof !==
+        "static-literal-plugin-host-with-isolated-worker-v1" ||
       moduleRuntime.type !== "opencode-cycle-desktop-runtime-guard" ||
       typeof moduleRuntime.dependencyFileCount !== "number" ||
       !Number.isSafeInteger(moduleRuntime.dependencyFileCount) ||
@@ -411,6 +425,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         moduleRuntime.verifiedJsonModuleCount + moduleRuntime.verifiedAssetFileCount !==
           moduleRuntime.graphFileCount ||
       typeof moduleRuntime.suppressedOptionalRootCount !== "number" ||
+      typeof moduleRuntime.isolatedRuntimeBoundarySha256 !== "string" ||
       !Number.isSafeInteger(moduleRuntime.suppressedOptionalRootCount) ||
       moduleRuntime.suppressedOptionalRootCount < 0 ||
       typeof moduleRuntime.bindingDigest !== "string" ||
@@ -442,6 +457,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(evidence.pluginPackageSha256)
     validateDigest(daemon.binaryPathSha256)
     validateDigest(daemon.startTokenSha256)
+    validateDigest(moduleRuntime.isolatedRuntimeBoundarySha256)
     validateDigest(daemon.runDigest)
     validateDigest(loadDiagnostics.sha256)
     validateDigest(moduleRuntime.bindingDigest)
