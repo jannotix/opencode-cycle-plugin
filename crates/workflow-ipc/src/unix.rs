@@ -1,6 +1,6 @@
 use std::{
     io,
-    os::unix::fs::FileTypeExt,
+    os::unix::{ffi::OsStrExt, fs::FileTypeExt},
     path::{Path, PathBuf},
 };
 
@@ -8,6 +8,7 @@ use nix::unistd::Uid;
 use tokio::net::{UnixListener, UnixStream};
 
 pub type LocalStream = UnixStream;
+pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 
 pub struct LocalListener {
     listener: UnixListener,
@@ -18,6 +19,7 @@ pub struct LocalListener {
 impl LocalListener {
     pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
+        validate_socket_path(path)?;
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent")
         })?;
@@ -74,7 +76,20 @@ impl Drop for LocalListener {
 }
 
 pub async fn connect(path: impl AsRef<Path>) -> io::Result<LocalStream> {
+    let path = path.as_ref();
+    validate_socket_path(path)?;
     UnixStream::connect(path).await
+}
+
+pub fn validate_socket_path(path: &Path) -> io::Result<usize> {
+    let bytes = path.as_os_str().as_bytes().len();
+    if bytes > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPC endpoint_path exceeds the Unix socket bound",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {

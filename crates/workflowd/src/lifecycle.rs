@@ -85,6 +85,8 @@ pub async fn run(
 ) -> Result<(), DaemonError> {
     let paths = RuntimePaths::new(data_directory.as_ref());
     std::fs::create_dir_all(&paths.runtime)?;
+    #[cfg(unix)]
+    workflow_ipc::transport::validate_socket_path(&paths.socket)?;
     let certification_identity = certification
         .as_ref()
         .map(certification_identity)

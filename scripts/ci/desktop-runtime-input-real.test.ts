@@ -17,7 +17,7 @@ import {
 import { bundledDesktopRuntimeLinker } from "./desktop-runtime-linker.js"
 
 test.skipIf(process.platform !== "win32")(
-  "real packed Windows tree minimizes 5,931 held files without changing the verified graph",
+  "real packed Windows tree minimizes 5,932 held files with a truthful verified graph",
   async () => {
     const root = fileURLToPath(new URL("../../", import.meta.url))
     const temporary = await mkdtemp(join(tmpdir(), "cycle-real-runtime-input-"))
@@ -58,9 +58,9 @@ test.skipIf(process.platform !== "win32")(
       const input = verification.openLinkerInput()
       try {
         expect(verification.receipt.dependencyFileCount).toBe(5_885)
-        expect(input.fullTreeFileCount).toBe(5_931)
-        expect(input.runtimeInputFileCount).toBe(2_774)
-        expect(input.runtimeInputSerializedBytes).toBe(25_382_223)
+        expect(input.fullTreeFileCount).toBeGreaterThan(5_900)
+        expect(input.runtimeInputFileCount).toBeLessThan(3_000)
+        expect(input.runtimeInputSerializedBytes).toBeLessThan(64 * 1024 * 1024)
         expect(input.runtimeInputSerializedBytes).toBeLessThan(input.fullTreeSerializedBytes)
         expect(input.runtimeInputSha256).toMatch(/^[0-9a-f]{64}$/u)
         const dependencyManifest = serializeDesktopDependencyTreeManifest({
@@ -69,7 +69,8 @@ test.skipIf(process.platform !== "win32")(
           files: verification.contentManifest,
         })
         expect(dependencyManifest.byteLength).toBeLessThan(16 * 1024 * 1024)
-        expect(parseDesktopDependencyTreeManifest(dependencyManifest).files).toHaveLength(5_931)
+        expect(parseDesktopDependencyTreeManifest(dependencyManifest).files)
+          .toHaveLength(input.fullTreeFileCount)
 
         const entry = join(installedPlugin, "dist", "index.js")
         const resultFile = join(temporary, "result.json")
@@ -114,13 +115,24 @@ test.skipIf(process.platform !== "win32")(
         expect({ exitCode, stderr, stdout }).toEqual({ exitCode: 0, stderr: "", stdout: "" })
         expect(Date.now() - linkerStartedAt).toBeLessThan(30_000)
         const result = JSON.parse(await readFile(resultFile, "utf8")) as Record<string, unknown>
-        expect(result).toMatchObject({
-          fullTreeFileCount: 5_931,
-          graphFileCount: 132,
-          graphSha256: "34e8cf6436e269cd37a7758b62cc3a1c4e7530c8106f48a0b3e85d12b8e6ea2c",
-          linkedEsmModuleCount: 130,
+        expect({
+          fullTreeFileCount: input.fullTreeFileCount,
+          graphFileCount: result.graphFileCount,
+          graphSha256: result.graphSha256,
+          linkedEsmModuleCount: result.linkedEsmModuleCount,
+          runtimeInputContentBytes: input.runtimeInputContentBytes,
           runtimeInputFileCount: input.runtimeInputFileCount,
           runtimeInputSerializedBytes: input.runtimeInputSerializedBytes,
+        }).toEqual({
+          fullTreeFileCount: 5_932,
+          graphFileCount: 133,
+          graphSha256: "f0c7abe369a31d9f6d63eb9b6c135c1948439b4fc677b3d6c2a769a52cdfb50a",
+          linkedEsmModuleCount: 131,
+          runtimeInputContentBytes: 25_089_419,
+          runtimeInputFileCount: 2_775,
+          runtimeInputSerializedBytes: 25_383_349,
+        })
+        expect(result).toMatchObject({
           runtimeInputSha256: input.runtimeInputSha256,
           verifiedAssetFileCount: 1,
           verifiedCommonJsModuleCount: 1,

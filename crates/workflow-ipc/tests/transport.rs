@@ -1,6 +1,9 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use workflow_ipc::transport::{LocalListener, connect};
 
+#[cfg(unix)]
+use workflow_ipc::transport::{MAX_UNIX_SOCKET_PATH_BYTES, validate_socket_path};
+
 #[cfg(windows)]
 fn endpoint() -> String {
     workflow_core::ContentDigest::of(uuid_seed().as_bytes()).to_string()[..32].to_owned()
@@ -122,4 +125,27 @@ async fn current_user_client_connects_and_stale_endpoint_recovers() {
     let mut received = [0_u8; 5];
     server.read_exact(&mut received).await.unwrap();
     assert_eq!(&received, b"local");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_socket_path_bound_counts_encoded_bytes_exactly() {
+    let exact = std::path::PathBuf::from("a".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+    assert_eq!(
+        validate_socket_path(&exact).unwrap(),
+        MAX_UNIX_SOCKET_PATH_BYTES
+    );
+    let over = std::path::PathBuf::from("a".repeat(MAX_UNIX_SOCKET_PATH_BYTES + 1));
+    assert_eq!(
+        validate_socket_path(&over).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let utf8_within = std::path::PathBuf::from("é".repeat(MAX_UNIX_SOCKET_PATH_BYTES / 2));
+    assert_eq!(validate_socket_path(&utf8_within).unwrap(), 106);
+    let utf8_over = std::path::PathBuf::from("é".repeat(MAX_UNIX_SOCKET_PATH_BYTES / 2 + 1));
+    assert_eq!(
+        validate_socket_path(&utf8_over).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }

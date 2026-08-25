@@ -107,6 +107,38 @@ async fn daemon_starts_reports_health_and_preserves_state_across_restart() {
     assert!(temporary.path().join("control-plane.db").is_file());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn overlong_unix_endpoint_fails_before_secret_pid_or_socket_publication() {
+    let temporary = TempDir::new().unwrap();
+    let data_directory = temporary.path().join("x".repeat(107));
+    let mut daemon = start(&data_directory);
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = daemon.0.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("overlong Unix endpoint did not fail promptly");
+    assert!(!status.success());
+    assert!(!data_directory.join("runtime").join("ipc.secret").exists());
+    assert!(
+        !data_directory
+            .join("runtime")
+            .join("workflowd.pid")
+            .exists()
+    );
+    assert!(
+        !data_directory
+            .join("runtime")
+            .join("workflow.sock")
+            .exists()
+    );
+}
+
 #[tokio::test]
 async fn concurrent_daemon_start_converges_on_one_process() {
     let temporary = TempDir::new().unwrap();

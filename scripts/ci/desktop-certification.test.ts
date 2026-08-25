@@ -43,6 +43,7 @@ const {
   certificationEnvironment,
   cleanupDesktopCertificationProcesses,
   completeDesktopDaemonCleanupDiagnostic,
+  desktopLoadDiagnosticStages,
   desktopLoadDiagnosticSummary,
   desktopOutputSummary,
   isCertificationOnboardingProfile,
@@ -732,6 +733,8 @@ test("bound Desktop config resolves and executes the candidate from the copied p
       provenanceCommit: OPENCODE_11821_HOST_PROOF_PROVENANCE.commit,
       tupleOptions: true,
     })
+    expect((await desktopLoadDiagnosticStages(fixture.binding.root, fixture.binding)).at(-1))
+      .toMatchObject({ stage: "daemon_identity_published", status: "passed" })
     expect(JSON.parse(await readFile(join(fixture.binding.root, "fixture-result.json"), "utf8"))).toEqual({
       binaryPath: join(fixture.prepared.installedPlugin, "bin", "workflowd.exe"),
       certificationRoot: fixture.binding.root,

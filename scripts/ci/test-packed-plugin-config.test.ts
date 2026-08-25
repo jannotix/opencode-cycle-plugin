@@ -1,6 +1,15 @@
 import { expect, test } from "bun:test"
 import { readFile } from "node:fs/promises"
-import { resolve } from "node:path"
+import { posix, resolve } from "node:path"
+
+import {
+  MAX_LINUX_UNIX_SOCKET_PATH_BYTES,
+} from "../../packages/opencode-cycle/src/endpoint-path.js"
+import {
+  packedPluginDaemonEndpointEvidence,
+  packedPluginDataDirectory,
+  packedPluginScratchPrefix,
+} from "./packed-plugin-paths.js"
 
 test("packed production gates build and package the release workflowd binary", async () => {
   const root = resolve(import.meta.dir, "../..")
@@ -17,7 +26,7 @@ test("packed production gates build and package the release workflowd binary", a
   expect(nativeGate).toContain('join(root, "target", "release", executable)')
   const evidenceEnvironment = pluginGate.indexOf("CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR")
   const evidenceOpen = pluginGate.indexOf("await openOfficialRuntimeEvidenceDirectory(")
-  const scratchCreation = pluginGate.indexOf('await mkdtemp(join(tmpdir(), "opencode-cycle-packed-plugin-")')
+  const scratchCreation = pluginGate.indexOf("packedPluginScratchPrefix(process.platform)")
   const nativeBuild = pluginGate.indexOf('await run(["cargo", "build", "-p", "workflowd", "--release"], root)')
   const runtimeGuard = pluginGate.indexOf("await verifyDesktopModuleRuntime(")
   const evidenceMaterial = pluginGate.indexOf("serializeDesktopDependencyTreeManifest({")
@@ -38,4 +47,33 @@ test("packed production gates build and package the release workflowd binary", a
   expect(scratchCleanup).toBeGreaterThan(failurePublication)
   expect(pluginGate).not.toContain("windows-runtime-result.json")
   expect(pluginGate).not.toContain("CYCLE_R3_WINDOWS_EVIDENCE")
+  for (const stage of [
+    "host-proof-failed",
+    "host-activation-finalized",
+    "host-authenticated-shutdown",
+    "host-daemon-absent",
+  ]) expect(pluginGate).toContain(stage)
+})
+
+test("Linux package proof uses a short isolated endpoint while the prior production layout fails", async () => {
+  const taskTmp = "/home/workflowci/opencode-cycle-linux-proof-a47b4d24/tmp"
+  const priorData = posix.join(taskTmp, "opencode-cycle-packed-plugin-XXXXXX", "runtime-data")
+  const shortData = posix.join(taskTmp, "ocp-XXXXXX", "d")
+  expect(Buffer.byteLength(posix.join(priorData, "runtime", "workflow.sock"))).toBe(127)
+  expect(Buffer.byteLength(posix.join(priorData, "runtime", "workflow.sock"))).toBeGreaterThan(
+    MAX_LINUX_UNIX_SOCKET_PATH_BYTES,
+  )
+  expect(Buffer.byteLength(posix.join(shortData, "runtime", "workflow.sock"))).toBe(91)
+
+  const scratch = resolve("C:\\task", `${packedPluginScratchPrefix("linux")}XXXXXX`)
+  const dataDirectory = packedPluginDataDirectory(scratch, "linux")
+  expect(packedPluginDaemonEndpointEvidence(dataDirectory, "linux").endpointPathBytes)
+    .toBeLessThanOrEqual(MAX_LINUX_UNIX_SOCKET_PATH_BYTES)
+  const rustTransport = await readFile(resolve(
+    import.meta.dir,
+    "../../crates/workflow-ipc/src/unix.rs",
+  ), "utf8")
+  expect(rustTransport).toContain(
+    `MAX_UNIX_SOCKET_PATH_BYTES: usize = ${MAX_LINUX_UNIX_SOCKET_PATH_BYTES}`,
+  )
 })

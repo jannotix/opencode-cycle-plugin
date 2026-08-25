@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url"
 import type { ReviewVerdictInput } from "./orchestration/reviewers.js"
 import type { ArbiterVerdictInput } from "./orchestration/arbiter.js"
 import type { TaskReviewVerdict } from "./orchestration/task-review.js"
+import {
+  assertControlPlaneUnixSocketPath,
+  controlPlaneUnixSocketPath,
+} from "./endpoint-path.js"
 import { connectIpcSocket, MAX_IPC_FRAME_BYTES, type IpcFrameReader } from "./ipc-reader.js"
 
 const AUTH_DOMAIN = Buffer.from("opencode-cycle-ipc-auth-v1")
@@ -369,8 +373,15 @@ export class LocalControlPlane {
       options.dataDirectory ?? resolveDataDirectory(platform, options.environment ?? process.env)
     this.#binaryPath = options.binaryPath
     this.#secretPath = join(this.#dataDirectory, "runtime", "ipc.secret")
-    this.#endpoint =
-      platform === "win32" ? "" : join(this.#dataDirectory, "runtime", "workflow.sock")
+    if (platform === "win32") this.#endpoint = ""
+    else {
+      try {
+        assertControlPlaneUnixSocketPath(this.#dataDirectory)
+      } catch (cause) {
+        throw new ControlPlaneError("workflowd endpoint_path exceeds the platform bound", { cause })
+      }
+      this.#endpoint = controlPlaneUnixSocketPath(this.#dataDirectory)
+    }
     this.#expectedProtocolVersion = options.expectedProtocolVersion ?? 1
     this.#onProcessSpawn = options.onProcessSpawn
     this.#processExitMarkerPath = options.processExitMarkerPath

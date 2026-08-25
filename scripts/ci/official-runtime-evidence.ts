@@ -374,6 +374,7 @@ export async function validateOfficialRuntimeEvidenceDirectory(path: string): Pr
     ) throw new Error("Official Electron success evidence stages are incomplete")
     validateRuntimeStages(stageValues, "none")
     validateEvidenceMaterialStage(stageValues, byName.get("dependency-tree-manifest.json"))
+    validateHostProofStages(stageValues, true)
     validateSuccessfulEvidence(byName, manifest, exit)
   } else {
     const finalStage = stageValues.at(-1)
@@ -386,9 +387,64 @@ export async function validateOfficialRuntimeEvidenceDirectory(path: string): Pr
     } else if (["output_limit", "runtime_exit", "timeout"].includes(String(exit.errorClass))) {
       validateRuntimeStages(stageValues, String(exit.errorClass))
     }
+    validateHostProofStages(stageValues, false, String(exit.errorClass))
     validateFailedEvidence(exit)
   }
   for (const value of [manifest, exit, output]) assertNoSensitiveReceiptValue(value)
+}
+
+function validateHostProofStages(
+  stages: readonly Record<string, unknown>[],
+  passed: boolean,
+  errorClass?: string,
+): void {
+  const byStage = new Map(stages.map((stage) => [String(stage.stage), stage]))
+  if (!passed) {
+    if (errorClass !== "host_proof") return
+    const failure = byStage.get("host-proof-failed")
+    const details = isRecord(failure?.details) ? failure.details : undefined
+    if (
+      !byStage.has("host-proof-started") || details === undefined ||
+      typeof details.errorCode !== "string" || !/^HOST_[A-Z_]+$/u.test(details.errorCode) ||
+      (details.exitCode !== null &&
+        (typeof details.exitCode !== "number" || !Number.isSafeInteger(details.exitCode))) ||
+      details.resultPresent !== false || typeof details.timedOut !== "boolean"
+    ) throw new Error("Official Electron host-proof failure stages are invalid")
+    return
+  }
+  const transcriptStages = [
+    "certification-env-prepared",
+    "config-tree-prepared",
+    "config-path-discovered",
+    "plugin-specifier-resolved",
+    "effective-env-validated",
+    "candidate-module-resolved",
+    "plugin-entry-started",
+    "plugin-entry-completed",
+    "daemon-identity-published",
+  ]
+  for (const stage of transcriptStages) {
+    const value = byStage.get(`host-${stage}`)
+    if (!isRecord(value?.details) || value.details.status !== "passed") {
+      throw new Error("Official Electron host-proof transcript stages are incomplete")
+    }
+  }
+  const activation = byStage.get("host-activation-finalized")
+  const endpoint = byStage.get("host-daemon-endpoint-prepared")
+  const shutdown = byStage.get("host-authenticated-shutdown")
+  const absent = byStage.get("host-daemon-absent")
+  if (
+    !byStage.has("host-proof-started") || !byStage.has("host-proof-completed") ||
+    !isRecord(endpoint?.details) ||
+    !["named_pipe", "unix_socket"].includes(String(endpoint.details.endpointKind)) ||
+    typeof endpoint.details.endpointPathBytes !== "number" ||
+    !Number.isSafeInteger(endpoint.details.endpointPathBytes) ||
+    endpoint.details.endpointPathBytes < 0 || endpoint.details.endpointPathBytes > 107 ||
+    !isRecord(activation?.details) || activation.details.markerPresent !== true ||
+    !isRecord(shutdown?.details) || shutdown.details.shutdownAuthenticated !== true ||
+    shutdown.details.terminated !== true || shutdown.details.exitMarkerPublished !== true ||
+    !isRecord(absent?.details) || absent.details.processAbsent !== true
+  ) throw new Error("Official Electron host-proof lifecycle stages are incomplete")
 }
 
 function validateEvidenceMaterialStage(

@@ -59,6 +59,7 @@ test("throw, runtime failures and post-runtime publication each leave complete d
     ["runtime-timeout", "timeout", true, false],
     ["runtime-output-limit", "output_limit", true, false],
     ["post-runtime-publication", "evidence_publication", true, true],
+    ["host-proof-timeout", "host_proof", true, true],
   ] as const) {
     const path = evidencePath(label)
     try {
@@ -73,6 +74,15 @@ test("throw, runtime failures and post-runtime publication each leave complete d
         if (runtimePassed) {
           await session.recordStage("runtime-guard-passed")
           await session.recordStage("evidence-material-preparing")
+          if (errorClass === "host_proof") {
+            await session.recordStage("host-proof-started")
+            await session.recordStage("host-proof-failed", {
+              errorCode: "HOST_RESULT_TIMEOUT",
+              exitCode: 143,
+              resultPresent: false,
+              timedOut: true,
+            })
+          }
         }
       }
       const publication = await session.finalizeFailure({
@@ -171,7 +181,7 @@ test("successful official evidence is durable, exact, path-free and cleanup-inde
       rm(internalScratch, { force: true, recursive: true }),
     ])
   }
-}, { timeout: 60_000 })
+}, { timeout: 120_000 })
 
 test("official evidence validation rejects obsolete filenames and stale schemas", async () => {
   const oldName = evidencePath("old-name")
@@ -197,7 +207,7 @@ test("official evidence validation rejects obsolete filenames and stale schemas"
       rm(oldSchema, { force: true, recursive: true }),
     ])
   }
-}, { timeout: 120_000 })
+}, { timeout: 300_000 })
 
 async function successfulSession(path: string) {
   const session = await openOfficialRuntimeEvidenceDirectory(path)
@@ -220,6 +230,33 @@ async function recordEvidenceMaterial(
     dependencyManifestBytes: manifest.byteLength,
     dependencyManifestSha256: digest(manifest),
   })
+  await session.recordStage("host-daemon-endpoint-prepared", {
+    endpointKind: "named_pipe",
+    endpointPathBytes: 0,
+  })
+  await session.recordStage("host-proof-started")
+  for (const [sequence, stage] of [
+    "certification-env-prepared",
+    "config-tree-prepared",
+    "config-path-discovered",
+    "plugin-specifier-resolved",
+    "effective-env-validated",
+    "candidate-module-resolved",
+    "plugin-entry-started",
+    "plugin-entry-completed",
+    "daemon-identity-published",
+  ].entries()) {
+    await session.recordStage(`host-${stage}`, { sequence, status: "passed" })
+  }
+  await session.recordStage("host-activation-finalized", { markerPresent: true })
+  await session.recordStage("host-authenticated-shutdown", {
+    exitMarkerPublished: true,
+    markerPublished: true,
+    shutdownAuthenticated: true,
+    terminated: true,
+  })
+  await session.recordStage("host-daemon-absent", { processAbsent: true })
+  await session.recordStage("host-proof-completed")
 }
 
 function runtimeInputPrepared() {

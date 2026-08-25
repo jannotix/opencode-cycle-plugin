@@ -11,6 +11,7 @@ import { cleanupCertifiedDaemon } from "./certified-daemon.js"
 import {
   certificationEnvironment,
   completeDesktopDaemonCleanupDiagnostic,
+  desktopLoadDiagnosticStages,
   desktopLoadDiagnosticSummary,
   prepareDesktopCertificationLoad,
   verifyDesktopModuleRuntime,
@@ -25,6 +26,11 @@ import {
   type OfficialRuntimeEvidenceSession,
 } from "./official-runtime-evidence.js"
 import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
+import {
+  packedPluginDaemonEndpointEvidence,
+  packedPluginDataDirectory,
+  packedPluginScratchPrefix,
+} from "./packed-plugin-paths.js"
 
 const GATE_OUTPUT_LIMIT = 16 * 1024 * 1024
 
@@ -82,6 +88,7 @@ let dependencyTreeEvidence: Buffer | undefined
 let revision: string | undefined
 let currentStage = "gate-open"
 let runtimeFailureClass: string | undefined
+let reportedHostDiagnosticCount = 0
 
 async function run(command: string[], cwd: string): Promise<string> {
   const child = Bun.spawn(command, { cwd, stderr: "pipe", stdout: "pipe" })
@@ -121,7 +128,7 @@ try {
   revision = (await run(["git", "rev-parse", "HEAD"], root)).trim()
   if (!/^[0-9a-f]{40}$/u.test(revision)) throw new PackageGateFailure("source_binding")
   await recordStage("source-bound", { revision })
-  scratch = await mkdtemp(join(tmpdir(), "opencode-cycle-packed-plugin-"))
+  scratch = await mkdtemp(join(tmpdir(), packedPluginScratchPrefix(process.platform)))
   launcherTemporary = await mkdtemp(join(tmpdir(), "opencode-cycle-host-launcher-"))
   launcher = join(launcherTemporary, "launcher.ts")
   launcherStop = join(launcherTemporary, "stop")
@@ -190,7 +197,10 @@ process.exit(await child.exited)
   await recordStage("dependency-tree-installed")
   const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
   const certificationRoot = join(scratch, "certification")
-  const dataDirectory = join(scratch, "runtime-data")
+  await recordStage("host-daemon-endpoint-preparing")
+  const dataDirectory = packedPluginDataDirectory(scratch, process.platform)
+  const endpointEvidence = packedPluginDaemonEndpointEvidence(dataDirectory, process.platform)
+  await recordStage("host-daemon-endpoint-prepared", endpointEvidence)
   const project = join(scratch, "project")
   await Promise.all([mkdir(certificationRoot), mkdir(project)])
   const binding: DesktopCertificationBinding = {
@@ -281,6 +291,7 @@ process.exit(await child.exited)
     })
   }
   await recordStage("host-proof-started")
+  await recordHostDiagnosticStages(certificationRoot, binding)
   const proofRequest = join(scratch, "host-proof-request.json")
   const proofResult = join(scratch, "host-proof-result.json")
   const proofRelease = join(certificationRoot, "host-proof-release")
@@ -307,16 +318,32 @@ process.exit(await child.exited)
     { cwd: root, env: environment, stderr: "ignore", stdout: "ignore" },
   )
   let proofReady = false
+  let proofExitedEarly = false
   for (let attempt = 0; attempt < 300; attempt += 1) {
     proofReady = await access(proofResult).then(() => true, () => false)
+    if (attempt % 50 === 0) {
+      await recordHostDiagnosticStages(certificationRoot, binding).catch(() => undefined)
+    }
     if (proofReady) break
+    if (proof.exitCode !== null) {
+      proofExitedEarly = true
+      break
+    }
     await Bun.sleep(50)
   }
   if (!proofReady) {
-    await writeFile(launcherStop, "stop\n", { flag: "wx" })
+    if (proof.exitCode === null) await writeFile(launcherStop, "stop\n", { flag: "wx" })
     await proof.exited
+    await recordHostDiagnosticStages(certificationRoot, binding)
+    await recordStage("host-proof-failed", {
+      errorCode: proofExitedEarly ? "HOST_EXIT_BEFORE_RESULT" : "HOST_RESULT_TIMEOUT",
+      exitCode: proof.exitCode,
+      resultPresent: false,
+      timedOut: !proofExitedEarly,
+    })
     throw new Error("Packed plugin failed the OpenCode 1.18.21 host proof")
   }
+  await recordHostDiagnosticStages(certificationRoot, binding)
   const hostReceipt = JSON.parse(await readFile(proofResult, "utf8")) as OpenCodeHostProofReceipt
   if (
     hostReceipt.provenanceCommit !== OPENCODE_11821_HOST_PROOF_PROVENANCE.commit ||
@@ -326,6 +353,7 @@ process.exit(await child.exited)
     !hostReceipt.tupleOptions
   ) throw new Error("Packed plugin host proof receipt is invalid")
   const activation = await waitForDesktopActivation(certificationRoot, binding, 5_000)
+  await recordStage("host-activation-finalized", { markerPresent: true })
   if (proof.exitCode !== null) throw new Error("Packed plugin host exited before daemon shutdown")
   const cleanup = await cleanupCertifiedDaemon({
     binding,
@@ -341,6 +369,13 @@ process.exit(await child.exited)
     !cleanup.shutdownAuthenticated ||
     !cleanup.terminated
   ) throw new Error("Packed plugin did not complete authenticated daemon shutdown")
+  await recordStage("host-authenticated-shutdown", {
+    exitMarkerPublished: cleanup.exitMarkerPublished,
+    markerPublished: cleanup.markerPublished,
+    shutdownAuthenticated: cleanup.shutdownAuthenticated,
+    terminated: cleanup.terminated,
+  })
+  await recordStage("host-daemon-absent", { processAbsent: cleanup.processAbsent })
   if (proof.exitCode !== null) throw new Error("Packed plugin host exited during daemon shutdown")
   await writeFile(proofRelease, "release\n", { flag: "wx" })
   if ((await proof.exited) !== 0) throw new Error("OpenCode 1.18.21 host proof exited after cleanup")
@@ -461,17 +496,33 @@ async function recordStage(
 
 function classifyPackageGateFailure(error: unknown): string {
   if (error instanceof PackageGateFailure) return error.errorClass
+  if (error instanceof Error && error.message.includes("endpoint_path")) return "endpoint_path"
   if (runtimeFailureClass !== undefined && runtimeFailureClass !== "none") return runtimeFailureClass
   if (
     currentStage.startsWith("runtime-") || currentStage.startsWith("module-") ||
     currentStage === "held-tree-verified"
   ) return "runtime_guard"
-  if (currentStage.startsWith("host-proof")) return "host_proof"
+  if (currentStage.startsWith("host-")) return "host_proof"
   if (currentStage.startsWith("native-build")) return "native_build"
   if (currentStage.startsWith("native-package")) return "native_package"
   if (currentStage.startsWith("dependency-tree")) return "dependency_tree"
   if (currentStage.startsWith("evidence-")) return "evidence_publication"
   return "package_error"
+}
+
+async function recordHostDiagnosticStages(
+  root: string,
+  binding: DesktopCertificationBinding,
+): Promise<void> {
+  if (officialEvidence === undefined) return
+  const diagnostics = await desktopLoadDiagnosticStages(root, binding)
+  for (const diagnostic of diagnostics.slice(reportedHostDiagnosticCount)) {
+    await recordStage(`host-${diagnostic.stage.replaceAll("_", "-")}`, {
+      sequence: diagnostic.sequence,
+      status: diagnostic.status,
+    })
+  }
+  reportedHostDiagnosticCount = diagnostics.length
 }
 
 async function digest(path: string): Promise<string> {

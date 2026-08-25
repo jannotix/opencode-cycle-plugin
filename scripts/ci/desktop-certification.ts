@@ -2236,6 +2236,22 @@ export async function desktopLoadDiagnosticSummary(
     .join(", ")
 }
 
+export async function desktopLoadDiagnosticStages(
+  root: string,
+  binding: DesktopCertificationBinding,
+): Promise<readonly {
+  readonly sequence: number
+  readonly stage: DesktopLoadDiagnosticStage
+  readonly status: DesktopLoadDiagnosticStatus
+}[]> {
+  return (await readDesktopLoadTranscript(join(root, DESKTOP_LOAD_DIAGNOSTIC_FILE), binding))
+    .map((record) => ({
+      sequence: record.sequence,
+      stage: record.stage,
+      status: record.status,
+    }))
+}
+
 async function readDesktopLoadTranscript(
   diagnosticsFile: string,
   binding: DesktopCertificationBinding,
