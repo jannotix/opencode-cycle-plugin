@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto"
+import { createHash, randomBytes, type Hash } from "node:crypto"
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
@@ -18,35 +18,117 @@ import {
   type DesktopModuleRuntimeEvidenceMaterial,
 } from "./desktop-certification.js"
 import {
+  digestOfficialEvidenceError,
   openOfficialRuntimeEvidenceDirectory,
+  type OfficialGateOutputSummary,
   type OfficialRuntimeEvidenceSession,
 } from "./official-runtime-evidence.js"
 import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
 
-const root = fileURLToPath(new URL("../../", import.meta.url))
-const packageRoot = join(root, "packages", PRODUCT_IDENTITY.mainPackage)
-const scratch = await mkdtemp(join(tmpdir(), "opencode-cycle-packed-plugin-"))
-const launcherTemporary = await mkdtemp(join(tmpdir(), "opencode-cycle-host-launcher-"))
-const launcher = join(launcherTemporary, "launcher.ts")
-const launcherStop = join(launcherTemporary, "stop")
-const extracted = join(scratch, "extracted")
-const nativeArtifacts = join(scratch, "native")
-const secondPack = join(scratch, "second-pack")
-let proof: ReturnType<typeof Bun.spawn> | undefined
-let officialEvidence: OfficialRuntimeEvidenceSession | undefined
-let officialEvidencePublished = false
-let runtimeEvidence: DesktopModuleRuntimeEvidenceMaterial | undefined
+const GATE_OUTPUT_LIMIT = 16 * 1024 * 1024
 
-async function run(command: string[], cwd: string): Promise<string> {
-  const child = Bun.spawn(command, { cwd, stderr: "inherit", stdout: "pipe" })
-  const output = await new Response(child.stdout).text()
-  if ((await child.exited) !== 0) throw new Error(`${command.join(" ")} failed`)
-  return output
+class PackageGateFailure extends Error {
+  readonly errorClass: string
+
+  constructor(errorClass: string) {
+    super("Packed plugin gate failed")
+    this.name = "PackageGateFailure"
+    this.errorClass = errorClass
+  }
 }
 
-await mkdir(extracted, { recursive: true })
-await mkdir(secondPack, { recursive: true })
+class BoundedGateOutput {
+  private readonly stderr = outputChannel()
+  private readonly stdout = outputChannel()
+
+  capture(channel: "stderr" | "stdout", value: Uint8Array): boolean {
+    const state = this[channel]
+    const remaining = GATE_OUTPUT_LIMIT - state.bytes
+    const captured = value.subarray(0, Math.max(remaining, 0))
+    state.hash.update(captured)
+    state.bytes += captured.byteLength
+    if (captured.byteLength !== value.byteLength) state.truncated = true
+    return !state.truncated
+  }
+
+  summary(): OfficialGateOutputSummary {
+    return {
+      stderrBytes: this.stderr.bytes,
+      stderrSha256: this.stderr.hash.copy().digest("hex"),
+      stderrTruncated: this.stderr.truncated,
+      stdoutBytes: this.stdout.bytes,
+      stdoutSha256: this.stdout.hash.copy().digest("hex"),
+      stdoutTruncated: this.stdout.truncated,
+    }
+  }
+}
+
+function outputChannel(): { bytes: number; hash: Hash; truncated: boolean } {
+  return { bytes: 0, hash: createHash("sha256"), truncated: false }
+}
+
+const root = fileURLToPath(new URL("../../", import.meta.url))
+const packageRoot = join(root, "packages", PRODUCT_IDENTITY.mainPackage)
+const gateOutput = new BoundedGateOutput()
+let scratch: string | undefined
+let launcherTemporary: string | undefined
+let launcher: string | undefined
+let launcherStop: string | undefined
+let proof: ReturnType<typeof Bun.spawn> | undefined
+let officialEvidence: OfficialRuntimeEvidenceSession | undefined
+let runtimeEvidence: DesktopModuleRuntimeEvidenceMaterial | undefined
+let revision: string | undefined
+let currentStage = "gate-open"
+let runtimeFailureClass: string | undefined
+
+async function run(command: string[], cwd: string): Promise<string> {
+  const child = Bun.spawn(command, { cwd, stderr: "pipe", stdout: "pipe" })
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    child.kill()
+  }, 5 * 60_000)
+  const results = await Promise.allSettled([
+    readGateOutput(child.stdout as ReadableStream<Uint8Array>, "stdout", child),
+    readGateOutput(child.stderr as ReadableStream<Uint8Array>, "stderr", child),
+    child.exited,
+  ])
+  clearTimeout(timeout)
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+  if (failure !== undefined) {
+    child.kill()
+    await child.exited
+    throw failure.reason
+  }
+  const [stdoutResult, , exitResult] = results as [
+    PromiseFulfilledResult<Buffer>,
+    PromiseFulfilledResult<Buffer>,
+    PromiseFulfilledResult<number>,
+  ]
+  if (timedOut) throw new PackageGateFailure("package_timeout")
+  if (exitResult.value !== 0) throw new PackageGateFailure("package_command")
+  return stdoutResult.value.toString("utf8")
+}
+
 try {
+  const officialEvidenceDirectory = process.env.CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR
+  if (officialEvidenceDirectory !== undefined) {
+    officialEvidence = await openOfficialRuntimeEvidenceDirectory(officialEvidenceDirectory)
+    await recordStage("gate-started", { official: true })
+  }
+  revision = (await run(["git", "rev-parse", "HEAD"], root)).trim()
+  if (!/^[0-9a-f]{40}$/u.test(revision)) throw new PackageGateFailure("source_binding")
+  await recordStage("source-bound", { revision })
+  scratch = await mkdtemp(join(tmpdir(), "opencode-cycle-packed-plugin-"))
+  launcherTemporary = await mkdtemp(join(tmpdir(), "opencode-cycle-host-launcher-"))
+  launcher = join(launcherTemporary, "launcher.ts")
+  launcherStop = join(launcherTemporary, "stop")
+  const extracted = join(scratch, "extracted")
+  const nativeArtifacts = join(scratch, "native")
+  const secondPack = join(scratch, "second-pack")
+  await mkdir(extracted, { recursive: true })
+  await mkdir(secondPack, { recursive: true })
+  await recordStage("scratch-created")
   await writeFile(launcher, `
 import { access } from "node:fs/promises"
 const [cwd, stop, ...command] = Bun.argv.slice(2)
@@ -61,6 +143,9 @@ while (child.exitCode === null) {
 }
 process.exit(await child.exited)
 `)
+  await recordStage("native-build-started")
+  await run(["cargo", "build", "-p", "workflowd", "--release"], root)
+  await recordStage("native-build-completed")
   const nativeTarget = `${process.platform}-${process.arch}` as NativeTarget
   const executable = process.platform === "win32" ? "workflowd.exe" : "workflowd"
   const native = await packageNative(
@@ -69,6 +154,7 @@ process.exit(await child.exited)
     join(root, "target", "release", executable),
     nativeArtifacts,
   )
+  await recordStage("native-package-completed", { nativeTarget })
   await run(["bun", "pm", "pack", "--destination", scratch], packageRoot)
   const archiveName = (await readdir(scratch)).find((name) => name.endsWith(".tgz"))
   if (archiveName === undefined) throw new Error("Plugin pack did not produce an archive")
@@ -79,6 +165,7 @@ process.exit(await child.exited)
   if ((await digest(archive)) !== (await digest(join(secondPack, secondArchiveName)))) {
     throw new Error("Plugin package is not reproducible from identical inputs")
   }
+  await recordStage("plugin-pack-completed")
   const listing = (await run(["tar", "-tf", archive], root)).split(/\r?\n/u).filter(Boolean)
   for (const required of ["package/package.json", "package/dist/index.js", "package/LICENSE", "package/NOTICE"]) {
     if (!listing.includes(required)) throw new Error(`Packed plugin is missing ${required}`)
@@ -98,6 +185,7 @@ process.exit(await child.exited)
     ["bun", "install", "--backend=copyfile", "--ignore-scripts", "--linker=hoisted", "--production", "--no-save", native.archive],
     installedPackage,
   )
+  await recordStage("dependency-tree-installed")
   const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
   const certificationRoot = join(scratch, "certification")
   const dataDirectory = join(scratch, "runtime-data")
@@ -107,7 +195,7 @@ process.exit(await child.exited)
     nativePackageSha256: native.checksum,
     nonce: randomBytes(32).toString("hex"),
     pluginPackageSha256: await digest(archive),
-    revision: (await run(["git", "rev-parse", "HEAD"], root)).trim(),
+    revision,
     root: certificationRoot,
     startedAtUnixMillis: Date.now(),
   }
@@ -130,6 +218,7 @@ process.exit(await child.exited)
     platform,
     scratch,
   })
+  await recordStage("runtime-input-prepared")
   const officialRuntime = process.env.CYCLE_OFFICIAL_ELECTRON_RUNTIME
   if (officialRuntime === undefined) {
     throw new Error("Packed plugin gate requires an official Electron runtime")
@@ -139,10 +228,7 @@ process.exit(await child.exited)
     throw new Error("Official Electron runtime path must be canonical and absolute")
   }
   await access(runtime)
-  const officialEvidenceDirectory = process.env.CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR
-  if (officialEvidenceDirectory !== undefined) {
-    officialEvidence = await openOfficialRuntimeEvidenceDirectory(officialEvidenceDirectory)
-  }
+  await recordStage("runtime-guard-started")
   await verifyDesktopModuleRuntime({
     binding,
     ...(officialEvidence === undefined
@@ -160,9 +246,23 @@ process.exit(await child.exited)
     hostVersion: "1.18.21",
     platform,
     prepared,
+    ...(officialEvidence === undefined
+      ? {}
+      : {
+          reportEvidenceStage: async (
+            stage: string,
+            details: Readonly<Record<string, boolean | number | string | null>>,
+          ) => {
+            if (stage === "runtime-completed" && typeof details.errorClass === "string") {
+              runtimeFailureClass = details.errorClass
+            }
+            await recordStage(stage, details)
+          },
+        }),
     runtimeCommand: [runtime],
     scratch,
   })
+  await recordStage("runtime-guard-passed")
   const proofRequest = join(scratch, "host-proof-request.json")
   const proofResult = join(scratch, "host-proof-result.json")
   const proofRelease = join(certificationRoot, "host-proof-release")
@@ -226,6 +326,7 @@ process.exit(await child.exited)
   if (proof.exitCode !== null) throw new Error("Packed plugin host exited during daemon shutdown")
   await writeFile(proofRelease, "release\n", { flag: "wx" })
   if ((await proof.exited) !== 0) throw new Error("OpenCode 1.18.21 host proof exited after cleanup")
+  await recordStage("host-proof-completed")
   await completeDesktopDaemonCleanupDiagnostic(prepared.diagnosticsFile, binding, "passed")
   const diagnostics = await desktopLoadDiagnosticSummary(certificationRoot, binding)
   if (
@@ -234,12 +335,14 @@ process.exit(await child.exited)
   ) {
     throw new Error("Packed plugin host proof diagnostics are incomplete")
   }
+  await recordStage("daemon-cleanup-completed")
   if (officialEvidence !== undefined) {
     if (runtimeEvidence === undefined) {
       throw new Error("Official Electron runtime evidence material was not captured")
     }
     const receipt = runtimeEvidence.receipt
-    await officialEvidence.publish({
+    await recordStage("evidence-publishing")
+    const publication = await officialEvidence.publish({
       binding: {
         electronVersion: receipt.electronVersion,
         nativePackageSha256: binding.nativePackageSha256,
@@ -249,6 +352,7 @@ process.exit(await child.exited)
         runtimeExecutableSha256: receipt.runtimeExecutableSha256,
         runtimeProductVersion: receipt.runtimeProductVersion,
       },
+      gateOutput: gateOutput.summary(),
       material: {
         "candidate-entry.js": runtimeEvidence.candidateEntry,
         "candidate-wrapper.js": runtimeEvidence.loader,
@@ -276,10 +380,25 @@ process.exit(await child.exited)
         "runtime-receipt.json": jsonLine(receipt),
       },
     })
-    officialEvidencePublished = true
+    if (!publication.passed) throw new PackageGateFailure("evidence_publication")
   }
+} catch (error) {
+  if (officialEvidence !== undefined) {
+    const errorClass = classifyPackageGateFailure(error)
+    await officialEvidence.recordStage("gate-failed", {
+      errorClass,
+      failedStage: currentStage,
+    }).catch(() => undefined)
+    await officialEvidence.finalizeFailure({
+      errorClass,
+      errorDigest: digestOfficialEvidenceError(error),
+      gateOutput: gateOutput.summary(),
+      ...(revision === undefined ? {} : { revision }),
+    })
+  }
+  throw error
 } finally {
-  if (proof !== undefined && proof.exitCode === null) {
+  if (proof !== undefined && proof.exitCode === null && scratch !== undefined && launcherStop !== undefined) {
     const release = join(scratch, "certification", "host-proof-release")
     await writeFile(release, "release\n", { flag: "wx" }).catch(() => undefined)
     await Promise.race([proof.exited, Bun.sleep(2_000)])
@@ -288,13 +407,59 @@ process.exit(await child.exited)
       await proof.exited
     }
   }
-  if (officialEvidence !== undefined && !officialEvidencePublished) {
-    await officialEvidence.abort()
-  }
   await Promise.all([
-    rm(scratch, { force: true, recursive: true }),
-    rm(launcherTemporary, { force: true, recursive: true }),
+    ...(scratch === undefined ? [] : [rm(scratch, { force: true, recursive: true })]),
+    ...(launcherTemporary === undefined
+      ? []
+      : [rm(launcherTemporary, { force: true, recursive: true })]),
   ])
+}
+
+async function readGateOutput(
+  stream: ReadableStream<Uint8Array>,
+  channel: "stderr" | "stdout",
+  child: { kill: () => void },
+): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  const reader = stream.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!gateOutput.capture(channel, value)) {
+        child.kill()
+        throw new PackageGateFailure("output_limit")
+      }
+      if (channel === "stderr") process.stderr.write(value)
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks)
+}
+
+async function recordStage(
+  stage: string,
+  details: Readonly<Record<string, boolean | number | string | null>> = {},
+): Promise<void> {
+  currentStage = stage
+  await officialEvidence?.recordStage(stage, details)
+}
+
+function classifyPackageGateFailure(error: unknown): string {
+  if (error instanceof PackageGateFailure) return error.errorClass
+  if (runtimeFailureClass !== undefined && runtimeFailureClass !== "none") return runtimeFailureClass
+  if (
+    currentStage.startsWith("runtime-") || currentStage.startsWith("module-") ||
+    currentStage === "held-tree-verified"
+  ) return "runtime_guard"
+  if (currentStage.startsWith("host-proof")) return "host_proof"
+  if (currentStage.startsWith("native-build")) return "native_build"
+  if (currentStage.startsWith("native-package")) return "native_package"
+  if (currentStage.startsWith("dependency-tree")) return "dependency_tree"
+  if (currentStage.startsWith("evidence-")) return "evidence_publication"
+  return "package_error"
 }
 
 async function digest(path: string): Promise<string> {

@@ -25,7 +25,7 @@
     "test": "bun test",
     "test:control-plane": "cargo build -p workflowd && bun test ./packages/opencode-cycle/test/client.e2e.ts",
     "test:native-package": "cargo build -p workflowd --release && bun scripts/ci/test-packed-native.ts",
-    "test:package": "cargo build -p workflowd --release && bun scripts/ci/test-packed-plugin.ts",
+    "test:package": "bun scripts/ci/test-packed-plugin.ts",
     "test:repeat-critical": "cargo build -p workflowd && bun scripts/ci/repeat-critical-suite.ts --iterations 20 --output target/certification/critical-suite.json",
     "test:scale:500k": "cargo run -p workflow-code-intel --release --example codebase_500k -- --output target/certification/codebase-500k.json",
     "typecheck": "tsc -b --pretty false && tsc -p scripts/tsconfig.json --pretty false"

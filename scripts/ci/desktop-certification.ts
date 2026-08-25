@@ -1496,7 +1496,12 @@ interface DesktopModuleRuntimeInput {
   readonly hostVersion: string
   readonly platform: CertifiedPlatform
   readonly prepared: PreparedDesktopCertificationLoad
+  readonly reportEvidenceStage?: (
+    stage: string,
+    details: Readonly<Record<string, boolean | number | string | null>>,
+  ) => Promise<void>
   readonly runtimeCommand: readonly string[]
+  readonly runtimeTimeoutMillis?: number
   readonly scratch: string
 }
 
@@ -1509,6 +1514,9 @@ export async function prepareDesktopModuleRuntimeGuard(
     !CERTIFIED_PLATFORMS.includes(input.platform) ||
     input.runtimeCommand.length === 0 ||
     input.runtimeCommand.some((argument) => typeof argument !== "string" || argument.length === 0) ||
+    (input.runtimeTimeoutMillis !== undefined &&
+      (!Number.isSafeInteger(input.runtimeTimeoutMillis) ||
+        input.runtimeTimeoutMillis < 10 || input.runtimeTimeoutMillis > 30_000)) ||
     !isDesktopHarnessPath(input.cwd, input.scratch)
   ) throw new Error("Official Desktop module runtime guard binding is invalid")
   const contentTreeSha256 = verifiedContentTreeSha256 ??
@@ -1678,6 +1686,9 @@ export async function verifyDesktopModuleRuntime(
       graphInput.contentTreeSha256 !== plan.expected.verifiedContentTreeSha256 ||
       graphInput.fileCount < plan.expected.dependencyTree.dependencyFileCount
     ) throw new Error("Official Desktop module runtime held input is inconsistent")
+    await input.reportEvidenceStage?.("module-graph-prepared", {
+      graphFileCount: graphInput.fileCount,
+    })
     const [executable, ...argumentsList] = plan.command
     if (executable === undefined) throw new Error("Official Desktop module runtime command is empty")
     const child = spawnChildProcess(executable, argumentsList, {
@@ -1686,13 +1697,25 @@ export async function verifyDesktopModuleRuntime(
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     })
-    const inputTransfer = pipeline(graphInput.createReadStream(), child.stdin!).catch((error) => {
-      child.kill()
-      throw error
-    })
+    const runtimeStartedAt = Date.now()
+    const runtimeTimeoutMillis = input.runtimeTimeoutMillis ?? 30_000
     const childExited = new Promise<number>((resolveExit, reject) => {
       child.once("error", reject)
       child.once("exit", (code) => resolveExit(code ?? 1))
+    })
+    try {
+      await input.reportEvidenceStage?.("runtime-started", {
+        runtimePid: child.pid ?? null,
+        timeoutMillis: runtimeTimeoutMillis,
+      })
+    } catch (error) {
+      child.kill()
+      await childExited.catch(() => undefined)
+      throw error
+    }
+    const inputTransfer = pipeline(graphInput.createReadStream(), child.stdin!).catch((error) => {
+      child.kill()
+      throw error
     })
     let timedOut = false
     let timeout: ReturnType<typeof setTimeout> | undefined
@@ -1703,7 +1726,7 @@ export async function verifyDesktopModuleRuntime(
           timedOut = true
           child.kill()
           void childExited.then(resolveExit)
-        }, 30_000)
+        }, runtimeTimeoutMillis)
       }),
     ])
     let exitCode: number
@@ -1727,7 +1750,6 @@ export async function verifyDesktopModuleRuntime(
     } finally {
       clearTimeout(timeout)
     }
-    const stableTree = await dependencyVerification.verifyAndClose()
     const execution = {
       exitCode,
       outputExceeded,
@@ -1735,6 +1757,21 @@ export async function verifyDesktopModuleRuntime(
       stdout,
       timedOut,
     }
+    await input.reportEvidenceStage?.("runtime-completed", {
+      durationMillis: Date.now() - runtimeStartedAt,
+      errorClass: timedOut ? "timeout" : outputExceeded ? "output_limit" : exitCode === 0 ? "none" : "runtime_exit",
+      exitCode,
+      outputExceeded,
+      stderrBytes: stderr.byteLength,
+      stderrSha256: createHash("sha256").update(stderr).digest("hex"),
+      stdoutBytes: stdout.byteLength,
+      stdoutSha256: createHash("sha256").update(stdout).digest("hex"),
+      timedOut,
+    })
+    const stableTree = await dependencyVerification.verifyAndClose()
+    await input.reportEvidenceStage?.("held-tree-verified", {
+      dependencyFileCount: stableTree.dependencyFileCount,
+    })
     const receipt = await validateDesktopModuleRuntimeGuard(plan, execution, stableTree)
     if (input.captureEvidence !== undefined) {
       await input.captureEvidence(await captureDesktopModuleRuntimeEvidence(

@@ -509,6 +509,65 @@ test("Desktop runtime guard uses the trusted non-evaluating linker under the pin
   }
 })
 
+test("Desktop runtime guard reports durable timeout and output-limit telemetry before rejection", async () => {
+  const node = Bun.which("node")
+  expect(node).toBeString()
+  for (const scenario of [
+    {
+      errorClass: "timeout",
+      outputExceeded: false,
+      runtimeTimeoutMillis: 50,
+      script: "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},60000))",
+      timedOut: true,
+    },
+    {
+      errorClass: "output_limit",
+      outputExceeded: true,
+      runtimeTimeoutMillis: 5_000,
+      script: "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('x'.repeat(70000)))",
+      timedOut: false,
+    },
+  ] as const) {
+    const fixture = await createDesktopLoadFixture()
+    const stages: Array<{
+      readonly details: Readonly<Record<string, boolean | number | string | null>>
+      readonly stage: string
+    }> = []
+    try {
+      await expect(verifyDesktopModuleRuntime({
+        binding: fixture.binding,
+        cwd: fixture.temporary,
+        environment: fixture.environment,
+        hostVersion: "1.18.21",
+        platform: "windows-x64",
+        prepared: fixture.prepared,
+        reportEvidenceStage: async (stage, details) => {
+          stages.push({ details, stage })
+        },
+        runtimeCommand: [node as string, "-e", scenario.script],
+        runtimeTimeoutMillis: scenario.runtimeTimeoutMillis,
+        scratch: fixture.temporary,
+      })).rejects.toThrow(scenario.errorClass)
+      expect(stages.map((stage) => stage.stage)).toEqual([
+        "module-graph-prepared",
+        "runtime-started",
+        "runtime-completed",
+        "held-tree-verified",
+      ])
+      expect(stages[1]?.details.runtimePid).toBeNumber()
+      expect(stages[2]?.details).toMatchObject({
+        errorClass: scenario.errorClass,
+        outputExceeded: scenario.outputExceeded,
+        timedOut: scenario.timedOut,
+      })
+      expect(stages[2]?.details.stderrSha256).toMatch(/^[0-9a-f]{64}$/u)
+      expect(stages[2]?.details.stdoutSha256).toMatch(/^[0-9a-f]{64}$/u)
+    } finally {
+      await rm(fixture.temporary, { force: true, recursive: true })
+    }
+  }
+}, 20_000)
+
 test("Desktop runtime authority exposes no candidate-child HMAC path", async () => {
   const module = await import("./desktop-certification.js") as Record<string, unknown>
   const source = await readFile(resolve(import.meta.dir, "desktop-certification.ts"), "utf8")
