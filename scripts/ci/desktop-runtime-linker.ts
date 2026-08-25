@@ -8,9 +8,14 @@ export interface DesktopRuntimeLinkerExpected {
   readonly candidateEntrySha256: string
   readonly dependencyTreeSha256: string
   readonly electronVersion: string | null
+  readonly fullTreeFileCount: number
   readonly installedPlugin: string
   readonly nodeVersion: string
   readonly resultFile: string
+  readonly runtimeInputContentBytes: number
+  readonly runtimeInputFileCount: number
+  readonly runtimeInputSerializedBytes: number
+  readonly runtimeInputSha256: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
   readonly verifiedContentTreeSha256: string

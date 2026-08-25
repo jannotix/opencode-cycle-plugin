@@ -60,6 +60,7 @@ test("throw, runtime timeout and output limit each leave complete durable failur
       const session = await openOfficialRuntimeEvidenceDirectory(path)
       await session.recordStage("gate-started", { revision: "c".repeat(40) })
       if (runtime) {
+        await session.recordStage("module-graph-prepared", runtimeInputPrepared())
         await session.recordStage("runtime-started", runtimeStarted())
         await session.recordStage("runtime-completed", runtimeCompleted(errorClass))
       }
@@ -130,6 +131,7 @@ test("successful official evidence is durable, exact, path-free and cleanup-inde
   try {
     const session = await openOfficialRuntimeEvidenceDirectory(path)
     await session.recordStage("gate-started", { revision: "c".repeat(40) })
+    await session.recordStage("module-graph-prepared", runtimeInputPrepared())
     await session.recordStage("runtime-started", runtimeStarted())
     await session.recordStage("runtime-completed", runtimeCompleted("none"))
     const publication = await session.publish({
@@ -182,14 +184,27 @@ test("official evidence validation rejects obsolete filenames and stale schemas"
       rm(oldSchema, { force: true, recursive: true }),
     ])
   }
-}, { timeout: 60_000 })
+}, { timeout: 120_000 })
 
 async function successfulSession(path: string) {
   const session = await openOfficialRuntimeEvidenceDirectory(path)
   await session.recordStage("gate-started")
+  await session.recordStage("module-graph-prepared", runtimeInputPrepared())
   await session.recordStage("runtime-started", runtimeStarted())
   await session.recordStage("runtime-completed", runtimeCompleted("none"))
   return session
+}
+
+function runtimeInputPrepared() {
+  return {
+    fullTreeFileCount: 4,
+    fullTreeSerializedBytes: 400,
+    inputPreparationDurationMillis: 5,
+    runtimeInputContentBytes: 100,
+    runtimeInputFileCount: 3,
+    runtimeInputSerializedBytes: 200,
+    runtimeInputSha256: "6".repeat(64),
+  }
 }
 
 function runtimeStarted() {
@@ -264,13 +279,18 @@ function material() {
     candidateEntrySha256,
     dependencyTreeSha256,
     electronVersion: "42.3.3",
+    fullTreeFileCount: 4,
     graphFileCount: 3,
     graphSha256,
     linkedEsmModuleCount: 2,
     nodeVersion: "24.15.0",
+    runtimeInputContentBytes: 100,
+    runtimeInputFileCount: 3,
+    runtimeInputSerializedBytes: 200,
+    runtimeInputSha256: "6".repeat(64),
     runtimeExecutableSha256: "d".repeat(64),
     runtimeProductVersion: "1.18.21.0",
-    schemaVersion: 2,
+    schemaVersion: 3,
     suppressedOptionalRootCount: 1,
     type: "opencode-cycle-desktop-module-link",
     verifiedAssetFileCount: 0,
@@ -282,6 +302,7 @@ function material() {
     candidateEntrySha256,
     dependencyTreeSha256,
     electronVersion: "42.3.3",
+    fullTreeFileCount: 4,
     graphFileCount: 3,
     graphSha256,
     linkedEsmModuleCount: 2,
@@ -291,9 +312,13 @@ function material() {
     nodeVersion: "24.15.0",
     pluginPackageSha256: "b".repeat(64),
     revision: "c".repeat(40),
+    runtimeInputContentBytes: 100,
+    runtimeInputFileCount: 3,
+    runtimeInputSerializedBytes: 200,
+    runtimeInputSha256: "6".repeat(64),
     runtimeExecutableSha256: "d".repeat(64),
     runtimeProductVersion: "1.18.21.0",
-    schemaVersion: 4,
+    schemaVersion: 5,
     suppressedOptionalRootCount: 1,
     type: "opencode-cycle-desktop-runtime-guard",
     verifiedAssetFileCount: 0,
@@ -307,7 +332,12 @@ function material() {
     "dependency-tree-manifest.json": json({
       contentTreeSha256,
       dependencyTree: { dependencyTreeSha256 },
-      files: [{ path: "dist/index.js", sha256: "f".repeat(64), size: 20 }],
+      files: [
+        { path: "dist/index.js", sha256: "f".repeat(64), size: 20 },
+        { path: "node_modules/a/index.js", sha256: "1".repeat(64), size: 20 },
+        { path: "node_modules/a/package.json", sha256: "2".repeat(64), size: 20 },
+        { path: "package.json", sha256: "3".repeat(64), size: 20 },
+      ],
       schemaVersion: 1,
       type: "opencode-cycle-desktop-dependency-tree-manifest",
     }),

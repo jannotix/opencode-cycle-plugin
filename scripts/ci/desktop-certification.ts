@@ -47,6 +47,7 @@ import {
   openDesktopDependencyTreeVerification,
   verifyDesktopDependencyTree,
   type DesktopDependencyContentFile,
+  type DesktopDependencyLinkerInput,
   type DesktopDependencyTreeReceipt,
 } from "./desktop-dependency-tree.js"
 
@@ -157,6 +158,7 @@ export interface DesktopModuleRuntimeReceipt {
   readonly dependencyTreeSha256: string
   readonly unsafeDynamicImportsRejected: true
   readonly electronVersion: string
+  readonly fullTreeFileCount: number
   readonly graphFileCount: number
   readonly graphSha256: string
   readonly linkedEsmModuleCount: number
@@ -168,9 +170,13 @@ export interface DesktopModuleRuntimeReceipt {
   readonly pluginPackageSha256: string
   readonly productVersion: string
   readonly revision: string
+  readonly runtimeInputContentBytes: number
+  readonly runtimeInputFileCount: number
+  readonly runtimeInputSerializedBytes: number
+  readonly runtimeInputSha256: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
-  readonly schemaVersion: 4
+  readonly schemaVersion: 5
   readonly suppressedOptionalRootCount: number
   readonly type: typeof DESKTOP_RUNTIME_GUARD_TYPE
   readonly unsafeModuleLoadingRejected: true
@@ -1505,9 +1511,20 @@ interface DesktopModuleRuntimeInput {
   readonly scratch: string
 }
 
+type DesktopRuntimeInputMetadata = Pick<DesktopDependencyLinkerInput,
+  | "fullTreeFileCount"
+  | "fullTreeSerializedBytes"
+  | "preparationDurationMillis"
+  | "runtimeInputContentBytes"
+  | "runtimeInputFileCount"
+  | "runtimeInputSerializedBytes"
+  | "runtimeInputSha256"
+>
+
 export async function prepareDesktopModuleRuntimeGuard(
   input: DesktopModuleRuntimeInput,
   verifiedContentTreeSha256?: string,
+  verifiedRuntimeInput?: DesktopRuntimeInputMetadata,
 ): Promise<DesktopModuleRuntimeGuardPlan> {
   if (
     input.hostVersion !== OPENCODE_DESKTOP_VERSION ||
@@ -1519,8 +1536,11 @@ export async function prepareDesktopModuleRuntimeGuard(
         input.runtimeTimeoutMillis < 10 || input.runtimeTimeoutMillis > 30_000)) ||
     !isDesktopHarnessPath(input.cwd, input.scratch)
   ) throw new Error("Official Desktop module runtime guard binding is invalid")
-  const contentTreeSha256 = verifiedContentTreeSha256 ??
-    await desktopContentTreeSha256(input.prepared.installedPlugin)
+  const fallback = verifiedContentTreeSha256 === undefined || verifiedRuntimeInput === undefined
+    ? await desktopRuntimeInputMetadata(input.prepared.installedPlugin)
+    : undefined
+  const contentTreeSha256 = verifiedContentTreeSha256 ?? fallback!.contentTreeSha256
+  const runtimeInput = verifiedRuntimeInput ?? fallback!.runtimeInput
   const [manifestFile, configFile] = await Promise.all([
     readVerifiedRegularFile(join(input.prepared.installedPlugin, "package.json"), {
       maxBytes: 64 * 1024,
@@ -1585,9 +1605,14 @@ export async function prepareDesktopModuleRuntimeGuard(
     candidateEntrySha256: candidate.sha256,
     dependencyTreeSha256: dependencyTree.dependencyTreeSha256,
     electronVersion: OFFICIAL_DESKTOP_RUNTIME.electronVersion,
+    fullTreeFileCount: runtimeInput.fullTreeFileCount,
     installedPlugin: input.prepared.installedPlugin,
     nodeVersion: OFFICIAL_DESKTOP_RUNTIME.nodeVersion,
     resultFile,
+    runtimeInputContentBytes: runtimeInput.runtimeInputContentBytes,
+    runtimeInputFileCount: runtimeInput.runtimeInputFileCount,
+    runtimeInputSerializedBytes: runtimeInput.runtimeInputSerializedBytes,
+    runtimeInputSha256: runtimeInput.runtimeInputSha256,
     runtimeExecutableSha256: runtime.sha256,
     runtimeProductVersion: runtime.productVersion,
     verifiedContentTreeSha256: contentTreeSha256,
@@ -1652,11 +1677,28 @@ export async function prepareDesktopModuleRuntimeGuard(
   }
 }
 
-async function desktopContentTreeSha256(installedPlugin: string): Promise<string> {
+async function desktopRuntimeInputMetadata(installedPlugin: string): Promise<{
+  readonly contentTreeSha256: string
+  readonly runtimeInput: DesktopRuntimeInputMetadata
+}> {
   const verification = await openDesktopDependencyTreeVerification(installedPlugin)
+  let input: DesktopDependencyLinkerInput | undefined
   try {
-    return verification.contentTreeSha256
+    input = verification.openLinkerInput()
+    return {
+      contentTreeSha256: verification.contentTreeSha256,
+      runtimeInput: {
+        fullTreeFileCount: input.fullTreeFileCount,
+        fullTreeSerializedBytes: input.fullTreeSerializedBytes,
+        preparationDurationMillis: input.preparationDurationMillis,
+        runtimeInputContentBytes: input.runtimeInputContentBytes,
+        runtimeInputFileCount: input.runtimeInputFileCount,
+        runtimeInputSerializedBytes: input.runtimeInputSerializedBytes,
+        runtimeInputSha256: input.runtimeInputSha256,
+      },
+    }
   } finally {
+    await input?.close().catch(() => undefined)
     await verification.abort()
   }
 }
@@ -1673,21 +1715,32 @@ export async function verifyDesktopModuleRuntime(
       JSON.stringify(dependencyVerification.receipt) !==
         JSON.stringify(input.prepared.dependencyTree)
     ) throw new Error("Official Desktop module runtime dependency handles changed")
+    graphInput = dependencyVerification.openLinkerInput()
     const plan = await prepareDesktopModuleRuntimeGuard(
       input,
       dependencyVerification.contentTreeSha256,
+      graphInput,
     )
     if (
       JSON.stringify(plan.expected.dependencyTree) !==
         JSON.stringify(dependencyVerification.receipt)
     ) throw new Error("Official Desktop module runtime dependency proof is inconsistent")
-    graphInput = dependencyVerification.openLinkerInput()
     if (
       graphInput.contentTreeSha256 !== plan.expected.verifiedContentTreeSha256 ||
-      graphInput.fileCount < plan.expected.dependencyTree.dependencyFileCount
+      graphInput.fullTreeFileCount < plan.expected.dependencyTree.dependencyFileCount ||
+      graphInput.fullTreeFileCount !== plan.expected.fullTreeFileCount ||
+      graphInput.runtimeInputFileCount !== plan.expected.runtimeInputFileCount ||
+      graphInput.runtimeInputSerializedBytes !== plan.expected.runtimeInputSerializedBytes ||
+      graphInput.runtimeInputSha256 !== plan.expected.runtimeInputSha256
     ) throw new Error("Official Desktop module runtime held input is inconsistent")
     await input.reportEvidenceStage?.("module-graph-prepared", {
-      graphFileCount: graphInput.fileCount,
+      fullTreeFileCount: graphInput.fullTreeFileCount,
+      fullTreeSerializedBytes: graphInput.fullTreeSerializedBytes,
+      inputPreparationDurationMillis: graphInput.preparationDurationMillis,
+      runtimeInputContentBytes: graphInput.runtimeInputContentBytes,
+      runtimeInputFileCount: graphInput.runtimeInputFileCount,
+      runtimeInputSerializedBytes: graphInput.runtimeInputSerializedBytes,
+      runtimeInputSha256: graphInput.runtimeInputSha256,
     })
     const [executable, ...argumentsList] = plan.command
     if (executable === undefined) throw new Error("Official Desktop module runtime command is empty")
@@ -1919,6 +1972,7 @@ export async function validateDesktopModuleRuntimeGuard(
     unsafeDynamicImportsRejected: true,
     unsafeModuleLoadingRejected: true,
     electronVersion: linkReceipt.electronVersion,
+    fullTreeFileCount: linkReceipt.fullTreeFileCount,
     graphFileCount: linkReceipt.graphFileCount,
     graphSha256: linkReceipt.graphSha256,
     linkedEsmModuleCount: linkReceipt.linkedEsmModuleCount,
@@ -1930,9 +1984,13 @@ export async function validateDesktopModuleRuntimeGuard(
     pluginPackageSha256: plan.expected.binding.pluginPackageSha256,
     productVersion: plan.expected.hostVersion,
     revision: plan.expected.binding.revision,
+    runtimeInputContentBytes: linkReceipt.runtimeInputContentBytes,
+    runtimeInputFileCount: linkReceipt.runtimeInputFileCount,
+    runtimeInputSerializedBytes: linkReceipt.runtimeInputSerializedBytes,
+    runtimeInputSha256: linkReceipt.runtimeInputSha256,
     runtimeExecutableSha256: linkReceipt.runtimeExecutableSha256,
     runtimeProductVersion: linkReceipt.runtimeProductVersion,
-    schemaVersion: 4,
+    schemaVersion: 5,
     suppressedOptionalRootCount: linkReceipt.suppressedOptionalRootCount,
     type: DESKTOP_RUNTIME_GUARD_TYPE,
     verifiedAssetFileCount: linkReceipt.verifiedAssetFileCount,
@@ -1947,10 +2005,15 @@ function assertDesktopModuleLinkReceipt(
   expected: DesktopModuleRuntimeGuardExpected,
 ): asserts value is {
   readonly electronVersion: string
+  readonly fullTreeFileCount: number
   readonly graphFileCount: number
   readonly graphSha256: string
   readonly linkedEsmModuleCount: number
   readonly nodeVersion: string
+  readonly runtimeInputContentBytes: number
+  readonly runtimeInputFileCount: number
+  readonly runtimeInputSerializedBytes: number
+  readonly runtimeInputSha256: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
   readonly suppressedOptionalRootCount: number
@@ -1962,13 +2025,18 @@ function assertDesktopModuleLinkReceipt(
   if (
     !isRecord(value) ||
     Object.keys(value).sort().join(",") !==
-      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,graphFileCount,graphSha256,linkedEsmModuleCount,nodeVersion,runtimeExecutableSha256,runtimeProductVersion,schemaVersion,suppressedOptionalRootCount,type,unsafeDynamicImportsRejected,unsafeModuleLoadingRejected,verifiedAssetFileCount,verifiedCommonJsModuleCount,verifiedContentTreeSha256,verifiedJsonModuleCount" ||
+      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,fullTreeFileCount,graphFileCount,graphSha256,linkedEsmModuleCount,nodeVersion,runtimeExecutableSha256,runtimeInputContentBytes,runtimeInputFileCount,runtimeInputSerializedBytes,runtimeInputSha256,runtimeProductVersion,schemaVersion,suppressedOptionalRootCount,type,unsafeDynamicImportsRejected,unsafeModuleLoadingRejected,verifiedAssetFileCount,verifiedCommonJsModuleCount,verifiedContentTreeSha256,verifiedJsonModuleCount" ||
     value.candidateDefaultExportLinked !== true ||
     value.candidateEntrySha256 !== expected.candidateEntrySha256 ||
     value.candidateEvaluated !== false ||
     value.dependencyTreeSha256 !== expected.dependencyTreeSha256 ||
     value.unsafeDynamicImportsRejected !== true ||
     value.electronVersion !== expected.electronVersion ||
+    value.fullTreeFileCount !== expected.fullTreeFileCount ||
+    value.runtimeInputFileCount !== expected.runtimeInputFileCount ||
+    value.runtimeInputContentBytes !== expected.runtimeInputContentBytes ||
+    value.runtimeInputSerializedBytes !== expected.runtimeInputSerializedBytes ||
+    value.runtimeInputSha256 !== expected.runtimeInputSha256 ||
     typeof value.graphFileCount !== "number" ||
     !Number.isSafeInteger(value.graphFileCount) ||
     value.graphFileCount < 1 ||
@@ -1996,7 +2064,7 @@ function assertDesktopModuleLinkReceipt(
     value.nodeVersion !== expected.nodeVersion ||
     value.runtimeExecutableSha256 !== expected.runtimeExecutableSha256 ||
     value.runtimeProductVersion !== expected.runtimeProductVersion ||
-    value.schemaVersion !== 2 ||
+    value.schemaVersion !== 3 ||
     value.type !== "opencode-cycle-desktop-module-link"
   ) throw new Error("Official Desktop module link receipt is invalid")
 }

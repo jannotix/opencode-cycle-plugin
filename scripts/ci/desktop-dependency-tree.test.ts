@@ -54,7 +54,11 @@ test("open dependency proof exposes a linker input built from retained verified 
   try {
     const input = session.openLinkerInput()
     try {
-      expect(input.fileCount).toBe(4)
+      expect(input.fullTreeFileCount).toBe(4)
+      expect(input.runtimeInputFileCount).toBe(4)
+      expect(input.runtimeInputContentBytes).toBeGreaterThan(0)
+      expect(input.runtimeInputSerializedBytes).toBeGreaterThan(input.runtimeInputContentBytes)
+      expect(input.runtimeInputSha256).toMatch(/^[0-9a-f]{64}$/u)
       expect(session.contentManifest).toHaveLength(4)
       expect(session.contentManifest.map((file) => file.path)).toEqual([
         "dist/index.js",
@@ -93,6 +97,59 @@ test("linker input keeps held bytes even when the verified path is replaced", as
   } finally {
     await input.close()
     await session.abort()
+    await rm(fixture.temporary, { force: true, recursive: true })
+  }
+})
+
+test("runtime input keeps source and exported asset metadata but excludes unrelated held bytes", async () => {
+  const fixture = await dependencyFixture("minimal-runtime-input")
+  const binary = join(fixture.dependency, "bin", "workflowd.exe")
+  await mkdir(join(fixture.dependency, "bin"), { recursive: true })
+  await Promise.all([
+    writeFile(join(fixture.dependency, "package.json"), `${JSON.stringify({
+      exports: "./bin/workflowd.exe",
+      name: "fixture-dependency",
+      version: "1.0.0",
+    })}\n`),
+    writeFile(binary, Buffer.alloc(64 * 1024, 0x5a)),
+    writeFile(join(fixture.dependency, "LICENSE"), "unrelated-license-token\n".repeat(512)),
+    writeFile(join(fixture.dependency, "README.md"), "unrelated-documentation-token\n".repeat(512)),
+    writeFile(join(fixture.dependency, "index.js.map"), "unrelated-source-map-token\n".repeat(512)),
+    writeFile(join(fixture.installedPlugin, "dist", "index.js"),
+      "const model = import.meta.resolve('./model.wasm'); export default model\n"),
+    writeFile(join(fixture.installedPlugin, "dist", "model.wasm"), Buffer.alloc(2048, 0x4d)),
+  ])
+  const session = await openDesktopDependencyTreeVerification(fixture.installedPlugin)
+  const input = session.openLinkerInput()
+  try {
+    expect(input.fullTreeFileCount).toBe(9)
+    expect(input.runtimeInputFileCount).toBe(6)
+    expect(input.runtimeInputSerializedBytes).toBeLessThan(input.fullTreeSerializedBytes)
+    const chunks: Buffer[] = []
+    for await (const chunk of input.createReadStream()) chunks.push(Buffer.from(chunk))
+    const framed = Buffer.concat(chunks)
+    expect(framed.byteLength).toBe(input.runtimeInputSerializedBytes)
+    expect(framed.toString("utf8")).toContain("bin/workflowd.exe")
+    expect(framed.toString("utf8")).toContain("dist/model.wasm")
+    expect(framed.includes(Buffer.alloc(1024, 0x5a))).toBe(false)
+    expect(framed.includes(Buffer.alloc(1024, 0x4d))).toBe(false)
+    expect(framed.toString("utf8")).not.toContain("unrelated-license-token")
+    expect(framed.toString("utf8")).not.toContain("unrelated-documentation-token")
+    expect(framed.toString("utf8")).not.toContain("unrelated-source-map-token")
+  } finally {
+    await input.close()
+    await session.abort()
+    await rm(fixture.temporary, { force: true, recursive: true })
+  }
+})
+
+test("runtime input fails before serialization when a required package manifest is missing", async () => {
+  const fixture = await dependencyFixture("missing-required-manifest")
+  await rm(join(fixture.dependency, "package.json"))
+  try {
+    await expect(openDesktopDependencyTreeVerification(fixture.installedPlugin))
+      .rejects.toThrow("contained")
+  } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
 })

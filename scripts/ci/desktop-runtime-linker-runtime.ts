@@ -37,9 +37,11 @@ interface GraphNode {
 
 interface HeldFile {
   readonly bytes: Buffer
+  readonly contentAvailable: boolean
   readonly path: string
   readonly relativePath: string
   readonly sha256: string
+  readonly size: number
 }
 
 interface PackageManifest {
@@ -67,6 +69,8 @@ class ResolutionError extends Error {
 const GENERATED_LOADING_BUILTINS = new Set(["module", "node:module", "node:vm", "vm"])
 const MAX_GRAPH_FILES = 50_000
 const MAX_MODULE_BYTES = 64 * 1024 * 1024
+const MAX_RUNTIME_INPUT_BYTES = 64 * 1024 * 1024
+const MAX_RUNTIME_INPUT_FILES = 10_000
 
 export async function runDesktopRuntimeLinker(
   expected: DesktopRuntimeLinkerExpected,
@@ -88,13 +92,22 @@ export async function runDesktopRuntimeLinker(
     typeof SourceTextModule !== "function" || typeof SyntheticModule !== "function" ||
     !isAbsolute(root) || root !== expected.installedPlugin ||
     !isAbsolute(expected.candidateEntry) || !inside(expected.candidateEntry) ||
+    !Number.isSafeInteger(expected.fullTreeFileCount) || expected.fullTreeFileCount < 1 ||
+    !Number.isSafeInteger(expected.runtimeInputFileCount) || expected.runtimeInputFileCount < 1 ||
+    expected.runtimeInputFileCount > MAX_RUNTIME_INPUT_FILES ||
+    expected.runtimeInputFileCount > expected.fullTreeFileCount ||
+    !Number.isSafeInteger(expected.runtimeInputContentBytes) || expected.runtimeInputContentBytes < 1 ||
+    !Number.isSafeInteger(expected.runtimeInputSerializedBytes) ||
+    expected.runtimeInputSerializedBytes < expected.runtimeInputContentBytes ||
+    expected.runtimeInputSerializedBytes > MAX_RUNTIME_INPUT_BYTES ||
+    !/^[0-9a-f]{64}$/u.test(expected.runtimeInputSha256) ||
     process.versions.node !== expected.nodeVersion ||
     (expected.authoritative && process.versions.electron !== expected.electronVersion) ||
     (!expected.authoritative && expected.electronVersion !== null) ||
     digestFile(process.execPath) !== expected.runtimeExecutableSha256
   ) throw new Error("module linker runtime binding")
 
-  const heldFiles = readHeldFiles(root, expected.verifiedContentTreeSha256, canonicalKey, inside)
+  const heldFiles = readHeldFiles(root, expected, canonicalKey, inside)
   const candidate = heldFiles.get(canonicalKey(expected.candidateEntry))
   if (candidate === undefined || candidate.sha256 !== expected.candidateEntrySha256) {
     throw new Error("module linker candidate binding")
@@ -117,7 +130,7 @@ export async function runDesktopRuntimeLinker(
     const cached = manifestCache.get(key)
     if (cached !== undefined) return cached
     const file = fileAt(path)
-    if (file === undefined) throw new ResolutionError("MODULE_NOT_FOUND_TARGET")
+    if (file === undefined || !file.contentAvailable) throw new ResolutionError("MODULE_NOT_FOUND_TARGET")
     let value: unknown
     try {
       value = JSON.parse(file.bytes.toString("utf8")) as unknown
@@ -406,6 +419,7 @@ export async function runDesktopRuntimeLinker(
       graph.set(key, asset)
       return asset
     }
+    if (!held.contentAvailable) throw new ResolutionError("MODULE_NOT_FOUND_TARGET")
     const kind = moduleKind(absolute)
     if (held.bytes.byteLength > MAX_MODULE_BYTES) {
       throw new Error("module linker module exceeds its byte limit")
@@ -568,13 +582,18 @@ export async function runDesktopRuntimeLinker(
     candidateEvaluated: false,
     dependencyTreeSha256: expected.dependencyTreeSha256,
     electronVersion: process.versions.electron ?? null,
+    fullTreeFileCount: expected.fullTreeFileCount,
     graphFileCount: graph.size,
     graphSha256: digestBytes(graphCanonical),
     linkedEsmModuleCount,
     nodeVersion: process.versions.node,
+    runtimeInputContentBytes: expected.runtimeInputContentBytes,
+    runtimeInputFileCount: expected.runtimeInputFileCount,
+    runtimeInputSerializedBytes: expected.runtimeInputSerializedBytes,
+    runtimeInputSha256: expected.runtimeInputSha256,
     runtimeExecutableSha256: digestFile(process.execPath),
     runtimeProductVersion: expected.runtimeProductVersion,
-    schemaVersion: 2,
+    schemaVersion: 3,
     suppressedOptionalRootCount: nodes.flatMap((node) => node.edges)
       .filter((edge) => edge.suppressedOptionalRoot).length,
     type: "opencode-cycle-desktop-module-link",
@@ -596,7 +615,7 @@ export async function runDesktopRuntimeLinker(
 
 function readHeldFiles(
   root: string,
-  expectedTreeSha256: string,
+  expected: DesktopRuntimeLinkerExpected,
   canonicalKey: (path: string) => string,
   inside: (path: string) => boolean,
 ): Map<string, HeldFile> {
@@ -608,15 +627,27 @@ function readHeldFiles(
   let offset = magic.byteLength
   const count = input.readUInt32LE(offset)
   offset += 4
-  if (count < 1 || count > MAX_GRAPH_FILES) throw new Error("module linker held input count")
+  if (
+    count < 1 || count > MAX_GRAPH_FILES || count !== expected.runtimeInputFileCount ||
+    input.byteLength !== expected.runtimeInputSerializedBytes
+  ) throw new Error("module linker held input count")
   const files = new Map<string, HeldFile>()
   const records: string[] = []
+  let totalContentBytes = 0
   for (let index = 0; index < count; index += 1) {
-    if (offset + 12 > input.byteLength) throw new Error("module linker held input frame")
-    const nameBytes = input.readUInt32LE(offset)
-    const contentBytes = input.readBigUInt64LE(offset + 4)
-    offset += 12
-    if (nameBytes < 1 || nameBytes > 16 * 1024 || contentBytes > BigInt(MAX_MODULE_BYTES)) {
+    if (offset + 53 > input.byteLength) throw new Error("module linker held input frame")
+    const kindValue = input.readUInt8(offset)
+    const nameBytes = input.readUInt32LE(offset + 1)
+    const fileBytes = input.readBigUInt64LE(offset + 5)
+    const contentBytes = input.readBigUInt64LE(offset + 13)
+    const claimedSha256 = input.subarray(offset + 21, offset + 53).toString("hex")
+    offset += 53
+    if (
+      ![1, 2].includes(kindValue) || nameBytes < 1 || nameBytes > 16 * 1024 ||
+      fileBytes > BigInt(MAX_MODULE_BYTES) || contentBytes > fileBytes ||
+      (kindValue === 1 && contentBytes !== fileBytes) ||
+      (kindValue === 2 && contentBytes !== 0n)
+    ) {
       throw new Error("module linker held input bound")
     }
     const endName = offset + nameBytes
@@ -631,16 +662,32 @@ function readHeldFiles(
     const path = resolve(root, ...segments)
     if (!inside(path)) throw new Error("module linker held input escape")
     const bytes = input.subarray(endName, endContent)
-    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    const contentAvailable = kindValue === 1
+    if (contentAvailable && createHash("sha256").update(bytes).digest("hex") !== claimedSha256) {
+      throw new Error("module linker held input content digest")
+    }
     const key = canonicalKey(path)
     if (files.has(key)) throw new Error("module linker held input duplicate")
-    files.set(key, { bytes, path, relativePath, sha256 })
-    records.push(`${relativePath}\0${bytes.byteLength}\0${sha256}\n`)
+    files.set(key, {
+      bytes,
+      contentAvailable,
+      path,
+      relativePath,
+      sha256: claimedSha256,
+      size: Number(fileBytes),
+    })
+    const kind = contentAvailable ? "content" : "metadata"
+    records.push(`${relativePath}\0${kind}\0${String(fileBytes)}\0${claimedSha256}\n`)
+    totalContentBytes += Number(contentBytes)
     offset = endContent
   }
   if (offset !== input.byteLength || files.size !== count) throw new Error("module linker held input trailer")
-  const treeSha256 = createHash("sha256").update(records.sort().join("")).digest("hex")
-  if (treeSha256 !== expectedTreeSha256) throw new Error("module linker held input digest")
+  const runtimeInputSha256 = createHash("sha256").update(records.sort().join("")).digest("hex")
+  if (
+    runtimeInputSha256 !== expected.runtimeInputSha256 ||
+    totalContentBytes !== expected.runtimeInputContentBytes ||
+    expected.runtimeInputFileCount > expected.fullTreeFileCount
+  ) throw new Error("module linker held input digest")
   return files
 }
 

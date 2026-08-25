@@ -41,9 +41,11 @@ test("trusted module linker links the graph without evaluating candidate code", 
     expect(result).toMatchObject({
       candidateDefaultExportLinked: true,
       candidateEvaluated: false,
+      fullTreeFileCount: 4,
       unsafeDynamicImportsRejected: true,
       graphFileCount: 3,
       linkedEsmModuleCount: 3,
+      runtimeInputFileCount: 4,
       verifiedAssetFileCount: 0,
       verifiedCommonJsModuleCount: 0,
       verifiedJsonModuleCount: 0,
@@ -80,6 +82,38 @@ test("trusted module linker rejects Bun builtins, dynamic imports and unresolved
     } finally {
       await rm(temporary, { force: true, recursive: true })
     }
+  }
+}, { timeout: 30_000 })
+
+test("minimal runtime input rejects a missing manifest-exported asset", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "cycle-link-missing-asset-"))
+  try {
+    const installedPlugin = join(temporary, "opencode-cycle")
+    const entry = join(installedPlugin, "dist", "index.js")
+    const assetPackage = join(installedPlugin, "node_modules", "native-fixture")
+    const resultFile = join(temporary, "result.json")
+    await Promise.all([
+      mkdir(join(installedPlugin, "dist"), { recursive: true }),
+      mkdir(assetPackage, { recursive: true }),
+    ])
+    await Promise.all([
+      writeFile(join(installedPlugin, "package.json"), `${JSON.stringify({
+        dependencies: { "native-fixture": "1.0.0" },
+        exports: { ".": "./dist/index.js" },
+        type: "module",
+      })}\n`),
+      writeFile(entry, "const native = import.meta.resolve('native-fixture'); export default native\n"),
+      writeFile(join(assetPackage, "package.json"), `${JSON.stringify({
+        exports: "./bin/native.exe",
+        name: "native-fixture",
+        version: "1.0.0",
+      })}\n`),
+    ])
+    const execution = await runLinker({ entry, installedPlugin, resultFile })
+    expect(execution.exitCode).not.toBe(0)
+    expect(await readFile(resultFile).then(() => true, () => false)).toBe(false)
+  } finally {
+    await rm(temporary, { force: true, recursive: true })
   }
 }, { timeout: 30_000 })
 
@@ -310,20 +344,25 @@ async function runLinker(input: {
   const verification = await openDesktopDependencyTreeVerification(input.installedPlugin)
   let graphInput: Awaited<ReturnType<typeof verification.openLinkerInput>> | undefined
   try {
+    graphInput = verification.openLinkerInput()
     await writeFile(sourceFile, await bundledDesktopRuntimeLinker({
       authoritative: false,
       candidateEntry: input.entry,
       candidateEntrySha256: await digest(input.entry),
       dependencyTreeSha256: verification.receipt.dependencyTreeSha256,
       electronVersion: null,
+      fullTreeFileCount: graphInput.fullTreeFileCount,
       installedPlugin: input.installedPlugin,
       nodeVersion: process.versions.node,
       resultFile: input.resultFile,
+      runtimeInputContentBytes: graphInput.runtimeInputContentBytes,
+      runtimeInputFileCount: graphInput.runtimeInputFileCount,
+      runtimeInputSerializedBytes: graphInput.runtimeInputSerializedBytes,
+      runtimeInputSha256: graphInput.runtimeInputSha256,
       runtimeExecutableSha256,
       runtimeProductVersion: "system-node-unit-proof",
       verifiedContentTreeSha256: verification.contentTreeSha256,
     }), { flag: "wx", mode: 0o600 })
-    graphInput = verification.openLinkerInput()
     const child = spawn(process.execPath, [
       "--no-warnings",
       "--experimental-vm-modules",

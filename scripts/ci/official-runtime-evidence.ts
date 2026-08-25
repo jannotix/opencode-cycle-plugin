@@ -391,12 +391,37 @@ function validateRuntimeStages(
   stages: readonly Record<string, unknown>[],
   expectedErrorClass: string,
 ): void {
+  const prepared = stages.find((stage) => stage.stage === "module-graph-prepared")
   const started = stages.find((stage) => stage.stage === "runtime-started")
   const completed = stages.find((stage) => stage.stage === "runtime-completed")
+  const preparedDetails = isRecord(prepared?.details) ? prepared.details : undefined
   const startedDetails = isRecord(started?.details) ? started.details : undefined
   const completedDetails = isRecord(completed?.details) ? completed.details : undefined
   if (
-    startedDetails === undefined || completedDetails === undefined ||
+    preparedDetails === undefined || startedDetails === undefined || completedDetails === undefined ||
+    typeof preparedDetails.fullTreeFileCount !== "number" ||
+    !Number.isSafeInteger(preparedDetails.fullTreeFileCount) || preparedDetails.fullTreeFileCount < 1 ||
+    typeof preparedDetails.fullTreeSerializedBytes !== "number" ||
+    !Number.isSafeInteger(preparedDetails.fullTreeSerializedBytes) ||
+    preparedDetails.fullTreeSerializedBytes < 1 ||
+    preparedDetails.fullTreeSerializedBytes > 512 * 1024 * 1024 ||
+    typeof preparedDetails.inputPreparationDurationMillis !== "number" ||
+    !Number.isSafeInteger(preparedDetails.inputPreparationDurationMillis) ||
+    preparedDetails.inputPreparationDurationMillis < 0 ||
+    typeof preparedDetails.runtimeInputContentBytes !== "number" ||
+    !Number.isSafeInteger(preparedDetails.runtimeInputContentBytes) ||
+    preparedDetails.runtimeInputContentBytes < 1 ||
+    typeof preparedDetails.runtimeInputFileCount !== "number" ||
+    !Number.isSafeInteger(preparedDetails.runtimeInputFileCount) ||
+    preparedDetails.runtimeInputFileCount < 1 ||
+    preparedDetails.runtimeInputFileCount > 10_000 ||
+    preparedDetails.runtimeInputFileCount > preparedDetails.fullTreeFileCount ||
+    typeof preparedDetails.runtimeInputSerializedBytes !== "number" ||
+    !Number.isSafeInteger(preparedDetails.runtimeInputSerializedBytes) ||
+    preparedDetails.runtimeInputSerializedBytes < preparedDetails.runtimeInputContentBytes ||
+    preparedDetails.runtimeInputSerializedBytes > 64 * 1024 * 1024 ||
+    typeof preparedDetails.runtimeInputSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(preparedDetails.runtimeInputSha256) ||
     typeof startedDetails.runtimePid !== "number" ||
     !Number.isSafeInteger(startedDetails.runtimePid) || startedDetails.runtimePid < 1 ||
     typeof startedDetails.timeoutMillis !== "number" ||
@@ -431,11 +456,11 @@ function validateSuccessfulEvidence(
   const tree = assertJsonArtifact(byName, "dependency-tree-manifest.json", 1,
     "opencode-cycle-desktop-dependency-tree-manifest", true)
   assertJsonLines(byName.get("desktop-runtime-diagnostics.jsonl"))
-  const result = assertJsonArtifact(byName, "desktop-runtime-result.json", 2,
+  const result = assertJsonArtifact(byName, "desktop-runtime-result.json", 3,
     "opencode-cycle-desktop-module-link")
   const runtimeOutput = assertJsonArtifact(byName, "runtime-output-summary.json", 1,
     "opencode-cycle-official-electron-runtime-output")
-  const runtime = assertJsonArtifact(byName, "runtime-receipt.json", 4,
+  const runtime = assertJsonArtifact(byName, "runtime-receipt.json", 5,
     "opencode-cycle-desktop-runtime-guard")
   const candidate = byName.get("candidate-entry.js")
   const linker = byName.get("desktop-runtime-linker.mjs")
@@ -449,6 +474,13 @@ function validateSuccessfulEvidence(
     runtime.loaderSha256 !== loader.sha256 ||
     runtime.dependencyTreeSha256 !== dependencyTree.dependencyTreeSha256 ||
     runtime.verifiedContentTreeSha256 !== tree.contentTreeSha256 ||
+    !Array.isArray(tree.files) || typeof runtime.fullTreeFileCount !== "number" ||
+    runtime.fullTreeFileCount !== tree.files.length ||
+    result.fullTreeFileCount !== runtime.fullTreeFileCount ||
+    result.runtimeInputContentBytes !== runtime.runtimeInputContentBytes ||
+    result.runtimeInputFileCount !== runtime.runtimeInputFileCount ||
+    result.runtimeInputSerializedBytes !== runtime.runtimeInputSerializedBytes ||
+    result.runtimeInputSha256 !== runtime.runtimeInputSha256 ||
     result.candidateEntrySha256 !== runtime.candidateEntrySha256 ||
     result.dependencyTreeSha256 !== runtime.dependencyTreeSha256 ||
     result.graphFileCount !== runtime.graphFileCount ||
@@ -457,6 +489,15 @@ function validateSuccessfulEvidence(
     result.verifiedCommonJsModuleCount !== runtime.verifiedCommonJsModuleCount ||
     result.verifiedJsonModuleCount !== runtime.verifiedJsonModuleCount ||
     result.verifiedAssetFileCount !== runtime.verifiedAssetFileCount ||
+    typeof runtime.graphFileCount !== "number" ||
+    typeof runtime.runtimeInputContentBytes !== "number" ||
+    typeof runtime.runtimeInputFileCount !== "number" ||
+    runtime.runtimeInputFileCount < runtime.graphFileCount ||
+    runtime.runtimeInputFileCount > runtime.fullTreeFileCount ||
+    typeof runtime.runtimeInputSerializedBytes !== "number" ||
+    runtime.runtimeInputSerializedBytes < runtime.runtimeInputContentBytes ||
+    typeof runtime.runtimeInputSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(runtime.runtimeInputSha256) ||
     result.verifiedContentTreeSha256 !== runtime.verifiedContentTreeSha256 ||
     result.suppressedOptionalRootCount !== runtime.suppressedOptionalRootCount ||
     result.electronVersion !== runtime.electronVersion ||

@@ -9,7 +9,7 @@ import {
   realpath,
   type FileHandle,
 } from "node:fs/promises"
-import { dirname, join, relative, resolve, sep } from "node:path"
+import { dirname, extname, join, posix, relative, resolve, sep } from "node:path"
 import { Readable } from "node:stream"
 
 import { assertNoReparseMaterial, assertStableOpenFile } from "../release/verified-file.js"
@@ -17,7 +17,10 @@ import { assertNoReparseMaterial, assertStableOpenFile } from "../release/verifi
 const MAX_DEPENDENCY_FILES = 50_000
 const MAX_DEPENDENCY_FILE_BYTES = 64 * 1024 * 1024
 const MAX_DEPENDENCY_TREE_BYTES = 512 * 1024 * 1024
-export const DESKTOP_LINKER_INPUT_MAGIC = "OPENCODE_CYCLE_GRAPH_V1\0"
+const MAX_RUNTIME_INPUT_BYTES = 64 * 1024 * 1024
+const MAX_RUNTIME_INPUT_FILES = 10_000
+export const DESKTOP_LINKER_INPUT_MAGIC = "OPENCODE_CYCLE_GRAPH_V2\0"
+const LINKER_INPUT_FRAME_BYTES = 53
 
 export interface DesktopDependencyTreeReceipt {
   readonly dependencyFileCount: number
@@ -46,7 +49,13 @@ export interface DesktopDependencyLinkerInput {
   readonly close: () => Promise<void>
   readonly contentTreeSha256: string
   readonly createReadStream: () => NodeJS.ReadableStream
-  readonly fileCount: number
+  readonly fullTreeFileCount: number
+  readonly fullTreeSerializedBytes: number
+  readonly preparationDurationMillis: number
+  readonly runtimeInputContentBytes: number
+  readonly runtimeInputFileCount: number
+  readonly runtimeInputSerializedBytes: number
+  readonly runtimeInputSha256: string
 }
 
 interface HeldDependencyFile {
@@ -56,6 +65,11 @@ interface HeldDependencyFile {
   readonly path: string
   readonly relativePath: string
   readonly sha256: string
+}
+
+interface RuntimeInputFile {
+  readonly file: HeldDependencyFile
+  readonly kind: "content" | "metadata"
 }
 
 interface DependencyMembershipSnapshot {
@@ -167,8 +181,24 @@ export async function openDesktopDependencyTreeVerification(
       contentTreeSha256: initial.contentTreeSha256,
       openLinkerInput() {
         if (closed) throw new Error("Desktop dependency verification handles are closed")
-        const files = [...held].sort((left, right) =>
+        const preparationStartedAt = Date.now()
+        const fullTreeFiles = [...held].sort((left, right) =>
           left.relativePath.localeCompare(right.relativePath))
+        const files = selectRuntimeInputFiles(fullTreeFiles)
+        const runtimeInputContentBytes = files.reduce((total, input) =>
+          total + (input.kind === "content" ? input.file.content.byteLength : 0), 0)
+        const runtimeInputSha256 = runtimeInputDigest(files)
+        const runtimeInputSerializedBytes = DESKTOP_LINKER_INPUT_MAGIC.length + 4 +
+          files.reduce((total, input) => total + LINKER_INPUT_FRAME_BYTES +
+            Buffer.byteLength(input.file.relativePath) +
+            (input.kind === "content" ? input.file.content.byteLength : 0), 0)
+        if (
+          files.length > MAX_RUNTIME_INPUT_FILES ||
+          runtimeInputSerializedBytes > MAX_RUNTIME_INPUT_BYTES
+        ) throw new Error("Desktop runtime input exceeds its serialized bound")
+        const fullTreeSerializedBytes = DESKTOP_LINKER_INPUT_MAGIC.length + 4 +
+          fullTreeFiles.reduce((total, file) =>
+            total + 12 + Buffer.byteLength(file.relativePath) + file.content.byteLength, 0)
         let inputClosed = false
         let streamOpened = false
         return {
@@ -183,19 +213,30 @@ export async function openDesktopDependencyTreeVerification(
               header.writeUInt32LE(files.length)
               yield Buffer.from(DESKTOP_LINKER_INPUT_MAGIC, "utf8")
               yield header
-              for (const file of files) {
+              for (const input of files) {
+                const file = input.file
                 const name = Buffer.from(file.relativePath, "utf8")
-                const frame = Buffer.alloc(12)
-                frame.writeUInt32LE(name.byteLength, 0)
-                frame.writeBigUInt64LE(BigInt(file.content.byteLength), 4)
+                const contentBytes = input.kind === "content" ? file.content.byteLength : 0
+                const frame = Buffer.alloc(LINKER_INPUT_FRAME_BYTES)
+                frame.writeUInt8(input.kind === "content" ? 1 : 2, 0)
+                frame.writeUInt32LE(name.byteLength, 1)
+                frame.writeBigUInt64LE(BigInt(file.content.byteLength), 5)
+                frame.writeBigUInt64LE(BigInt(contentBytes), 13)
+                Buffer.from(file.sha256, "hex").copy(frame, 21)
                 yield frame
                 yield name
-                yield file.content
+                if (input.kind === "content") yield file.content
               }
             }
             return Readable.from(frames())
           },
-          fileCount: files.length,
+          fullTreeFileCount: fullTreeFiles.length,
+          fullTreeSerializedBytes,
+          preparationDurationMillis: Date.now() - preparationStartedAt,
+          runtimeInputContentBytes,
+          runtimeInputFileCount: files.length,
+          runtimeInputSerializedBytes,
+          runtimeInputSha256,
         }
       },
       receipt,
@@ -300,6 +341,123 @@ async function captureDependencyMembership(
     fileCount: files,
     paths,
   }
+}
+
+function selectRuntimeInputFiles(files: readonly HeldDependencyFile[]): RuntimeInputFile[] {
+  const byPath = new Map(files.map((file) => [file.relativePath, file]))
+  const selected = new Map<string, RuntimeInputFile>()
+  for (const file of files) {
+    if (runtimeContentFile(file.relativePath)) {
+      selected.set(file.relativePath, { file, kind: "content" })
+    }
+  }
+  for (const manifestFile of files.filter((file) => posix.basename(file.relativePath) === "package.json")) {
+    let manifest: unknown
+    try {
+      manifest = JSON.parse(manifestFile.content.toString("utf8")) as unknown
+    } catch {
+      throw new Error("Desktop runtime input package manifest is malformed")
+    }
+    if (!isRecord(manifest)) throw new Error("Desktop runtime input package manifest is malformed")
+    const packageDirectory = posix.dirname(manifestFile.relativePath)
+    for (const target of manifestRuntimeTargets(manifest)) {
+      if (!target.startsWith("./")) continue
+      const relativeTarget = posix.normalize(posix.join(packageDirectory, target))
+      if (
+        relativeTarget === ".." || relativeTarget.startsWith("../") ||
+        posix.isAbsolute(relativeTarget)
+      ) throw new Error("Desktop runtime input manifest target escapes its package")
+      if (!relativeTarget.includes("*")) {
+        const file = byPath.get(relativeTarget)
+        if (file !== undefined && !runtimeContentFile(file.relativePath)) {
+          selected.set(file.relativePath, { file, kind: "metadata" })
+        }
+        continue
+      }
+      const [prefix = "", suffix = ""] = relativeTarget.split("*")
+      for (const file of files) {
+        if (
+          file.relativePath.startsWith(prefix) && file.relativePath.endsWith(suffix) &&
+          !runtimeContentFile(file.relativePath)
+        ) selected.set(file.relativePath, { file, kind: "metadata" })
+      }
+    }
+  }
+  for (const source of files.filter((file) => [".cjs", ".js", ".mjs"]
+    .includes(extname(file.relativePath).toLowerCase()))) {
+    const expression = /\bimport\s*\.\s*meta\s*\.\s*resolve\s*\(\s*(["'])([^"']+)\1\s*\)/gu
+    for (const match of source.content.toString("utf8").matchAll(expression)) {
+      const specifier = match[2]
+      if (specifier === undefined) continue
+      const target = resolveLiteralAssetTarget(source.relativePath, specifier, byPath)
+      if (target !== undefined && !runtimeContentFile(target.relativePath)) {
+        selected.set(target.relativePath, { file: target, kind: "metadata" })
+      }
+    }
+  }
+  return [...selected.values()].sort((left, right) =>
+    left.file.relativePath.localeCompare(right.file.relativePath))
+}
+
+function resolveLiteralAssetTarget(
+  parent: string,
+  specifier: string,
+  files: ReadonlyMap<string, HeldDependencyFile>,
+): HeldDependencyFile | undefined {
+  if (specifier.startsWith("./") || specifier.startsWith("../")) {
+    const target = posix.normalize(posix.join(posix.dirname(parent), specifier))
+    if (target === ".." || target.startsWith("../") || posix.isAbsolute(target)) return undefined
+    return files.get(target)
+  }
+  if (
+    specifier.startsWith("#") || specifier.startsWith("/") || specifier.startsWith("file:") ||
+    specifier.includes("\\") || specifier.includes("\0")
+  ) return undefined
+  const segments = specifier.split("/")
+  const packageName = specifier.startsWith("@")
+    ? segments.length >= 2 ? segments.slice(0, 2).join("/") : undefined
+    : segments[0]
+  if (packageName === undefined) return undefined
+  const consumed = packageName.startsWith("@") ? 2 : 1
+  if (segments.length === consumed) return undefined
+  let cursor = posix.dirname(parent)
+  for (;;) {
+    const packageRoot = posix.join(cursor === "." ? "" : cursor, "node_modules", packageName)
+    if (files.has(posix.join(packageRoot, "package.json"))) {
+      return files.get(posix.join(packageRoot, ...segments.slice(consumed)))
+    }
+    if (cursor === ".") return undefined
+    cursor = posix.dirname(cursor)
+  }
+}
+
+function runtimeContentFile(path: string): boolean {
+  return [".cjs", ".js", ".json", ".mjs"].includes(extname(path).toLowerCase())
+}
+
+function manifestRuntimeTargets(manifest: Readonly<Record<string, unknown>>): string[] {
+  const targets: string[] = []
+  const collect = (value: unknown): void => {
+    if (typeof value === "string") {
+      targets.push(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item)
+      return
+    }
+    if (isRecord(value)) for (const item of Object.values(value)) collect(item)
+  }
+  collect(manifest.exports)
+  collect(manifest.imports)
+  collect(manifest.main)
+  return targets
+}
+
+function runtimeInputDigest(files: readonly RuntimeInputFile[]): string {
+  const canonical = files.map(({ file, kind }) =>
+    `${file.relativePath}\0${kind}\0${file.content.byteLength}\0${file.sha256}\n`).sort().join("")
+  return createHash("sha256").update(canonical).digest("hex")
 }
 
 function membershipMetadata(details: Awaited<ReturnType<typeof lstat>>): string {

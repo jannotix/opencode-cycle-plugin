@@ -489,7 +489,7 @@ test("Desktop runtime guard uses the trusted non-evaluating linker under the pin
       "--experimental-vm-modules",
       plan.expected.linker,
     ])
-    expect(linkerSource).toContain("OPENCODE_CYCLE_GRAPH_V1")
+    expect(linkerSource).toContain("OPENCODE_CYCLE_GRAPH_V2")
     expect(linkerSource).toContain("Bundled dependency: acorn@8.15.0")
     expect(linkerSource).toContain("MIT License")
     expect(linkerSource).toContain("SourceTextModule")
