@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { expect, mock, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -12,7 +12,8 @@ import {
   writeDesktopActivationMarker,
   type DesktopCertificationBinding,
 } from "../../packages/opencode-cycle/src/certification.js"
-import { createVerifiedFileReaderForTests } from "../release/verified-file.js"
+import * as VerifiedFileModule from "../release/verified-file.js"
+import type { DesktopAsset, DesktopAssetMatrix } from "./desktop-certification.js"
 
 function daemonIdentity(binding: DesktopCertificationBinding) {
   return {
@@ -25,7 +26,19 @@ function daemonIdentity(binding: DesktopCertificationBinding) {
     startedAtUnixMillis: binding.startedAtUnixMillis,
   }
 }
-import {
+const verifiedFileReader = VerifiedFileModule.createVerifiedFileReaderForTests({
+  assertNoReparse: async () => undefined,
+})
+mock.module("../release/verified-file.js", () => ({
+  ...VerifiedFileModule,
+  readVerifiedFileDirectory: (directory: string) => verifiedFileReader.readDirectory(directory),
+  readVerifiedRegularFile: (
+    path: string,
+    options?: { readonly maxBytes?: number; readonly root?: string },
+  ) => verifiedFileReader.readFile(path, options),
+}))
+
+const {
   activationScanRoots,
   certificationEnvironment,
   cleanupDesktopCertificationProcesses,
@@ -43,14 +56,13 @@ import {
   terminateDesktopProcess,
   validateDesktopAsset,
   validateDesktopAssetMatrix,
+  verifyDesktopModuleRuntime,
   waitForDesktopActivation,
   windowsDesktopExtraction,
   windowsPowerShellEnvironment,
   windowsPowerShellPath,
   SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS,
-  type DesktopAsset,
-  type DesktopAssetMatrix,
-} from "./desktop-certification.js"
+} = await import("./desktop-certification.js")
 import {
   OPENCODE_11821_HOST_PROOF_PROVENANCE,
   verifyCanonicalFixture,
@@ -260,28 +272,25 @@ test("Linux certification shell emitter is profile-free and contains only isolat
   try {
     expect(fixture.prepared.shellWrapper).toBeString()
     const source = await readFile(fixture.prepared.shellWrapper as string, "utf8")
-    expect(source.startsWith("#!/bin/sh\nexec /usr/bin/env -i \\")).toBe(true)
-    expect(source).toContain(`'HOME=${fixture.environment.HOME}'`)
-    expect(source).toContain(`'OPENCODE_CONFIG_DIR=${fixture.environment.OPENCODE_CONFIG_DIR}'`)
-    expect(source).not.toContain("/owner/")
-    expect(source).not.toContain("\\owner\\")
-    expect(source).not.toContain("\n+")
+    expect(source).toBe("#!/bin/sh\nexit 1\n")
+    expect(source).not.toContain(fixture.environment.HOME as string)
+    expect(source).not.toContain(fixture.binding.nonce)
     if (process.platform === "linux") {
-      const child = Bun.spawn([fixture.prepared.shellWrapper as string, "-il", "-c", "env -0"], {
-        env: { HOME: "/owner/home", XDG_CONFIG_HOME: "/owner/config" },
-        stderr: "ignore",
-        stdout: "pipe",
-      })
-      const output = Buffer.from(await new Response(child.stdout).arrayBuffer()).toString("utf8")
-      expect(await child.exited).toBe(0)
-      const values = Object.fromEntries(
-        output.split("\0").filter(Boolean).map((entry) => {
-          const separator = entry.indexOf("=")
-          return [entry.slice(0, separator), entry.slice(separator + 1)]
-        }),
-      )
-      expect(values.HOME).toBe(fixture.environment.HOME)
-      expect(values.OPENCODE_CONFIG_DIR).toBe(fixture.environment.OPENCODE_CONFIG_DIR)
+      for (const argumentsList of [["--version"], ["-c", "env -0"]]) {
+        const child = Bun.spawn([fixture.prepared.shellWrapper as string, ...argumentsList], {
+          env: { HOME: "/owner/home", XDG_CONFIG_HOME: "/owner/config" },
+          stderr: "pipe",
+          stdout: "pipe",
+        })
+        const [exitCode, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ])
+        expect(exitCode).not.toBe(0)
+        expect(stdout).toBe("")
+        expect(stderr).toBe("")
+      }
     }
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
@@ -346,9 +355,6 @@ CandidateFixture.finalizeDesktopCertification = async () => {}
     HOME: join(temporary, "desktop-shell-home"),
     XDG_CONFIG_HOME: join(temporary, "desktop-profile", "config"),
   }
-  const reader = createVerifiedFileReaderForTests({ assertNoReparse: async () => undefined })
-  const readFileBoundary = (path: string, options?: { readonly maxBytes?: number; readonly root?: string }) =>
-    reader.readFile(path, options)
   const prepared = await prepareDesktopCertificationLoad({
     certification: binding,
     dataDirectory,
@@ -357,7 +363,6 @@ CandidateFixture.finalizeDesktopCertification = async () => {}
     nativeExecutable,
     packedPlugin,
     platform,
-    readFileBoundary,
     scratch: temporary,
   })
   return {
@@ -366,7 +371,6 @@ CandidateFixture.finalizeDesktopCertification = async () => {}
     environment: effectiveEnvironment,
     nativeExecutable,
     prepared,
-    readFileBoundary,
     temporary,
   }
 }
@@ -376,10 +380,12 @@ test("canonical Linux preferAppEnv skips conflicting login-shell bindings before
   const fixture = await createDesktopLoadFixture(undefined, "linux-x64")
   try {
     const shell = fixture.prepared.shellWrapper as string
+    const invocationMarker = join(fixture.temporary, "nu-invoked")
     await writeFile(
       shell,
       [
         "#!/bin/sh",
+        `touch ${JSON.stringify(invocationMarker)}`,
         "exec /usr/bin/env -i \\",
         "  'HOME=/owner/home' \\",
         "  'XDG_CONFIG_HOME=/owner/config' \\",
@@ -423,10 +429,82 @@ test("canonical Linux preferAppEnv skips conflicting login-shell bindings before
       provenanceCommit: OPENCODE_11821_HOST_PROOF_PROVENANCE.commit,
       shellEnvironmentSkipped: true,
     })
+    expect(await access(invocationMarker).then(() => true, () => false)).toBe(false)
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
 }, 20_000)
+
+test("native certification requires an official Electron module-runtime guard before Desktop launch", async () => {
+  const module = await import("./desktop-certification.js") as Record<string, unknown>
+  expect(module.verifyDesktopModuleRuntime).toBeFunction()
+  const source = await readFile(resolve(import.meta.dir, "desktop-certification.ts"), "utf8")
+  const guard = source.indexOf("await verifyDesktopModuleRuntime(")
+  const launch = source.indexOf("desktopProcess = Bun.spawn(")
+  expect(guard).toBeGreaterThan(0)
+  expect(launch).toBeGreaterThan(guard)
+})
+
+test("Desktop module runtime guard validates exact wrapper, package and runtime bindings", async () => {
+  const node = Bun.which("node")
+  expect(node).toBeString()
+  for (const electronVersion of ["42.3.3", "0.0.0"] as const) {
+    const fixture = await createDesktopLoadFixture()
+    try {
+      const runtime = join(fixture.temporary, `fake-electron-${electronVersion}.mjs`)
+      await writeFile(runtime, `
+import { pathToFileURL } from "node:url"
+Object.defineProperty(process.versions, "electron", { value: ${JSON.stringify(electronVersion)} })
+Object.defineProperty(process.versions, "node", { value: "24.15.0" })
+await import(pathToFileURL(process.argv[2]).href)
+`)
+      const proof = verifyDesktopModuleRuntime({
+        binding: fixture.binding,
+        cwd: fixture.temporary,
+        environment: fixture.environment,
+        hostVersion: "1.18.21",
+        prepared: fixture.prepared,
+        runtimeCommand: [node as string, runtime],
+        scratch: fixture.temporary,
+      })
+      if (electronVersion === "42.3.3") {
+        const receipt = await proof
+        expect(receipt).toMatchObject({
+          electronVersion,
+          moduleResolved: true,
+          nodeVersion: "24.15.0",
+          productVersion: "1.18.21",
+          revision: fixture.binding.revision,
+          type: "opencode-cycle-desktop-runtime-guard",
+        })
+        expect(await desktopLoadDiagnosticSummary(fixture.binding.root, fixture.binding)).toContain(
+          "config_path_discovered=missing",
+        )
+      } else {
+        let failure: unknown
+        try {
+          await proof
+        } catch (error) {
+          failure = error
+        }
+        expect(failure).toBeInstanceOf(Error)
+        expect((failure as Error).message).toMatch(
+          /^Official Desktop module runtime guard failed: class=runtime_exit, code=1, output_sha256=[0-9a-f]{64}$/u,
+        )
+        expect((failure as Error).message).not.toContain(fixture.temporary)
+      }
+    } finally {
+      await rm(fixture.temporary, { force: true, recursive: true })
+    }
+  }
+}, 20_000)
+
+test("production Desktop helpers expose no optional verified-file reader overrides", async () => {
+  const source = await readFile(resolve(import.meta.dir, "desktop-certification.ts"), "utf8")
+  expect(source).not.toContain("readFileBoundary?:")
+  expect(source).not.toContain("readonly readFile?: typeof readVerifiedRegularFile")
+  expect(source).not.toContain("dependencies.readFile")
+})
 
 async function runHostProof(
   fixture: Awaited<ReturnType<typeof createDesktopLoadFixture>>,
@@ -707,9 +785,6 @@ test("malformed Desktop load diagnostics fail closed without echoing untrusted f
     startedAtUnixMillis: 1_700_000_000_000,
   }
   try {
-    const reader = createVerifiedFileReaderForTests({ assertNoReparse: async () => undefined })
-    const readFileBoundary = (path: string, options?: { readonly maxBytes?: number; readonly root?: string }) =>
-      reader.readFile(path, options)
     await writeFile(
       join(root, "desktop-load-diagnostics.jsonl"),
       `${JSON.stringify({
@@ -720,16 +795,13 @@ test("malformed Desktop load diagnostics fail closed without echoing untrusted f
         type: "opencode-cycle-desktop-load-diagnostic",
       })}\n`,
     )
-    await expect(desktopLoadDiagnosticSummary(root, binding, {
-      readFile: readFileBoundary,
-    })).rejects.toThrow("transcript")
+    await expect(desktopLoadDiagnosticSummary(root, binding)).rejects.toThrow("transcript")
 
     let clock = binding.startedAtUnixMillis
     let failure: unknown
     try {
       await waitForDesktopActivation(root, binding, 1, {
         now: () => clock,
-        readFile: readFileBoundary,
         sleep: async (milliseconds) => {
           clock += milliseconds
         },
@@ -799,10 +871,7 @@ for (const scenario of ["duplicate", "out-of-order", "failure-overwrite", "stale
         join(root, "desktop-load-diagnostics.jsonl"),
         `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
       )
-      const reader = createVerifiedFileReaderForTests({ assertNoReparse: async () => undefined })
-      await expect(desktopLoadDiagnosticSummary(root, binding, {
-        readFile: (path, options) => reader.readFile(path, options),
-      })).rejects.toThrow("transcript")
+      await expect(desktopLoadDiagnosticSummary(root, binding)).rejects.toThrow("transcript")
     } finally {
       await rm(root, { force: true, recursive: true })
     }
@@ -831,7 +900,6 @@ test("a complete passing load transcript can never replace the activation marker
     "daemon_identity_published",
   ]
   try {
-    const reader = createVerifiedFileReaderForTests({ assertNoReparse: async () => undefined })
     await writeFile(
       join(root, "desktop-load-diagnostics.jsonl"),
       `${stages.map((stage, sequence) => JSON.stringify({
@@ -846,7 +914,6 @@ test("a complete passing load transcript can never replace the activation marker
     let clock = binding.startedAtUnixMillis
     await expect(waitForDesktopActivation(root, binding, 1, {
       now: () => clock,
-      readFile: (path, options) => reader.readFile(path, options),
       sleep: async (milliseconds) => { clock += milliseconds },
     })).rejects.toThrow("did not activate")
   } finally {
@@ -1219,11 +1286,6 @@ test("local Desktop assets are staged only after exact byte verification", async
       },
       destination,
       source,
-      {
-        readFile: (path, options) =>
-          createVerifiedFileReaderForTests({ assertNoReparse: async () => undefined })
-            .readFile(path, options),
-      },
     )
     expect(await readFile(destination)).toEqual(bytes)
   } finally {

@@ -1,11 +1,17 @@
 import { execFile, spawn as spawnChildProcess } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
 import type { Readable } from "node:stream"
 import { promisify } from "node:util"
 
 import type { ArchitecturePlanInput } from "../client.js"
+import {
+  realWindowsVerificationTreeAdapter,
+  type WindowsVerificationProcessInstance,
+  type WindowsVerificationTreeAdapter,
+} from "./task-verification-windows.js"
+
+export type { WindowsVerificationProcessInstance, WindowsVerificationTreeAdapter }
 
 const execFileAsync = promisify(execFile)
 const OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -22,6 +28,12 @@ const FORBIDDEN_ARGUMENTS = new Set([
 ])
 
 type PlannedTask = ArchitecturePlanInput["tasks"][number]
+
+interface VerificationProcessEvents {
+  once(event: "error", listener: (error: Error) => void): unknown
+  once(event: "exit", listener: (code: number | null) => void): unknown
+}
+
 
 export interface TaskVerificationInput {
   readonly baseRevision: string
@@ -155,8 +167,16 @@ async function runVerificationCommand(
       tool,
     }
   } catch (error) {
+    terminate()
+    await terminationPromise
     if (aborted) signal?.throwIfAborted()
-    return failedCommandReceipt(invocation, tool, args, error, timedOut)
+    return failedCommandReceipt(
+      invocation,
+      tool,
+      args,
+      terminationError ?? error,
+      timedOut,
+    )
   } finally {
     clearTimeout(timeout)
     signal?.removeEventListener("abort", onAbort)
@@ -164,6 +184,7 @@ async function runVerificationCommand(
 }
 
 function spawnVerificationProcess(directory: string, tool: string, args: readonly string[]) {
+  const spawnedAtUnixMillis = Date.now()
   const child = spawnChildProcess(tool, [...args], {
     cwd: directory,
     detached: true,
@@ -175,22 +196,14 @@ function spawnVerificationProcess(directory: string, tool: string, args: readonl
     child.once("error", () => undefined)
     throw new Error("Verification process failed to start")
   }
-  const exited = new Promise<number>((resolve) => {
-    let settled = false
-    const finish = (code: number): void => {
-      if (settled) return
-      settled = true
-      resolve(code)
-    }
-    child.once("error", () => finish(1))
-    child.once("exit", (code) => finish(code ?? 1))
-  })
+  const exited = createVerificationProcessExitPromise(child)
   return {
     exited,
     get exitCode() { return child.exitCode },
     kill(signal?: NodeJS.Signals | number) { return child.kill(signal) },
     pid: child.pid,
     get signalCode() { return child.signalCode },
+    spawnedAtUnixMillis,
     stderr: child.stderr,
     stdout: child.stdout,
   }
@@ -200,7 +213,12 @@ type VerificationProcess = ReturnType<typeof spawnVerificationProcess>
 
 async function terminateProcessTree(child: VerificationProcess): Promise<void> {
   if (process.platform === "win32") {
-    await terminateWindowsProcessTree(child)
+    await terminateWindowsVerificationTree({
+      adapter: realWindowsVerificationTreeAdapter(),
+      exited: child.exited,
+      rootPid: child.pid,
+      spawnedAtUnixMillis: child.spawnedAtUnixMillis,
+    })
     return
   }
   signalProcessGroup(child.pid, "SIGTERM")
@@ -213,24 +231,49 @@ async function terminateProcessTree(child: VerificationProcess): Promise<void> {
   }
 }
 
-async function terminateWindowsProcessTree(child: VerificationProcess): Promise<void> {
-  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
-  const killer = spawnVerificationProcess(
-    process.cwd(),
-    join(systemRoot, "System32", "taskkill.exe"),
-    ["/PID", String(child.pid), "/T", "/F"],
-  )
-  if (!(await waitForExit(killer.exited, TERMINATION_LIMIT_MILLIS))) {
-    killer.kill()
-    if (!(await waitForExit(killer.exited, TERMINATION_GRACE_MILLIS))) {
-      throw new Error("Windows process-tree terminator did not exit")
+export function createVerificationProcessExitPromise(
+  events: VerificationProcessEvents,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    events.once("error", reject)
+    events.once("exit", (code) => resolve(code ?? 1))
+  })
+}
+
+export async function terminateWindowsVerificationTree(input: {
+  readonly adapter: WindowsVerificationTreeAdapter
+  readonly exited: Promise<number>
+  readonly rootPid: number
+  readonly spawnedAtUnixMillis: number
+}): Promise<void> {
+  const before = await input.adapter.snapshot({
+    rootPid: input.rootPid,
+    spawnedAtUnixMillis: input.spawnedAtUnixMillis,
+  })
+  const root = before.find((instance) => instance.pid === input.rootPid)
+  if (root !== undefined) {
+    const taskkillExitCode = await input.adapter.terminate(root)
+    if (taskkillExitCode !== 0) {
+      throw new Error("Windows verification taskkill returned a nonzero exit status")
     }
+  } else if (before.length !== 0) {
+    throw new Error("Windows verification process tree outlived its root process")
+  } else {
+    if (!(await waitForExit(input.exited, TERMINATION_LIMIT_MILLIS))) {
+      throw new Error("Windows verification root process did not exit")
+    }
+    return
   }
-  if (!(await waitForExit(child.exited, TERMINATION_LIMIT_MILLIS))) {
-    child.kill()
-    if (!(await waitForExit(child.exited, TERMINATION_GRACE_MILLIS))) {
-      throw new Error("Verification process did not terminate")
-    }
+  if (!(await waitForExit(input.exited, TERMINATION_LIMIT_MILLIS))) {
+    throw new Error("Windows verification root process did not exit")
+  }
+  const after = await input.adapter.snapshot({
+    rootPid: input.rootPid,
+    ...(root === undefined ? {} : { rootStartedAtUnixMillis: root.startedAtUnixMillis }),
+    spawnedAtUnixMillis: input.spawnedAtUnixMillis,
+  })
+  if (after.length !== 0) {
+    throw new Error("Windows verification process tree did not exit")
   }
 }
 
@@ -257,11 +300,14 @@ async function waitForProcessGroupExit(pid: number, timeoutMillis: number): Prom
 }
 
 async function waitForExit(exited: Promise<number>, timeoutMillis: number): Promise<boolean> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => resolve(false), timeoutMillis)
     void exited.then(() => {
       clearTimeout(timeout)
       resolve(true)
+    }, (error) => {
+      clearTimeout(timeout)
+      reject(error as Error)
     })
   })
 }

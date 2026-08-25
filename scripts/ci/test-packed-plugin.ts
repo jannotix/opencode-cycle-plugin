@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "node:crypto"
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { isAbsolute, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import type { DesktopCertificationBinding } from "../../packages/opencode-cycle/src/certification.js"
 import { packageNative, type NativeTarget } from "../packaging/native-package.js"
@@ -13,6 +13,7 @@ import {
   completeDesktopDaemonCleanupDiagnostic,
   desktopLoadDiagnosticSummary,
   prepareDesktopCertificationLoad,
+  verifyDesktopModuleRuntime,
   waitForDesktopActivation,
 } from "./desktop-certification.js"
 import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
@@ -91,19 +92,6 @@ process.exit(await child.exited)
   )
   const node = Bun.which("node")
   if (node === null) throw new Error("Packed plugin Node runtime is unavailable")
-  const nodeLoad = Bun.spawn(
-    [
-      node,
-      "--input-type=module",
-      "-e",
-      "await import(process.argv[1])",
-      pathToFileURL(join(installedPackage, "dist", "index.js")).href,
-    ],
-    { cwd: installedPackage, stderr: "ignore", stdout: "ignore" },
-  )
-  if ((await nodeLoad.exited) !== 0) {
-    throw new Error("Packed plugin failed the Desktop Node runtime import")
-  }
   const platform = process.platform === "win32" ? "windows-x64" : "linux-x64"
   const certificationRoot = join(scratch, "certification")
   const dataDirectory = join(scratch, "runtime-data")
@@ -134,6 +122,34 @@ process.exit(await child.exited)
     nativeExecutable: join(root, "target", "debug", executable),
     packedPlugin: installedPackage,
     platform,
+    scratch,
+  })
+  const officialRuntime = process.env.CYCLE_OFFICIAL_ELECTRON_RUNTIME
+  let runtimeCommand: string[]
+  if (officialRuntime !== undefined) {
+    const runtime = resolve(officialRuntime)
+    if (!isAbsolute(officialRuntime) || runtime !== officialRuntime) {
+      throw new Error("Official Electron runtime path must be canonical and absolute")
+    }
+    await access(runtime)
+    runtimeCommand = [runtime]
+  } else {
+    const fakeRuntime = join(scratch, "fake-electron-runtime.mjs")
+    await writeFile(fakeRuntime, `
+import { pathToFileURL } from "node:url"
+Object.defineProperty(process.versions, "electron", { value: "42.3.3" })
+Object.defineProperty(process.versions, "node", { value: "24.15.0" })
+await import(pathToFileURL(process.argv[2]).href)
+`)
+    runtimeCommand = [node, fakeRuntime]
+  }
+  await verifyDesktopModuleRuntime({
+    binding,
+    cwd: project,
+    environment,
+    hostVersion: "1.18.21",
+    prepared,
+    runtimeCommand,
     scratch,
   })
   const proofRequest = join(scratch, "host-proof-request.json")

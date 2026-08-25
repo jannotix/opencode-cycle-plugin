@@ -1,11 +1,34 @@
-import { expect, test } from "bun:test"
-import { execFile } from "node:child_process"
+import { expect, mock, test } from "bun:test"
+import { execFile, spawnSync } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { parseVerificationCommand, runTaskVerification } from "../src/orchestration/task-verification.js"
 import type { ArchitecturePlanInput } from "../src/client.js"
+import type { WindowsVerificationTreeAdapter } from "../src/orchestration/task-verification-windows.js"
+
+const windowsTestAdapter: WindowsVerificationTreeAdapter = {
+  async snapshot(input) {
+    return processAlive(input.rootPid)
+      ? [{ parentPid: process.pid, pid: input.rootPid, startedAtUnixMillis: input.spawnedAtUnixMillis }]
+      : []
+  },
+  async terminate(root) {
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
+    const result = spawnSync(
+      join(systemRoot, "System32", "taskkill.exe"),
+      ["/PID", String(root.pid), "/T", "/F"],
+      { stdio: "ignore", windowsHide: true },
+    )
+    return result.status ?? 1
+  },
+}
+mock.module("../src/orchestration/task-verification-windows.js", () => ({
+  realWindowsVerificationTreeAdapter: () => windowsTestAdapter,
+}))
+const TaskVerificationModule = await import("../src/orchestration/task-verification.js")
+const { parseVerificationCommand, runTaskVerification } = TaskVerificationModule
 
 test("deterministic task verification records passed commands with bounded digests", async () => {
   const repository = await createRepository()
@@ -263,6 +286,7 @@ test("abort terminates the verification process tree and propagates cancellation
 }, { timeout: 30_000 })
 
 test("verification process-group containment leaves no background descendant after success", async () => {
+  if (process.platform === "win32") return
   const pidFile = join(tmpdir(), `cycle-verifier-success-${crypto.randomUUID()}.pid`)
   const repository = await createRepository({ "process-tree.cjs": processTreeFixture(false, true) })
   let descendantPid: number | undefined
@@ -309,6 +333,71 @@ test("output-limit termination kills the verification process tree", async () =>
     await rm(repository, { force: true, recursive: true })
   }
 }, { timeout: 30_000 })
+
+test("verification child errors reject instead of impersonating process exit", async () => {
+  const createExit = (TaskVerificationModule as Record<string, unknown>)
+    .createVerificationProcessExitPromise
+  expect(createExit).toBeFunction()
+  if (typeof createExit !== "function") return
+  const events = new EventEmitter()
+  const exited = (createExit as (events: EventEmitter) => Promise<number>)(events)
+  const failure = new Error("kill delivery failed")
+  events.emit("error", failure)
+  events.emit("exit", 0)
+  await expect(exited).rejects.toBe(failure)
+})
+
+test("Windows tree cleanup rejects taskkill failure, delivery errors and surviving descendants", async () => {
+  const terminate = (TaskVerificationModule as Record<string, unknown>)
+    .terminateWindowsVerificationTree
+  expect(terminate).toBeFunction()
+  if (typeof terminate !== "function") return
+  const root = { parentPid: 1, pid: 100, startedAtUnixMillis: 1_000 }
+  const descendant = { parentPid: 100, pid: 101, startedAtUnixMillis: 1_001 }
+  const run = terminate as (input: Record<string, unknown>) => Promise<void>
+
+  await expect(run({
+    adapter: {
+      snapshot: async () => [root, descendant],
+      terminate: async () => 5,
+    },
+    exited: Promise.resolve(0),
+    rootPid: root.pid,
+    spawnedAtUnixMillis: 999,
+  })).rejects.toThrow("taskkill")
+
+  await expect(run({
+    adapter: {
+      snapshot: async () => [root],
+      terminate: async () => { throw new Error("delivery") },
+    },
+    exited: Promise.resolve(0),
+    rootPid: root.pid,
+    spawnedAtUnixMillis: 999,
+  })).rejects.toThrow("delivery")
+
+  let snapshots = 0
+  await expect(run({
+    adapter: {
+      snapshot: async () => snapshots++ === 0 ? [root, descendant] : [descendant],
+      terminate: async () => 0,
+    },
+    exited: Promise.resolve(0),
+    rootPid: root.pid,
+    spawnedAtUnixMillis: 999,
+  })).rejects.toThrow("process tree")
+
+  snapshots = 0
+  await expect(run({
+    adapter: {
+      snapshot: async () => snapshots++ === 0 ? [root] : [],
+      terminate: async () => 0,
+    },
+    exited: Promise.resolve(0),
+    rootPid: root.pid,
+    spawnedAtUnixMillis: 999,
+  })).resolves.toBeUndefined()
+})
 
 function task(verificationCommands: readonly string[]): ArchitecturePlanInput["tasks"][number] {
   return {
