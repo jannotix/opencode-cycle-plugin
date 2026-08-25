@@ -15,7 +15,12 @@ import {
   prepareDesktopCertificationLoad,
   verifyDesktopModuleRuntime,
   waitForDesktopActivation,
+  type DesktopModuleRuntimeEvidenceMaterial,
 } from "./desktop-certification.js"
+import {
+  openOfficialRuntimeEvidenceDirectory,
+  type OfficialRuntimeEvidenceSession,
+} from "./official-runtime-evidence.js"
 import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
 
 const root = fileURLToPath(new URL("../../", import.meta.url))
@@ -28,6 +33,9 @@ const extracted = join(scratch, "extracted")
 const nativeArtifacts = join(scratch, "native")
 const secondPack = join(scratch, "second-pack")
 let proof: ReturnType<typeof Bun.spawn> | undefined
+let officialEvidence: OfficialRuntimeEvidenceSession | undefined
+let officialEvidencePublished = false
+let runtimeEvidence: DesktopModuleRuntimeEvidenceMaterial | undefined
 
 async function run(command: string[], cwd: string): Promise<string> {
   const child = Bun.spawn(command, { cwd, stderr: "inherit", stdout: "pipe" })
@@ -131,8 +139,22 @@ process.exit(await child.exited)
     throw new Error("Official Electron runtime path must be canonical and absolute")
   }
   await access(runtime)
+  const officialEvidenceDirectory = process.env.CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR
+  if (officialEvidenceDirectory !== undefined) {
+    officialEvidence = await openOfficialRuntimeEvidenceDirectory(officialEvidenceDirectory)
+  }
   await verifyDesktopModuleRuntime({
     binding,
+    ...(officialEvidence === undefined
+      ? {}
+      : {
+          captureEvidence: async (material: DesktopModuleRuntimeEvidenceMaterial) => {
+            if (runtimeEvidence !== undefined) {
+              throw new Error("Official Electron runtime evidence was captured more than once")
+            }
+            runtimeEvidence = material
+          },
+        }),
     cwd: project,
     environment,
     hostVersion: "1.18.21",
@@ -212,6 +234,50 @@ process.exit(await child.exited)
   ) {
     throw new Error("Packed plugin host proof diagnostics are incomplete")
   }
+  if (officialEvidence !== undefined) {
+    if (runtimeEvidence === undefined) {
+      throw new Error("Official Electron runtime evidence material was not captured")
+    }
+    const receipt = runtimeEvidence.receipt
+    await officialEvidence.publish({
+      binding: {
+        electronVersion: receipt.electronVersion,
+        nativePackageSha256: binding.nativePackageSha256,
+        nodeVersion: receipt.nodeVersion,
+        pluginPackageSha256: binding.pluginPackageSha256,
+        revision: binding.revision,
+        runtimeExecutableSha256: receipt.runtimeExecutableSha256,
+        runtimeProductVersion: receipt.runtimeProductVersion,
+      },
+      material: {
+        "candidate-entry.js": runtimeEvidence.candidateEntry,
+        "candidate-wrapper.js": runtimeEvidence.loader,
+        "dependency-tree-manifest.json": jsonLine({
+          contentTreeSha256: runtimeEvidence.contentTreeSha256,
+          dependencyTree: runtimeEvidence.dependencyTree,
+          files: runtimeEvidence.contentManifest,
+          schemaVersion: 1,
+          type: "opencode-cycle-desktop-dependency-tree-manifest",
+        }),
+        "desktop-runtime-diagnostics.jsonl": runtimeEvidence.diagnostics,
+        "desktop-runtime-linker.mjs": runtimeEvidence.linker,
+        "desktop-runtime-result.json": runtimeEvidence.result,
+        "runtime-output-summary.json": jsonLine({
+          exitCode: runtimeEvidence.execution.exitCode,
+          outputExceeded: runtimeEvidence.execution.outputExceeded,
+          schemaVersion: 1,
+          stderrBytes: runtimeEvidence.execution.stderr.byteLength,
+          stderrSha256: digestBytes(runtimeEvidence.execution.stderr),
+          stdoutBytes: runtimeEvidence.execution.stdout.byteLength,
+          stdoutSha256: digestBytes(runtimeEvidence.execution.stdout),
+          timedOut: runtimeEvidence.execution.timedOut,
+          type: "opencode-cycle-official-electron-runtime-output",
+        }),
+        "runtime-receipt.json": jsonLine(receipt),
+      },
+    })
+    officialEvidencePublished = true
+  }
 } finally {
   if (proof !== undefined && proof.exitCode === null) {
     const release = join(scratch, "certification", "host-proof-release")
@@ -222,6 +288,9 @@ process.exit(await child.exited)
       await proof.exited
     }
   }
+  if (officialEvidence !== undefined && !officialEvidencePublished) {
+    await officialEvidence.abort()
+  }
   await Promise.all([
     rm(scratch, { force: true, recursive: true }),
     rm(launcherTemporary, { force: true, recursive: true }),
@@ -229,7 +298,13 @@ process.exit(await child.exited)
 }
 
 async function digest(path: string): Promise<string> {
-  return createHash("sha256")
-    .update(Buffer.from(await Bun.file(path).arrayBuffer()))
-    .digest("hex")
+  return digestBytes(Buffer.from(await Bun.file(path).arrayBuffer()))
+}
+
+function digestBytes(value: Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex")
+}
+
+function jsonLine(value: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(value)}\n`)
 }

@@ -55,6 +55,13 @@ test("open dependency proof exposes a linker input built from retained verified 
     const input = session.openLinkerInput()
     try {
       expect(input.fileCount).toBe(4)
+      expect(session.contentManifest).toHaveLength(4)
+      expect(session.contentManifest.map((file) => file.path)).toEqual([
+        "dist/index.js",
+        "node_modules/fixture-dependency/index.js",
+        "node_modules/fixture-dependency/package.json",
+        "package.json",
+      ])
       expect(input.contentTreeSha256).toMatch(/^[0-9a-f]{64}$/u)
       const chunks: Buffer[] = []
       for await (const chunk of input.createReadStream()) chunks.push(Buffer.from(chunk))

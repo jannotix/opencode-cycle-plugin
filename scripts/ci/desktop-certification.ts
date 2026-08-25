@@ -46,6 +46,7 @@ import { cleanupCertifiedDaemon, type CertifiedDaemonCleanup } from "./certified
 import {
   openDesktopDependencyTreeVerification,
   verifyDesktopDependencyTree,
+  type DesktopDependencyContentFile,
   type DesktopDependencyTreeReceipt,
 } from "./desktop-dependency-tree.js"
 
@@ -1474,8 +1475,22 @@ export interface DesktopModuleRuntimeExecution {
   readonly timedOut: boolean
 }
 
+export interface DesktopModuleRuntimeEvidenceMaterial {
+  readonly candidateEntry: Buffer
+  readonly contentManifest: readonly DesktopDependencyContentFile[]
+  readonly contentTreeSha256: string
+  readonly dependencyTree: DesktopDependencyTreeReceipt
+  readonly diagnostics: Buffer
+  readonly execution: DesktopModuleRuntimeExecution
+  readonly linker: Buffer
+  readonly loader: Buffer
+  readonly receipt: DesktopModuleRuntimeReceipt
+  readonly result: Buffer
+}
+
 interface DesktopModuleRuntimeInput {
   readonly binding: DesktopCertificationBinding
+  readonly captureEvidence?: (material: DesktopModuleRuntimeEvidenceMaterial) => Promise<void>
   readonly cwd: string
   readonly environment: NodeJS.ProcessEnv
   readonly hostVersion: string
@@ -1713,18 +1728,84 @@ export async function verifyDesktopModuleRuntime(
       clearTimeout(timeout)
     }
     const stableTree = await dependencyVerification.verifyAndClose()
-    return validateDesktopModuleRuntimeGuard(plan, {
+    const execution = {
       exitCode,
       outputExceeded,
       stderr,
       stdout,
       timedOut,
-    }, stableTree)
+    }
+    const receipt = await validateDesktopModuleRuntimeGuard(plan, execution, stableTree)
+    if (input.captureEvidence !== undefined) {
+      await input.captureEvidence(await captureDesktopModuleRuntimeEvidence(
+        plan,
+        execution,
+        receipt,
+        stableTree,
+        dependencyVerification.contentManifest,
+        dependencyVerification.contentTreeSha256,
+      ))
+    }
+    return receipt
   } catch (error) {
     await dependencyVerification.abort()
     throw error
   } finally {
     await graphInput?.close().catch(() => undefined)
+  }
+}
+
+async function captureDesktopModuleRuntimeEvidence(
+  plan: DesktopModuleRuntimeGuardPlan,
+  execution: DesktopModuleRuntimeExecution,
+  receipt: DesktopModuleRuntimeReceipt,
+  dependencyTree: DesktopDependencyTreeReceipt,
+  contentManifest: readonly DesktopDependencyContentFile[],
+  contentTreeSha256: string,
+): Promise<DesktopModuleRuntimeEvidenceMaterial> {
+  const [candidate, diagnostics, linker, loader, result] = await Promise.all([
+    readVerifiedRegularFile(plan.expected.candidateEntry, {
+      maxBytes: 4 * 1024 * 1024,
+      root: dirname(plan.expected.candidateEntry),
+    }),
+    readVerifiedRegularFile(plan.runtimeGuardDiagnosticsFile, {
+      maxBytes: 64 * 1024,
+      root: plan.binding.root,
+    }),
+    readVerifiedRegularFile(plan.expected.linker, {
+      maxBytes: 2 * 1024 * 1024,
+      root: dirname(plan.expected.linker),
+    }),
+    readVerifiedRegularFile(plan.expected.loader, {
+      maxBytes: 256 * 1024,
+      root: dirname(plan.expected.loader),
+    }),
+    readVerifiedRegularFile(plan.expected.resultFile, {
+      maxBytes: 64 * 1024,
+      root: plan.binding.root,
+    }),
+  ])
+  if (
+    candidate.sha256 !== receipt.candidateEntrySha256 ||
+    linker.sha256 !== receipt.linkerSha256 ||
+    loader.sha256 !== receipt.loaderSha256 ||
+    contentTreeSha256 !== receipt.verifiedContentTreeSha256
+  ) throw new Error("Official Desktop runtime evidence material changed before capture")
+  return {
+    candidateEntry: candidate.content,
+    contentManifest,
+    contentTreeSha256,
+    dependencyTree,
+    diagnostics: diagnostics.content,
+    execution: {
+      ...execution,
+      stderr: Buffer.from(execution.stderr),
+      stdout: Buffer.from(execution.stdout),
+    },
+    linker: linker.content,
+    loader: loader.content,
+    receipt,
+    result: result.content,
   }
 }
 

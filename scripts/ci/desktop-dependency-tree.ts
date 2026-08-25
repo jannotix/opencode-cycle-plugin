@@ -29,10 +29,17 @@ export interface DesktopDependencyTreeReceipt {
 
 export interface DesktopDependencyTreeVerification {
   readonly abort: () => Promise<void>
+  readonly contentManifest: readonly DesktopDependencyContentFile[]
   readonly contentTreeSha256: string
   readonly openLinkerInput: () => DesktopDependencyLinkerInput
   readonly receipt: DesktopDependencyTreeReceipt
   readonly verifyAndClose: () => Promise<DesktopDependencyTreeReceipt>
+}
+
+export interface DesktopDependencyContentFile {
+  readonly path: string
+  readonly sha256: string
+  readonly size: number
 }
 
 export interface DesktopDependencyLinkerInput {
@@ -48,6 +55,7 @@ interface HeldDependencyFile {
   readonly metadata: string
   readonly path: string
   readonly relativePath: string
+  readonly sha256: string
 }
 
 interface DependencyMembershipSnapshot {
@@ -149,6 +157,13 @@ export async function openDesktopDependencyTreeVerification(
     }
     return {
       abort: close,
+      contentManifest: [...held]
+        .map((file) => ({
+          path: file.relativePath,
+          sha256: file.sha256,
+          size: file.content.byteLength,
+        }))
+        .sort((left, right) => left.path.localeCompare(right.path)),
       contentTreeSha256: initial.contentTreeSha256,
       openLinkerInput() {
         if (closed) throw new Error("Desktop dependency verification handles are closed")
@@ -269,7 +284,7 @@ async function captureDependencyMembership(
       )
       contentRecords.push(`${name}\0${content.byteLength}\0${sha256}\n`)
       if (held === undefined) await handle.close()
-      else held.push({ content, handle, metadata, path, relativePath: name })
+      else held.push({ content, handle, metadata, path, relativePath: name, sha256 })
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error

@@ -43,6 +43,8 @@ On Windows, task verification is hosted by the packaged release `workflowd`. It 
 
 The packed-plugin gate never fabricates Electron or Node identity. Set `CYCLE_OFFICIAL_ELECTRON_RUNTIME` to the canonical absolute path of the retained official runtime when running `bun run test:package`; the gate fails closed when that runtime is absent.
 
+A final authoritative package gate must also set `CYCLE_OFFICIAL_ELECTRON_EVIDENCE_DIR` to an absent direct child of the operating-system temporary directory whose basename starts with `opencode-cycle-official-evidence-`. The gate creates that directory without clobbering, captures the exact linker result and runtime receipt, diagnostics, bundled linker, candidate entry and wrapper, full held-content tree manifest, and zero-output summary, then publishes a digest-bound exit receipt before package scratch cleanup. Each file is atomically published and the entire directory is removed if publication or schema validation fails. Running the package gate without this evidence variable retains its existing non-authoritative behavior and does not publish durable proof.
+
 ## Publication order
 
 Native packages are published before the plugin so its optional platform dependency is resolvable. The plugin is published last. GitHub release creation occurs only after package publication succeeds. npm and GitHub publication use a protected `release` environment; local developer machines are not an authorized publication path.
