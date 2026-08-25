@@ -490,6 +490,7 @@ function assertPackedManifestAllowlist(manifest: PackedManifest): void {
     ? {
         "@opencode-ai/plugin": "1.18.21",
         "@opencode-ai/sdk": "1.18.21",
+        "@puppeteer/browsers": "3.2.0",
         "puppeteer-core": "25.6.0",
       }
     : {}

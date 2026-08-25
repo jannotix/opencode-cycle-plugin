@@ -487,20 +487,22 @@ test("Desktop runtime guard uses the trusted non-evaluating linker under the pin
       node as string,
       "--no-warnings",
       "--experimental-vm-modules",
-      "--experimental-import-meta-resolve",
       plan.expected.linker,
     ])
-    expect(linkerSource).toContain("await entry.link(")
+    expect(linkerSource).toContain("OPENCODE_CYCLE_GRAPH_V1")
+    expect(linkerSource).toContain("Bundled dependency: acorn@8.15.0")
+    expect(linkerSource).toContain("MIT License")
     expect(linkerSource).toContain("SourceTextModule")
     expect(linkerSource).not.toContain(".evaluate(")
     expect(linkerSource).not.toContain("fork(")
     expect(linkerSource).not.toContain("createHmac")
-    expect(linkerSource).not.toContain("await import(pathToFileURL(expected.candidateEntry)")
+    expect(linkerSource).not.toMatch(/from["']acorn["']/u)
     expect(plan.expected.runtimeExecutableSha256).toBe(
       "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999",
     )
     expect(plan.expected.runtimeProductVersion).toBe("1.18.21.0")
     expect(plan.expected.dependencyTree).toEqual(fixture.prepared.dependencyTree)
+    expect(plan.expected.verifiedContentTreeSha256).toMatch(/^[0-9a-f]{64}$/u)
     expect(plan.expected.linkerSha256).toMatch(/^[0-9a-f]{64}$/u)
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })

@@ -62,6 +62,25 @@ test("plugin package accepts the exact production module allowlist", () => {
   ).not.toThrow()
 })
 
+test("plugin package accepts only the declared generated CommonJS runtime companion", () => {
+  const base = [
+    "package/LICENSE",
+    "package/NOTICE",
+    "package/dist/index.js",
+    "package/package.json",
+  ]
+  expect(() => validatePluginListing(
+    [...base, "package/dist/browser/managed-browser-session.cjs"],
+    ["index.js"],
+    ["browser/managed-browser-session.cjs"],
+  )).not.toThrow()
+  expect(() => validatePluginListing(
+    base,
+    ["index.js"],
+    ["browser/managed-browser-session.cjs"],
+  )).toThrow("managed-browser-session.cjs")
+})
+
 test("plugin entry builds and imports in the Desktop Node runtime", async () => {
   const root = fileURLToPath(new URL("../../", import.meta.url))
   const output = await mkdtemp(join(root, "target", "node-runtime-load-"))

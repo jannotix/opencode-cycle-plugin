@@ -2,6 +2,8 @@ import { spawn } from "node:child_process"
 import { isAbsolute, resolve } from "node:path"
 import type { Readable } from "node:stream"
 
+import { terminateWindowsVerificationJobProcess } from "./task-verification-windows-control.js"
+
 const REQUEST_ENV = "CYCLE_VERIFICATION_JOB_REQUEST"
 
 export interface WindowsVerificationJobHost {
@@ -59,15 +61,7 @@ export function spawnWindowsVerificationJobHost(
   })
   let termination: Promise<void> | undefined
   const terminate = (): Promise<void> => {
-    termination ??= (async () => {
-      if (child.exitCode !== null || child.signalCode !== null) return
-      await new Promise<void>((resolveDelivery, reject) => {
-        child.stdin?.end("terminate\n", (error?: Error | null) => {
-          if (error === undefined || error === null) resolveDelivery()
-          else reject(error)
-        })
-      })
-    })()
+    termination ??= terminateWindowsVerificationJobProcess(child, exited)
     return termination
   }
   return {

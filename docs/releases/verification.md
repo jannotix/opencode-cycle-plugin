@@ -10,7 +10,9 @@ Version 1.0.0 supports and certifies OpenCode Desktop on Windows x64 and Linux x
 
 A release contains the JavaScript plugin and native `workflowd` packages for Windows x64 and Linux x64. It also publishes `SHA256SUMS`, a CycloneDX 1.6 SBOM, a release manifest, Windows and Linux Desktop certification records, scale evidence and build-provenance attestations.
 
-Production archives are allowlisted. The plugin archive contains compiled ESM, its manifest, `LICENSE` and `NOTICE`. A native archive contains one stripped executable, its manifest, `LICENSE` and `NOTICE`. Tests, fixtures, examples, benchmarks, source, source maps, documentation, logs, databases, caches, CI files and debug output are rejected.
+Production archives are allowlisted. The plugin archive contains compiled ESM, one exact generated CommonJS browser-runtime companion, its manifest, `LICENSE` and `NOTICE`. A native archive contains one stripped executable, its manifest, `LICENSE` and `NOTICE`. Tests, fixtures, examples, benchmarks, source, source maps, documentation, logs, databases, caches, CI files and debug output are rejected.
+
+The browser-runtime companion bundles only the pinned Puppeteer code used by the managed browser. Exact `@puppeteer/browsers` runtime subpaths remain external and that package is a direct pinned plugin dependency, so its optional-peer declarations remain authoritative. The unrelated `@puppeteer/browsers` CLI export and its Yargs loader graph never enter the candidate graph.
 
 ## Verify a downloaded candidate
 
@@ -35,7 +37,9 @@ Supported platform values are `windows-x64` and `linux-x64`. The command downloa
 
 For an offline or repeated run, append `--desktop-asset <path>`. A supplied file is copied into the disposable certification workspace and must match the same pinned byte count and SHA-256; local input never bypasses authenticity or compatibility checks.
 
-Before Desktop launch, certification materializes a private copyfile dependency tree inside the isolated plugin root and rejects ancestor resolution, links, hard links and path escapes. The official Electron/Node process runs a trusted supervisor, which imports the candidate only in a separate same-runtime child and accepts one challenge-bound acknowledgement after import. Desktop evidence retains the supervisor, child wrapper, runtime executable, generated loader, candidate entry and dependency-tree digests.
+Before Desktop launch, certification materializes a private copyfile dependency tree inside the isolated plugin root and rejects ancestor resolution, links, hard links and path escapes. It opens and retains every graph-file handle and verified byte buffer, then streams only those held bytes to one self-contained trusted linker under the exact pinned official Electron/Node runtime. The linker bundles the exact pinned Acorn parser, parses ESM and CommonJS completely, follows only statically provable module edges, links every reachable ESM module with `vm.SourceTextModule`, and never evaluates candidate code. Nonliteral or aliased loaders, generated evaluation, forbidden builtins, unresolved required edges and malformed optional-package paths fail closed. CommonJS, JSON and resolution-only asset counts are recorded separately from actually linked ESM modules. Pre-link and post-link handle metadata, path identity, root membership and full-tree hashes must remain identical.
+
+On Windows, task verification is hosted by the packaged release `workflowd`. It creates the requested process suspended, assigns it to a private Job Object with kill-on-close before resume, preserves exact standard streams and closes the Job after natural exit or bounded terminate control. Assignment failure terminates and waits on the exact suspended process handle; a stalled control path terminates the exact live host handle and waits, causing Job close to remove the complete contained tree. Linux keeps the existing detached process-group boundary.
 
 The packed-plugin gate never fabricates Electron or Node identity. Set `CYCLE_OFFICIAL_ELECTRON_RUNTIME` to the canonical absolute path of the retained official runtime when running `bun run test:package`; the gate fails closed when that runtime is absent.
 

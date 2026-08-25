@@ -58,7 +58,7 @@ process.exit(await child.exited)
   const native = await packageNative(
     root,
     nativeTarget,
-    join(root, "target", "debug", executable),
+    join(root, "target", "release", executable),
     nativeArtifacts,
   )
   await run(["bun", "pm", "pack", "--destination", scratch], packageRoot)
@@ -78,7 +78,7 @@ process.exit(await child.exited)
   const unexpected = listing.find(
     (path) =>
       !["package/package.json", "package/LICENSE", "package/NOTICE"].includes(path) &&
-      !/^package\/dist\/(?:[^/]+\/)*[^/]+\.js$/u.test(path),
+      !/^package\/dist\/(?:[^/]+\/)*[^/]+\.(?:cjs|js)$/u.test(path),
   )
   if (unexpected !== undefined) {
     throw new Error(`Packed plugin contains non-production file ${unexpected}`)
@@ -117,7 +117,7 @@ process.exit(await child.exited)
     dataDirectory,
     environment,
     hostVersion: "1.18.21",
-    nativeExecutable: join(root, "target", "debug", executable),
+    nativeExecutable: join(root, "target", "release", executable),
     packedPlugin: installedPackage,
     platform,
     scratch,

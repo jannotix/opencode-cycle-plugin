@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto"
+import { spawn as spawnChildProcess } from "node:child_process"
 import { createWriteStream } from "node:fs"
 import {
   chmod,
@@ -51,7 +52,7 @@ import {
 export { openDesktopDependencyTreeVerification, verifyDesktopDependencyTree }
 
 import {
-  desktopRuntimeLinkerSource,
+  bundledDesktopRuntimeLinker,
   type DesktopRuntimeLinkerExpected,
 } from "./desktop-runtime-linker.js"
 
@@ -157,7 +158,7 @@ export interface DesktopModuleRuntimeReceipt {
   readonly electronVersion: string
   readonly graphFileCount: number
   readonly graphSha256: string
-  readonly linkedModuleCount: number
+  readonly linkedEsmModuleCount: number
   readonly linkerSha256: string
   readonly loaderSha256: string
   readonly moduleLinked: true
@@ -168,8 +169,14 @@ export interface DesktopModuleRuntimeReceipt {
   readonly revision: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
-  readonly schemaVersion: 3
+  readonly schemaVersion: 4
+  readonly suppressedOptionalRootCount: number
   readonly type: typeof DESKTOP_RUNTIME_GUARD_TYPE
+  readonly unsafeModuleLoadingRejected: true
+  readonly verifiedAssetFileCount: number
+  readonly verifiedCommonJsModuleCount: number
+  readonly verifiedContentTreeSha256: string
+  readonly verifiedJsonModuleCount: number
 }
 
 export const SUPPORTED_DESKTOP_CERTIFICATION_PLATFORMS = CERTIFIED_PLATFORMS
@@ -1480,6 +1487,7 @@ interface DesktopModuleRuntimeInput {
 
 export async function prepareDesktopModuleRuntimeGuard(
   input: DesktopModuleRuntimeInput,
+  verifiedContentTreeSha256?: string,
 ): Promise<DesktopModuleRuntimeGuardPlan> {
   if (
     input.hostVersion !== OPENCODE_DESKTOP_VERSION ||
@@ -1488,6 +1496,8 @@ export async function prepareDesktopModuleRuntimeGuard(
     input.runtimeCommand.some((argument) => typeof argument !== "string" || argument.length === 0) ||
     !isDesktopHarnessPath(input.cwd, input.scratch)
   ) throw new Error("Official Desktop module runtime guard binding is invalid")
+  const contentTreeSha256 = verifiedContentTreeSha256 ??
+    await desktopContentTreeSha256(input.prepared.installedPlugin)
   const [manifestFile, configFile] = await Promise.all([
     readVerifiedRegularFile(join(input.prepared.installedPlugin, "package.json"), {
       maxBytes: 64 * 1024,
@@ -1557,8 +1567,9 @@ export async function prepareDesktopModuleRuntimeGuard(
     resultFile,
     runtimeExecutableSha256: runtime.sha256,
     runtimeProductVersion: runtime.productVersion,
+    verifiedContentTreeSha256: contentTreeSha256,
   }
-  await writeFile(linker, desktopRuntimeLinkerSource(linkerExpected), {
+  await writeFile(linker, await bundledDesktopRuntimeLinker(linkerExpected), {
     encoding: "utf8",
     flag: "wx",
     mode: 0o600,
@@ -1590,7 +1601,6 @@ export async function prepareDesktopModuleRuntimeGuard(
       ...input.runtimeCommand,
       "--no-warnings",
       "--experimental-vm-modules",
-      "--experimental-import-meta-resolve",
       linker,
     ],
     cwd: resolve(input.cwd),
@@ -1619,38 +1629,65 @@ export async function prepareDesktopModuleRuntimeGuard(
   }
 }
 
+async function desktopContentTreeSha256(installedPlugin: string): Promise<string> {
+  const verification = await openDesktopDependencyTreeVerification(installedPlugin)
+  try {
+    return verification.contentTreeSha256
+  } finally {
+    await verification.abort()
+  }
+}
+
 export async function verifyDesktopModuleRuntime(
   input: DesktopModuleRuntimeInput,
 ): Promise<DesktopModuleRuntimeReceipt> {
   const dependencyVerification = await openDesktopDependencyTreeVerification(
     input.prepared.installedPlugin,
   )
+  let graphInput: Awaited<ReturnType<typeof dependencyVerification.openLinkerInput>> | undefined
   try {
     if (
       JSON.stringify(dependencyVerification.receipt) !==
         JSON.stringify(input.prepared.dependencyTree)
     ) throw new Error("Official Desktop module runtime dependency handles changed")
-    const plan = await prepareDesktopModuleRuntimeGuard(input)
+    const plan = await prepareDesktopModuleRuntimeGuard(
+      input,
+      dependencyVerification.contentTreeSha256,
+    )
     if (
       JSON.stringify(plan.expected.dependencyTree) !==
         JSON.stringify(dependencyVerification.receipt)
     ) throw new Error("Official Desktop module runtime dependency proof is inconsistent")
-    const child = Bun.spawn([...plan.command], {
+    graphInput = dependencyVerification.openLinkerInput()
+    if (
+      graphInput.contentTreeSha256 !== plan.expected.verifiedContentTreeSha256 ||
+      graphInput.fileCount < plan.expected.dependencyTree.dependencyFileCount
+    ) throw new Error("Official Desktop module runtime held input is inconsistent")
+    const [executable, ...argumentsList] = plan.command
+    if (executable === undefined) throw new Error("Official Desktop module runtime command is empty")
+    const child = spawnChildProcess(executable, argumentsList, {
       cwd: plan.cwd,
       env: plan.environment,
-      stderr: "pipe",
-      stdout: "pipe",
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+    })
+    const inputTransfer = pipeline(graphInput.createReadStream(), child.stdin!).catch((error) => {
+      child.kill()
+      throw error
+    })
+    const childExited = new Promise<number>((resolveExit, reject) => {
+      child.once("error", reject)
+      child.once("exit", (code) => resolveExit(code ?? 1))
     })
     let timedOut = false
     let timeout: ReturnType<typeof setTimeout> | undefined
     const exit = Promise.race([
-      child.exited,
+      childExited,
       new Promise<number>((resolveExit) => {
         timeout = setTimeout(() => {
           timedOut = true
           child.kill()
-          void child.exited.then(resolveExit)
+          void childExited.then(resolveExit)
         }, 30_000)
       }),
     ])
@@ -1661,15 +1698,17 @@ export async function verifyDesktopModuleRuntime(
     try {
       ;[exitCode, stdout, stderr] = await Promise.all([
         exit,
-        readBoundedRuntimeOutput(child.stdout, () => {
+        readBoundedNodeRuntimeOutput(child.stdout!, () => {
           outputExceeded = true
           child.kill()
         }),
-        readBoundedRuntimeOutput(child.stderr, () => {
+        readBoundedNodeRuntimeOutput(child.stderr!, () => {
           outputExceeded = true
           child.kill()
         }),
-      ])
+        inputTransfer,
+      ]).then(([code, standardOutput, standardError]) =>
+        [code, standardOutput, standardError] as const)
     } finally {
       clearTimeout(timeout)
     }
@@ -1684,6 +1723,8 @@ export async function verifyDesktopModuleRuntime(
   } catch (error) {
     await dependencyVerification.abort()
     throw error
+  } finally {
+    await graphInput?.close().catch(() => undefined)
   }
 }
 
@@ -1758,10 +1799,11 @@ export async function validateDesktopModuleRuntimeGuard(
     dependencyTotalBytes: tree.dependencyTotalBytes,
     dependencyTreeSha256: tree.dependencyTreeSha256,
     unsafeDynamicImportsRejected: true,
+    unsafeModuleLoadingRejected: true,
     electronVersion: linkReceipt.electronVersion,
     graphFileCount: linkReceipt.graphFileCount,
     graphSha256: linkReceipt.graphSha256,
-    linkedModuleCount: linkReceipt.linkedModuleCount,
+    linkedEsmModuleCount: linkReceipt.linkedEsmModuleCount,
     linkerSha256: plan.expected.linkerSha256,
     loaderSha256: plan.expected.loaderSha256,
     moduleLinked: true,
@@ -1772,8 +1814,13 @@ export async function validateDesktopModuleRuntimeGuard(
     revision: plan.expected.binding.revision,
     runtimeExecutableSha256: linkReceipt.runtimeExecutableSha256,
     runtimeProductVersion: linkReceipt.runtimeProductVersion,
-    schemaVersion: 3,
+    schemaVersion: 4,
+    suppressedOptionalRootCount: linkReceipt.suppressedOptionalRootCount,
     type: DESKTOP_RUNTIME_GUARD_TYPE,
+    verifiedAssetFileCount: linkReceipt.verifiedAssetFileCount,
+    verifiedCommonJsModuleCount: linkReceipt.verifiedCommonJsModuleCount,
+    verifiedContentTreeSha256: linkReceipt.verifiedContentTreeSha256,
+    verifiedJsonModuleCount: linkReceipt.verifiedJsonModuleCount,
   }
 }
 
@@ -1784,15 +1831,20 @@ function assertDesktopModuleLinkReceipt(
   readonly electronVersion: string
   readonly graphFileCount: number
   readonly graphSha256: string
-  readonly linkedModuleCount: number
+  readonly linkedEsmModuleCount: number
   readonly nodeVersion: string
   readonly runtimeExecutableSha256: string
   readonly runtimeProductVersion: string
+  readonly suppressedOptionalRootCount: number
+  readonly verifiedAssetFileCount: number
+  readonly verifiedCommonJsModuleCount: number
+  readonly verifiedContentTreeSha256: string
+  readonly verifiedJsonModuleCount: number
 } {
   if (
     !isRecord(value) ||
     Object.keys(value).sort().join(",") !==
-      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,graphFileCount,graphSha256,linkedModuleCount,nodeVersion,runtimeExecutableSha256,runtimeProductVersion,schemaVersion,type,unsafeDynamicImportsRejected" ||
+      "candidateDefaultExportLinked,candidateEntrySha256,candidateEvaluated,dependencyTreeSha256,electronVersion,graphFileCount,graphSha256,linkedEsmModuleCount,nodeVersion,runtimeExecutableSha256,runtimeProductVersion,schemaVersion,suppressedOptionalRootCount,type,unsafeDynamicImportsRejected,unsafeModuleLoadingRejected,verifiedAssetFileCount,verifiedCommonJsModuleCount,verifiedContentTreeSha256,verifiedJsonModuleCount" ||
     value.candidateDefaultExportLinked !== true ||
     value.candidateEntrySha256 !== expected.candidateEntrySha256 ||
     value.candidateEvaluated !== false ||
@@ -1804,13 +1856,29 @@ function assertDesktopModuleLinkReceipt(
     value.graphFileCount < 1 ||
     typeof value.graphSha256 !== "string" ||
     !/^[0-9a-f]{64}$/u.test(value.graphSha256) ||
-    typeof value.linkedModuleCount !== "number" ||
-    !Number.isSafeInteger(value.linkedModuleCount) ||
-    value.linkedModuleCount < value.graphFileCount ||
+    typeof value.linkedEsmModuleCount !== "number" ||
+    !Number.isSafeInteger(value.linkedEsmModuleCount) ||
+    value.linkedEsmModuleCount < 1 ||
+    typeof value.verifiedCommonJsModuleCount !== "number" ||
+    !Number.isSafeInteger(value.verifiedCommonJsModuleCount) ||
+    value.verifiedCommonJsModuleCount < 0 ||
+    typeof value.verifiedJsonModuleCount !== "number" ||
+    !Number.isSafeInteger(value.verifiedJsonModuleCount) ||
+    value.verifiedJsonModuleCount < 0 ||
+    typeof value.verifiedAssetFileCount !== "number" ||
+    !Number.isSafeInteger(value.verifiedAssetFileCount) ||
+    value.verifiedAssetFileCount < 0 ||
+    value.linkedEsmModuleCount + value.verifiedCommonJsModuleCount +
+      value.verifiedJsonModuleCount + value.verifiedAssetFileCount !== value.graphFileCount ||
+    typeof value.suppressedOptionalRootCount !== "number" ||
+    !Number.isSafeInteger(value.suppressedOptionalRootCount) ||
+    value.suppressedOptionalRootCount < 0 ||
+    value.verifiedContentTreeSha256 !== expected.verifiedContentTreeSha256 ||
+    value.unsafeModuleLoadingRejected !== true ||
     value.nodeVersion !== expected.nodeVersion ||
     value.runtimeExecutableSha256 !== expected.runtimeExecutableSha256 ||
     value.runtimeProductVersion !== expected.runtimeProductVersion ||
-    value.schemaVersion !== 1 ||
+    value.schemaVersion !== 2 ||
     value.type !== "opencode-cycle-desktop-module-link"
   ) throw new Error("Official Desktop module link receipt is invalid")
 }
@@ -1863,6 +1931,24 @@ async function readBoundedRuntimeOutput(
       break
     }
     const chunk = Buffer.from(value)
+    chunks.push(chunk)
+    bytes += chunk.byteLength
+  }
+  return Buffer.concat(chunks)
+}
+
+async function readBoundedNodeRuntimeOutput(
+  stream: Readable,
+  onLimit: () => void,
+): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const value of stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array)
+    if (bytes + chunk.byteLength > 64 * 1024) {
+      onLimit()
+      break
+    }
     chunks.push(chunk)
     bytes += chunk.byteLength
   }

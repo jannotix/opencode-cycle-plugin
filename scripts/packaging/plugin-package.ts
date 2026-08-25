@@ -6,6 +6,8 @@ import { basename, join, resolve } from "node:path"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
 import { inspectTarGz } from "./tar-archive.js"
 
+const GENERATED_RUNTIME_MODULES = ["browser/managed-browser-session.cjs"] as const
+
 const NON_PRODUCTION_PATH =
   /(?:^|\/)(?:(?:test|tests|example|examples|fixture|fixtures|debug|coverage|docs|\.github)(?:\/|$)|[^/]*(?:\.(?:test|spec)(?:\.|$)|_(?:test|spec)_)[^/]*)|\.map$/iu
 
@@ -37,7 +39,7 @@ export async function packagePlugin(root: string, output: string): Promise<Plugi
       throw new Error("Plugin package is not reproducible from identical inputs")
     }
     const listing = inspectTarGz(await readFile(archive)).map((entry) => entry.name)
-    validatePluginListing(listing, sourceModules)
+    validatePluginListing(listing, sourceModules, GENERATED_RUNTIME_MODULES)
     const checksum = await digest(archive)
     await writeFile(`${archive}.sha256`, `${checksum}  ${basename(archive)}\n`, "utf8")
     return { archive, checksum }
@@ -59,6 +61,7 @@ export async function cleanPluginBuildOutput(packageRoot: string): Promise<void>
 export function validatePluginListing(
   listing: readonly string[],
   sourceModules: readonly string[],
+  generatedRuntimeModules: readonly string[] = [],
 ): void {
   const unique = new Set(listing)
   if (unique.size !== listing.length) {
@@ -74,6 +77,7 @@ export function validatePluginListing(
     "package/NOTICE",
     "package/package.json",
     ...sourceModules.map((path) => `package/dist/${path}`),
+    ...generatedRuntimeModules.map((path) => `package/dist/${path}`),
   ].sort()
   const actual = [...listing].sort()
   const unexpected = actual.find((path) => !expected.includes(path))

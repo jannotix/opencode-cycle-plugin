@@ -5,7 +5,7 @@ import type { Socket } from "node:net"
 import { isAbsolute, join, posix, resolve, win32 } from "node:path"
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { once } from "node:events"
-import { createRequire } from "node:module"
+import { fileURLToPath } from "node:url"
 
 import type { ReviewVerdictInput } from "./orchestration/reviewers.js"
 import type { ArbiterVerdictInput } from "./orchestration/arbiter.js"
@@ -16,7 +16,6 @@ const AUTH_DOMAIN = Buffer.from("opencode-cycle-ipc-auth-v1")
 const CANDIDATE_OPERATION_TIMEOUT_MILLIS = 30 * 60_000
 const VERIFICATION_RESPONSE_TIMEOUT_MILLIS = 24 * 60 * 60_000
 const HEALTH_WAIT_MS = 15_000
-const require = createRequire(import.meta.url)
 
 export interface ControlPlaneHealth {
   readonly product_version: string
@@ -1502,7 +1501,10 @@ export function nativePackageName(platform: NodeJS.Platform, architecture: strin
 function packagedBinaryPath(platform: NodeJS.Platform, architecture: string): string {
   const packageName = nativePackageName(platform, architecture)
   try {
-    return require.resolve(packageName)
+    const resolved = platform === "linux"
+      ? import.meta.resolve("@opencode-cycle/native-linux-x64")
+      : import.meta.resolve("@opencode-cycle/native-win32-x64")
+    return fileURLToPath(resolved)
   } catch (cause) {
     throw new ControlPlaneError(
       `required native package ${packageName} is not installed; reinstall opencode-cycle for this platform`,

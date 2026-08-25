@@ -10,12 +10,14 @@ import {
   type FileHandle,
 } from "node:fs/promises"
 import { dirname, join, relative, resolve, sep } from "node:path"
+import { Readable } from "node:stream"
 
 import { assertNoReparseMaterial, assertStableOpenFile } from "../release/verified-file.js"
 
 const MAX_DEPENDENCY_FILES = 50_000
 const MAX_DEPENDENCY_FILE_BYTES = 64 * 1024 * 1024
 const MAX_DEPENDENCY_TREE_BYTES = 512 * 1024 * 1024
+export const DESKTOP_LINKER_INPUT_MAGIC = "OPENCODE_CYCLE_GRAPH_V1\0"
 
 export interface DesktopDependencyTreeReceipt {
   readonly dependencyFileCount: number
@@ -27,18 +29,31 @@ export interface DesktopDependencyTreeReceipt {
 
 export interface DesktopDependencyTreeVerification {
   readonly abort: () => Promise<void>
+  readonly contentTreeSha256: string
+  readonly openLinkerInput: () => DesktopDependencyLinkerInput
   readonly receipt: DesktopDependencyTreeReceipt
   readonly verifyAndClose: () => Promise<DesktopDependencyTreeReceipt>
 }
 
+export interface DesktopDependencyLinkerInput {
+  readonly close: () => Promise<void>
+  readonly contentTreeSha256: string
+  readonly createReadStream: () => NodeJS.ReadableStream
+  readonly fileCount: number
+}
+
 interface HeldDependencyFile {
+  readonly content: Buffer
   readonly handle: FileHandle
   readonly metadata: string
   readonly path: string
+  readonly relativePath: string
 }
 
 interface DependencyMembershipSnapshot {
   readonly canonical: string
+  readonly contentTreeSha256: string
+  readonly fileCount: number
   readonly paths: readonly string[]
 }
 
@@ -134,6 +149,40 @@ export async function openDesktopDependencyTreeVerification(
     }
     return {
       abort: close,
+      contentTreeSha256: initial.contentTreeSha256,
+      openLinkerInput() {
+        if (closed) throw new Error("Desktop dependency verification handles are closed")
+        const files = [...held].sort((left, right) =>
+          left.relativePath.localeCompare(right.relativePath))
+        let inputClosed = false
+        let streamOpened = false
+        return {
+          async close() { inputClosed = true },
+          contentTreeSha256: initial.contentTreeSha256,
+          createReadStream() {
+            if (inputClosed || closed) throw new Error("Desktop linker input handle is closed")
+            if (streamOpened) throw new Error("Desktop linker input stream is single-use")
+            streamOpened = true
+            const frames = function* (): Generator<Buffer> {
+              const header = Buffer.alloc(4)
+              header.writeUInt32LE(files.length)
+              yield Buffer.from(DESKTOP_LINKER_INPUT_MAGIC, "utf8")
+              yield header
+              for (const file of files) {
+                const name = Buffer.from(file.relativePath, "utf8")
+                const frame = Buffer.alloc(12)
+                frame.writeUInt32LE(name.byteLength, 0)
+                frame.writeBigUInt64LE(BigInt(file.content.byteLength), 4)
+                yield frame
+                yield name
+                yield file.content
+              }
+            }
+            return Readable.from(frames())
+          },
+          fileCount: files.length,
+        }
+      },
       receipt,
       async verifyAndClose() {
         if (closed) throw new Error("Desktop dependency verification handles are closed")
@@ -150,6 +199,8 @@ export async function openDesktopDependencyTreeVerification(
           ])
           if (
             current.canonical !== initial.canonical ||
+            current.contentTreeSha256 !== initial.contentTreeSha256 ||
+            current.fileCount !== initial.fileCount ||
             JSON.stringify(currentReceipt) !== JSON.stringify(receipt)
           ) throw new Error("Desktop dependency tree changed during module link proof")
           await close()
@@ -171,6 +222,7 @@ async function captureDependencyMembership(
   held?: HeldDependencyFile[],
 ): Promise<DependencyMembershipSnapshot> {
   const records: string[] = []
+  const contentRecords: string[] = []
   const paths: string[] = []
   let files = 0
   let totalBytes = 0
@@ -211,11 +263,13 @@ async function captureDependencyMembership(
         throw new Error("Desktop dependency membership file changed identity")
       }
       const metadata = membershipMetadata(after)
+      const sha256 = createHash("sha256").update(content).digest("hex")
       records.push(
-        `${name}\0file\0${metadata}\0${createHash("sha256").update(content).digest("hex")}\n`,
+        `${name}\0file\0${metadata}\0${sha256}\n`,
       )
+      contentRecords.push(`${name}\0${content.byteLength}\0${sha256}\n`)
       if (held === undefined) await handle.close()
-      else held.push({ handle, metadata, path })
+      else held.push({ content, handle, metadata, path, relativePath: name })
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error
@@ -225,7 +279,12 @@ async function captureDependencyMembership(
   for (let index = 0; index < paths.length; index += 512) {
     await assertNoReparseMaterial(paths.slice(index, index + 512))
   }
-  return { canonical: records.sort().join(""), paths }
+  return {
+    canonical: records.sort().join(""),
+    contentTreeSha256: createHash("sha256").update(contentRecords.sort().join("")).digest("hex"),
+    fileCount: files,
+    paths,
+  }
 }
 
 function membershipMetadata(details: Awaited<ReturnType<typeof lstat>>): string {

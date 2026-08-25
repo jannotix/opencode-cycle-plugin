@@ -46,8 +46,9 @@ test("workspace pins the certified toolchain and production allowlist", async ()
   ])
   expect(plugin.dependencies?.["@opencode-ai/plugin"]).toBe("1.18.21")
   expect(plugin.dependencies?.["@opencode-ai/sdk"]).toBe("1.18.21")
+  expect(plugin.dependencies?.["@puppeteer/browsers"]).toBe("3.2.0")
   expect(plugin.dependencies?.["puppeteer-core"]).toBe("25.6.0")
-  expect(plugin.files).toEqual(["dist/**/*.js", "LICENSE", "NOTICE"])
+  expect(plugin.files).toEqual(["dist/**/*.js", "dist/**/*.cjs", "LICENSE", "NOTICE"])
   expect(plugin.optionalDependencies).toEqual({
     "@opencode-cycle/native-linux-x64": "1.0.0",
     "@opencode-cycle/native-win32-x64": "1.0.0",

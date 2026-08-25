@@ -110,8 +110,8 @@ mod windows {
             Threading::{
                 CREATE_SUSPENDED, CreateEventW, CreateProcessW, GetCurrentProcess,
                 GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread,
-                STARTF_USESTDHANDLES, STARTUPINFOW, SetEvent, WaitForMultipleObjects,
-                WaitForSingleObject,
+                STARTF_USESTDHANDLES, STARTUPINFOW, SetEvent, TerminateProcess,
+                WaitForMultipleObjects, WaitForSingleObject,
             },
         },
     };
@@ -205,10 +205,20 @@ mod windows {
         }
         let child_process = OwnedHandle::new(process.hProcess)?;
         let child_thread = OwnedHandle::new(process.hThread)?;
+        #[cfg(debug_assertions)]
+        if let Some(pid_path) = std::env::var_os("CYCLE_VERIFICATION_JOB_TEST_ASSIGNMENT_FAILURE") {
+            let recorded = std::fs::write(pid_path, process.dwProcessId.to_string());
+            let cleaned = terminate_and_wait(child_process.0);
+            recorded.map_err(|_| ())?;
+            cleaned?;
+            return Err(());
+        }
         if unsafe { AssignProcessToJobObject(job.0, child_process.0) } == 0 {
+            terminate_and_wait(child_process.0)?;
             return Err(());
         }
         if unsafe { ResumeThread(child_thread.0) } == u32::MAX {
+            terminate_and_wait(child_process.0)?;
             return Err(());
         }
 
@@ -247,6 +257,16 @@ mod windows {
             Ok(1)
         } else {
             Ok(i32::try_from(exit_code).unwrap_or(1))
+        }
+    }
+
+    fn terminate_and_wait(process: HANDLE) -> Result<(), ()> {
+        let terminated = unsafe { TerminateProcess(process, 1) } != 0;
+        let waited = unsafe { WaitForSingleObject(process, INFINITE) } == WAIT_OBJECT_0;
+        if terminated && waited {
+            Ok(())
+        } else {
+            Err(())
         }
     }
 

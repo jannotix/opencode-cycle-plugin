@@ -219,7 +219,11 @@ describe("release SBOM", () => {
     const plugin = JSON.parse(
       await readFile(join(root, "packages", "opencode-cycle", "package.json"), "utf8"),
     ) as Record<string, unknown>
-    plugin.dependencies = { "@opencode-ai/plugin": "1.18.21", "puppeteer-core": "25.6.0" }
+    plugin.dependencies = {
+      "@opencode-ai/plugin": "1.18.21",
+      "@puppeteer/browsers": "3.2.0",
+      "puppeteer-core": "25.6.0",
+    }
     const missingSdk = packed.map((artifact) =>
       artifact.name.startsWith("opencode-cycle-1.0.0")
         ? verifiedTar(artifact.name, Buffer.from(JSON.stringify(plugin)))

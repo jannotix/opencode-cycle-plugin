@@ -274,7 +274,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "electronVersion",
         "graphFileCount",
         "graphSha256",
-        "linkedModuleCount",
+        "linkedEsmModuleCount",
         "linkerSha256",
         "loaderSha256",
         "moduleLinked",
@@ -286,8 +286,14 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
         "runtimeExecutableSha256",
         "runtimeProductVersion",
         "schemaVersion",
+        "suppressedOptionalRootCount",
         "type",
         "unsafeDynamicImportsRejected",
+        "unsafeModuleLoadingRejected",
+        "verifiedAssetFileCount",
+        "verifiedCommonJsModuleCount",
+        "verifiedContentTreeSha256",
+        "verifiedJsonModuleCount",
       ],
       "Desktop module runtime evidence",
     )
@@ -347,13 +353,14 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       moduleRuntime.candidateDefaultExportLinked !== true ||
       moduleRuntime.candidateEvaluated !== false ||
       moduleRuntime.unsafeDynamicImportsRejected !== true ||
+      moduleRuntime.unsafeModuleLoadingRejected !== true ||
       moduleRuntime.moduleLinked !== true ||
       moduleRuntime.electronVersion !== "42.3.3" ||
       moduleRuntime.nodeVersion !== "24.15.0" ||
       moduleRuntime.productVersion !== OPENCODE_DESKTOP_VERSION ||
       moduleRuntime.runtimeExecutableSha256 !== asset.runtimeExecutable.sha256 ||
       moduleRuntime.runtimeProductVersion !== asset.runtimeExecutable.productVersion ||
-      moduleRuntime.schemaVersion !== 3 ||
+      moduleRuntime.schemaVersion !== 4 ||
       moduleRuntime.type !== "opencode-cycle-desktop-runtime-guard" ||
       typeof moduleRuntime.dependencyFileCount !== "number" ||
       !Number.isSafeInteger(moduleRuntime.dependencyFileCount) ||
@@ -367,9 +374,24 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       typeof moduleRuntime.graphFileCount !== "number" ||
       !Number.isSafeInteger(moduleRuntime.graphFileCount) ||
       moduleRuntime.graphFileCount < 1 ||
-      typeof moduleRuntime.linkedModuleCount !== "number" ||
-      !Number.isSafeInteger(moduleRuntime.linkedModuleCount) ||
-      moduleRuntime.linkedModuleCount < moduleRuntime.graphFileCount ||
+      typeof moduleRuntime.linkedEsmModuleCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.linkedEsmModuleCount) ||
+      moduleRuntime.linkedEsmModuleCount < 1 ||
+      typeof moduleRuntime.verifiedCommonJsModuleCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.verifiedCommonJsModuleCount) ||
+      moduleRuntime.verifiedCommonJsModuleCount < 0 ||
+      typeof moduleRuntime.verifiedJsonModuleCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.verifiedJsonModuleCount) ||
+      moduleRuntime.verifiedJsonModuleCount < 0 ||
+      typeof moduleRuntime.verifiedAssetFileCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.verifiedAssetFileCount) ||
+      moduleRuntime.verifiedAssetFileCount < 0 ||
+      moduleRuntime.linkedEsmModuleCount + moduleRuntime.verifiedCommonJsModuleCount +
+        moduleRuntime.verifiedJsonModuleCount + moduleRuntime.verifiedAssetFileCount !==
+          moduleRuntime.graphFileCount ||
+      typeof moduleRuntime.suppressedOptionalRootCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.suppressedOptionalRootCount) ||
+      moduleRuntime.suppressedOptionalRootCount < 0 ||
       typeof moduleRuntime.bindingDigest !== "string" ||
       typeof moduleRuntime.candidateEntrySha256 !== "string" ||
       typeof moduleRuntime.dependencyTreeSha256 !== "string" ||
@@ -381,6 +403,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       typeof moduleRuntime.revision !== "string" ||
       typeof moduleRuntime.runtimeExecutableSha256 !== "string" ||
       typeof moduleRuntime.runtimeProductVersion !== "string" ||
+      typeof moduleRuntime.verifiedContentTreeSha256 !== "string" ||
 
       typeof evidence.nativePackageSha256 !== "string" ||
       typeof evidence.pluginPackageSha256 !== "string"
@@ -406,6 +429,7 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(moduleRuntime.linkerSha256)
     validateDigest(moduleRuntime.loaderSha256)
     validateDigest(moduleRuntime.runtimeExecutableSha256)
+    validateDigest(moduleRuntime.verifiedContentTreeSha256)
     validateRevision(moduleRuntime.revision)
 
     if (

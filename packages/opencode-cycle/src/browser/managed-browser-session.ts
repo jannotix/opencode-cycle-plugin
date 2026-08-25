@@ -2,12 +2,15 @@ import { createHash, randomUUID } from "node:crypto"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve } from "node:path"
 
-import puppeteer, {
-  type Browser,
-  type ElementHandle,
-  type KeyInput,
-  type Page,
+import type {
+  Browser,
+  ElementHandle,
+  KeyInput,
+  Page,
 } from "puppeteer-core"
+
+// @ts-expect-error The pinned runtime wrapper is bundled and typed at this boundary.
+import puppeteerRuntime from "./puppeteer-runtime.js"
 
 import {
   isLoopback,
@@ -15,6 +18,8 @@ import {
   type BrowserSessionFactory,
   type ManagedBrowserSession,
 } from "./browser-manager.js"
+
+const puppeteer = puppeteerRuntime as typeof import("puppeteer-core").default
 
 interface ManagedBrowserFactoryOptions {
   readonly browserExecutable?: string

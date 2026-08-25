@@ -14,17 +14,19 @@
   },
   "files": [
     "dist/**/*.js",
+    "dist/**/*.cjs",
     "LICENSE",
     "NOTICE"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && bun ../../scripts/packaging/build-browser-runtime.ts",
     "prepack": "bun run build && bun ../../scripts/packaging/prepare-plugin-package.ts",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.21",
     "@opencode-ai/sdk": "1.18.21",
+    "@puppeteer/browsers": "3.2.0",
     "puppeteer-core": "25.6.0"
   },
   "optionalDependencies": {
