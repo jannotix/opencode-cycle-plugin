@@ -5,13 +5,7 @@ import type { Readable } from "node:stream"
 import { promisify } from "node:util"
 
 import type { ArchitecturePlanInput } from "../client.js"
-import {
-  realWindowsVerificationTreeAdapter,
-  type WindowsVerificationProcessInstance,
-  type WindowsVerificationTreeAdapter,
-} from "./task-verification-windows.js"
-
-export type { WindowsVerificationProcessInstance, WindowsVerificationTreeAdapter }
+import { spawnWindowsVerificationJobHost } from "./task-verification-windows.js"
 
 const execFileAsync = promisify(execFile)
 const OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -19,24 +13,6 @@ const OUTPUT_PREVIEW_CHARACTERS = 4_096
 const DEFAULT_TIMEOUT_MILLIS = 120_000
 const TERMINATION_GRACE_MILLIS = 500
 const TERMINATION_LIMIT_MILLIS = 5_000
-const WINDOWS_VERIFICATION_BOOTSTRAP = `
-const { spawn } = require("node:child_process")
-const request = JSON.parse(Buffer.from(process.argv[1], "base64url").toString("utf8"))
-let started = false
-process.stdin.once("data", () => {
-  if (started) process.exit(1)
-  started = true
-  const child = spawn(request.tool, request.args, {
-    env: process.env,
-    stdio: ["ignore", "inherit", "inherit"],
-    windowsHide: true,
-  })
-  child.once("error", () => process.exit(1))
-  child.once("exit", (code) => process.exit(code ?? 1))
-})
-process.stdin.resume()
-`
-
 const FORBIDDEN_EXECUTABLES = new Set([
   "bash", "cmd", "del", "env", "fish", "git", "powershell", "pwsh", "rm", "sh",
   "shutdown", "sudo", "su", "wsl", "zsh",
@@ -60,6 +36,7 @@ export interface TaskVerificationInput {
   readonly revision: string
   readonly signal?: AbortSignal
   readonly task: PlannedTask
+  readonly verificationHostPath: string
   readonly timeoutMillis?: number
 }
 
@@ -92,7 +69,13 @@ export async function runTaskVerification(input: TaskVerificationInput): Promise
   const commands: TaskVerificationCommandReceipt[] = []
   for (const invocation of input.task.verification_commands) {
     input.signal?.throwIfAborted()
-    commands.push(await runVerificationCommand(input.directory, invocation, input.timeoutMillis, input.signal))
+    commands.push(await runVerificationCommand(
+      input.directory,
+      invocation,
+      input.verificationHostPath,
+      input.timeoutMillis,
+      input.signal,
+    ))
     const postCommandBindingError = await revisionBindingError(input)
     if (postCommandBindingError !== null) {
       return failedReceipt(input, postCommandBindingError, commands)
@@ -128,6 +111,7 @@ export function parseVerificationCommand(invocation: string): readonly [string, 
 async function runVerificationCommand(
   directory: string,
   invocation: string,
+  verificationHostPath: string,
   timeoutMillis = DEFAULT_TIMEOUT_MILLIS,
   signal: AbortSignal | undefined,
 ): Promise<TaskVerificationCommandReceipt> {
@@ -141,7 +125,7 @@ async function runVerificationCommand(
 
   let child: Awaited<ReturnType<typeof spawnVerificationProcess>>
   try {
-    child = await spawnVerificationProcess(directory, tool, args)
+    child = await spawnVerificationProcess(directory, tool, args, verificationHostPath)
   } catch (error) {
     return failedCommandReceipt(invocation, tool, args, error)
   }
@@ -201,83 +185,40 @@ async function runVerificationCommand(
   }
 }
 
-interface WindowsVerificationOwnershipRecord {
-  readonly depth: number
-  readonly instance: WindowsVerificationProcessInstance
-  endedAtUnixMillis?: number
-  endReason?: "absent" | "reused" | "terminated"
-}
-
-export interface WindowsVerificationCleanupSummary {
-  readonly absent: number
-  readonly delivered: number
-  readonly instances: number
-  readonly reused: number
-  readonly survivors: number
-}
-
-export interface WindowsVerificationOwnershipTracker {
-  cleanup(exited: Promise<number>): Promise<WindowsVerificationCleanupSummary>
-  observe(): Promise<void>
-  start(): void
-  stop(): Promise<void>
-}
-
 async function spawnVerificationProcess(
   directory: string,
   tool: string,
   args: readonly string[],
+  verificationHostPath: string,
 ) {
-  const spawnedAtUnixMillis = Date.now()
-  const windows = process.platform === "win32"
   const environment = verificationEnvironment()
-  const child = spawnChildProcess(
-    windows ? process.execPath : tool,
-    windows
-      ? [
-          "-e",
-          WINDOWS_VERIFICATION_BOOTSTRAP,
-          Buffer.from(JSON.stringify({ args, tool })).toString("base64url"),
-        ]
-      : [...args],
-    {
-      cwd: directory,
-      detached: true,
-      env: windows ? { ...environment, ELECTRON_RUN_AS_NODE: "1" } : environment,
-      stdio: [windows ? "pipe" : "ignore", "pipe", "pipe"],
-      windowsHide: true,
-    },
-  )
+  if (process.platform === "win32") {
+    const child = spawnWindowsVerificationJobHost({
+      args,
+      binaryPath: verificationHostPath,
+      directory,
+      environment,
+      tool,
+    })
+    return { ...child, terminateWindowsJob: child.terminate }
+  }
+  const child = spawnChildProcess(tool, [...args], {
+    cwd: directory,
+    detached: true,
+    env: environment,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  })
   if (child.pid === undefined || child.stdout === null || child.stderr === null) {
     child.once("error", () => undefined)
     throw new Error("Verification process failed to start")
   }
-  const exited = createVerificationProcessExitPromise(child)
-  let windowsOwnership: WindowsVerificationOwnershipTracker | undefined
-  if (windows) {
-    if (child.stdin === null) throw new Error("Windows verification bootstrap has no start channel")
-    try {
-      const adapter = realWindowsVerificationTreeAdapter()
-      const root = await adapter.captureRoot({ rootPid: child.pid, spawnedAtUnixMillis })
-      windowsOwnership = createWindowsVerificationOwnershipTracker({ adapter, root })
-      await windowsOwnership.observe()
-      windowsOwnership.start()
-      child.stdin.end(Buffer.from([1]))
-    } catch (error) {
-      child.kill()
-      await waitForExit(exited, TERMINATION_LIMIT_MILLIS).catch(() => false)
-      throw error
-    }
-  }
   return {
-    exited,
-    get exitCode() { return child.exitCode },
-    kill(signal?: NodeJS.Signals | number) { return child.kill(signal) },
+    exited: createVerificationProcessExitPromise(child),
     pid: child.pid,
-    get signalCode() { return child.signalCode },
     stderr: child.stderr,
     stdout: child.stdout,
-    windowsOwnership,
+    terminateWindowsJob: undefined,
   }
 }
 
@@ -285,10 +226,13 @@ type VerificationProcess = Awaited<ReturnType<typeof spawnVerificationProcess>>
 
 async function terminateProcessTree(child: VerificationProcess): Promise<void> {
   if (process.platform === "win32") {
-    if (child.windowsOwnership === undefined) {
-      throw new Error("Windows verification process ownership was not captured")
+    if (child.terminateWindowsJob === undefined) {
+      throw new Error("Windows verification Job ownership was not captured")
     }
-    await child.windowsOwnership.cleanup(child.exited)
+    await child.terminateWindowsJob()
+    if (!(await waitForExit(child.exited, TERMINATION_LIMIT_MILLIS))) {
+      throw new Error("Windows verification Job host did not terminate")
+    }
     return
   }
   signalProcessGroup(child.pid, "SIGTERM")
@@ -309,196 +253,6 @@ export function createVerificationProcessExitPromise(
     events.once("exit", (code) => resolve(code ?? 1))
   })
 }
-
-export function createWindowsVerificationOwnershipTracker(input: {
-  readonly adapter: WindowsVerificationTreeAdapter
-  readonly now?: () => number
-  readonly root: WindowsVerificationProcessInstance
-  readonly sleep?: (milliseconds: number) => Promise<void>
-}): WindowsVerificationOwnershipTracker {
-  const now = input.now ?? Date.now
-  const sleep = input.sleep ?? delay
-  const records = new Map<string, WindowsVerificationOwnershipRecord>([
-    [processInstanceKey(input.root), { depth: 0, instance: input.root }],
-  ])
-  let lastSnapshot: Awaited<ReturnType<WindowsVerificationTreeAdapter["snapshot"]>> | undefined
-  let loop: Promise<void> | undefined
-  let stopping = false
-  let trackingError: unknown
-
-  const applySnapshot = (
-    snapshot: Awaited<ReturnType<WindowsVerificationTreeAdapter["snapshot"]>>,
-  ): void => {
-    if (
-      !Number.isSafeInteger(snapshot.observedAtUnixMillis) ||
-      snapshot.observedAtUnixMillis < 1
-    ) throw new Error("Windows verification process snapshot time is invalid")
-    lastSnapshot = snapshot
-    for (const record of records.values()) {
-      if (record.endReason !== undefined) continue
-      const current = snapshot.instances.find((item) => item.pid === record.instance.pid)
-      if (current === undefined) {
-        record.endedAtUnixMillis = snapshot.observedAtUnixMillis
-        record.endReason = "absent"
-      } else if (current.startedAtUnixMillis !== record.instance.startedAtUnixMillis) {
-        record.endedAtUnixMillis = Math.min(
-          snapshot.observedAtUnixMillis,
-          current.startedAtUnixMillis - 1,
-        )
-        record.endReason = "reused"
-      }
-    }
-
-    let discovered = true
-    while (discovered) {
-      discovered = false
-      for (const instance of snapshot.instances) {
-        const key = processInstanceKey(instance)
-        if (records.has(key)) continue
-        if ([...records.values()].some((record) => record.instance.pid === instance.pid)) continue
-        const parent = [...records.values()]
-          .filter((record) =>
-            record.instance.pid === instance.parentPid &&
-            instance.startedAtUnixMillis >= record.instance.startedAtUnixMillis &&
-            (
-              record.endedAtUnixMillis === undefined ||
-              instance.startedAtUnixMillis <= record.endedAtUnixMillis
-            )
-          )
-          .sort((left, right) => right.depth - left.depth)[0]
-        if (parent === undefined) continue
-        records.set(key, {
-          depth: parent.depth + 1,
-          instance,
-        })
-        discovered = true
-      }
-    }
-
-    const ownedPids = new Set([...records.values()].map((record) => record.instance.pid))
-    if (snapshot.inaccessible.some((item) =>
-      ownedPids.has(item.pid) || ownedPids.has(item.parentPid)
-    )) throw new Error("Windows verification process identity access failed")
-  }
-
-  const observe = async (): Promise<void> => {
-    if (trackingError !== undefined) throw trackingError
-    applySnapshot(await input.adapter.snapshot())
-  }
-
-  const start = (): void => {
-    if (loop !== undefined) return
-    loop = (async () => {
-      while (!stopping) {
-        try {
-          await observe()
-        } catch (error) {
-          trackingError = error
-          return
-        }
-        await sleep(25)
-      }
-    })()
-  }
-
-  const stop = async (): Promise<void> => {
-    stopping = true
-    await loop
-    if (trackingError !== undefined) throw trackingError
-  }
-
-  const cleanup = async (exited: Promise<number>): Promise<WindowsVerificationCleanupSummary> => {
-    await stop()
-    const attempted = new Set<string>()
-    let delivered = 0
-    const terminationDeadline = now() + TERMINATION_LIMIT_MILLIS
-    for (let round = 0; round < 16; round += 1) {
-      await observe()
-      const snapshot = lastSnapshot
-      if (snapshot === undefined) throw new Error("Windows verification process snapshot is absent")
-      const present = [...records.entries()]
-        .filter(([, record]) => snapshot.instances.some((item) =>
-          item.pid === record.instance.pid &&
-          item.startedAtUnixMillis === record.instance.startedAtUnixMillis
-        ))
-        .sort((left, right) => left[1].depth - right[1].depth)
-      if (present.length === 0) break
-      if (present.every(([key]) => attempted.has(key))) {
-        if (now() >= terminationDeadline) {
-          throw new Error("Windows verification process instances survived termination")
-        }
-        await sleep(25)
-        continue
-      }
-      for (const [key, record] of present) {
-        if (attempted.has(key)) continue
-        attempted.add(key)
-        const termination = await input.adapter.terminate(record.instance)
-        if (termination.status === "delivered") {
-          if (termination.exitCode !== 0) {
-            throw new Error("Windows verification taskkill returned a nonzero exit status")
-          }
-          delivered += 1
-          record.endedAtUnixMillis ??= now()
-          record.endReason ??= "terminated"
-        } else if (termination.status === "absent") {
-          record.endedAtUnixMillis ??= now()
-          record.endReason ??= "absent"
-        } else {
-          record.endedAtUnixMillis ??= Math.min(now(), termination.startedAtUnixMillis - 1)
-          record.endReason ??= "reused"
-        }
-      }
-      await sleep(25)
-    }
-    if (!(await waitForExit(exited, TERMINATION_LIMIT_MILLIS))) {
-      throw new Error("Windows verification root process did not exit")
-    }
-    await observe()
-    const snapshot = lastSnapshot
-    if (snapshot === undefined) throw new Error("Windows verification process snapshot is absent")
-    const survivors = [...records.values()].filter((record) => snapshot.instances.some((item) =>
-      item.pid === record.instance.pid &&
-      item.startedAtUnixMillis === record.instance.startedAtUnixMillis
-    ))
-    if (survivors.length !== 0) {
-      throw new Error("Windows verification process instances survived termination")
-    }
-    const values = [...records.values()]
-    return {
-      absent: values.filter((record) => record.endReason === "absent").length,
-      delivered,
-      instances: values.length,
-      reused: values.filter((record) => record.endReason === "reused").length,
-      survivors: 0,
-    }
-  }
-
-  return { cleanup, observe, start, stop }
-}
-
-export async function terminateWindowsVerificationTree(input: {
-  readonly adapter: WindowsVerificationTreeAdapter
-  readonly exited: Promise<number>
-  readonly rootPid: number
-  readonly spawnedAtUnixMillis: number
-}): Promise<void> {
-  const root = await input.adapter.captureRoot({
-    rootPid: input.rootPid,
-    spawnedAtUnixMillis: input.spawnedAtUnixMillis,
-  })
-  const tracker = createWindowsVerificationOwnershipTracker({
-    adapter: input.adapter,
-    root,
-  })
-  await tracker.observe()
-  await tracker.cleanup(input.exited)
-}
-
-function processInstanceKey(instance: WindowsVerificationProcessInstance): string {
-  return `${instance.pid}:${instance.startedAtUnixMillis}`
-}
-
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try {

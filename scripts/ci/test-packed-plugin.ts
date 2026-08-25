@@ -136,6 +136,7 @@ process.exit(await child.exited)
     cwd: project,
     environment,
     hostVersion: "1.18.21",
+    platform,
     prepared,
     runtimeCommand: [runtime],
     scratch,

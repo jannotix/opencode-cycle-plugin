@@ -1,52 +1,67 @@
 import { expect, mock, test } from "bun:test"
-import { execFile, spawnSync } from "node:child_process"
+import { execFile, spawn as spawnChildProcess, spawnSync } from "node:child_process"
 import { EventEmitter } from "node:events"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import type { ArchitecturePlanInput } from "../src/client.js"
-import type { WindowsVerificationTreeAdapter } from "../src/orchestration/task-verification-windows.js"
-
-let windowsTestRoot: {
-  readonly parentPid: number
-  readonly pid: number
-  readonly startedAtUnixMillis: number
-} | undefined
-const windowsTestAdapter: WindowsVerificationTreeAdapter = {
-  async captureRoot(input) {
-    windowsTestRoot = {
-      parentPid: process.pid,
-      pid: input.rootPid,
-      startedAtUnixMillis: input.spawnedAtUnixMillis,
-    }
-    return windowsTestRoot
-  },
-  async snapshot() {
-    return {
-      inaccessible: [],
-      instances: windowsTestRoot !== undefined && processAlive(windowsTestRoot.pid)
-        ? [windowsTestRoot]
-        : [],
-      observedAtUnixMillis: Date.now(),
-    }
-  },
-  async terminate(root) {
-    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
-    const result = spawnSync(
-      join(systemRoot, "System32", "taskkill.exe"),
-      ["/PID", String(root.pid), "/T", "/F"],
-      { stdio: "ignore", windowsHide: true },
-    )
-    return { exitCode: result.status ?? 1, status: "delivered" }
-  },
-}
+let windowsTerminationRequests = 0
 
 mock.module("../src/orchestration/task-verification-windows.js", () => ({
-  realWindowsVerificationTreeAdapter: () => windowsTestAdapter,
+  spawnWindowsVerificationJobHost(input: {
+    readonly args: readonly string[]
+    readonly directory: string
+    readonly environment: NodeJS.ProcessEnv
+    readonly tool: string
+  }) {
+    const child = spawnChildProcess(input.tool, [...input.args], {
+      cwd: input.directory,
+      detached: true,
+      env: input.environment,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    if (child.pid === undefined || child.stdout === null || child.stderr === null) {
+      throw new Error("test Job host failed to start")
+    }
+    const exited = new Promise<number>((resolve, reject) => {
+      child.once("error", reject)
+      child.once("exit", (code) => resolve(code ?? 1))
+    })
+    return {
+      exited,
+      pid: child.pid,
+      stderr: child.stderr,
+      stdout: child.stdout,
+      async terminate() {
+        if (child.exitCode !== null || child.signalCode !== null) return
+        windowsTerminationRequests += 1
+        const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows"
+        const result = spawnSync(
+          join(systemRoot, "System32", "taskkill.exe"),
+          ["/PID", String(child.pid), "/T", "/F"],
+          { stdio: "ignore", windowsHide: true },
+        )
+        if (result.status !== 0 && processAlive(child.pid as number)) {
+          throw new Error("test Job termination failed")
+        }
+        await exited
+      },
+    }
+  },
 }))
 const TaskVerificationModule = await import("../src/orchestration/task-verification.js")
-const { parseVerificationCommand, runTaskVerification } = TaskVerificationModule
+const { parseVerificationCommand } = TaskVerificationModule
+type VerificationInput = Omit<
+  Parameters<typeof TaskVerificationModule.runTaskVerification>[0],
+  "verificationHostPath"
+> & { readonly verificationHostPath?: string }
+const runTaskVerification = (input: VerificationInput) =>
+  TaskVerificationModule.runTaskVerification({
+    ...input,
+    verificationHostPath: input.verificationHostPath ?? process.execPath,
+  })
 
 test("deterministic task verification records passed commands with bounded digests", async () => {
   const repository = await createRepository()
@@ -365,232 +380,41 @@ test("verification child errors reject instead of impersonating process exit", a
   await expect(exited).rejects.toBe(failure)
 })
 
-test("Windows tree cleanup rejects taskkill failure, delivery errors and surviving descendants", async () => {
-  const createTracker = (TaskVerificationModule as Record<string, unknown>)
-    .createWindowsVerificationOwnershipTracker
-  expect(createTracker).toBeFunction()
-  if (typeof createTracker !== "function") return
-  const create = createTracker as (input: Record<string, unknown>) => {
-    cleanup(exited: Promise<number>): Promise<Record<string, number>>
-    observe(): Promise<void>
-  }
-  const root = { parentPid: 1, pid: 100, startedAtUnixMillis: 1_000 }
-  const observation = { inaccessible: [], instances: [root], observedAtUnixMillis: 2_000 }
-
-  const nonzero = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => observation,
-      terminate: async () => ({ exitCode: 5, status: "delivered" }),
-    },
-    root,
-  })
-  await nonzero.observe()
-  await expect(nonzero.cleanup(Promise.resolve(0))).rejects.toThrow("taskkill")
-
-  const delivery = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => observation,
-      terminate: async () => { throw new Error("delivery") },
-    },
-    root,
-  })
-  await delivery.observe()
-  await expect(delivery.cleanup(Promise.resolve(0))).rejects.toThrow("delivery")
-
-  let survivorNow = 0
-  const survivor = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => observation,
-      terminate: async () => ({ exitCode: 0, status: "delivered" }),
-    },
-    root,
-    now: () => { survivorNow += 1_000; return survivorNow },
-    sleep: async () => undefined,
-  })
-  await survivor.observe()
-  await expect(survivor.cleanup(Promise.resolve(0))).rejects.toThrow("survived")
-})
-
-test("Windows ownership tracking rejects PID reuse, root-gone survivors and access failures", async () => {
-  const createTracker = (TaskVerificationModule as Record<string, unknown>)
-    .createWindowsVerificationOwnershipTracker
-  expect(createTracker).toBeFunction()
-  if (typeof createTracker !== "function") return
-  const create = createTracker as (input: Record<string, unknown>) => {
-    cleanup(exited: Promise<number>): Promise<Record<string, number>>
-    observe(): Promise<void>
-  }
-  const root = { parentPid: 1, pid: 100, startedAtUnixMillis: 1_000 }
-  const descendant = { parentPid: 100, pid: 101, startedAtUnixMillis: 1_001 }
-  const reusedRoot = { parentPid: 2, pid: 100, startedAtUnixMillis: 2_000 }
-  const observation = (
-    instances: readonly Record<string, number>[],
-    inaccessible: readonly Record<string, number>[] = [],
-  ) => ({ inaccessible, instances, observedAtUnixMillis: 3_000 })
-
-  const reuseSnapshots = [
-    observation([root, descendant]),
-    observation([reusedRoot, descendant]),
-    observation([reusedRoot]),
-  ]
-  const reuseTerminations: number[] = []
-  const reuse = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => reuseSnapshots.shift() ?? observation([reusedRoot]),
-      terminate: async (instance: { pid: number }) => {
-        reuseTerminations.push(instance.pid)
-        return { exitCode: 0, status: "delivered" }
-      },
-    },
-    root,
-  })
-  await reuse.observe()
-  const reuseSummary = await reuse.cleanup(Promise.resolve(0))
-  expect(reuseTerminations).toEqual([descendant.pid])
-  expect(reuseSummary).toMatchObject({ delivered: 1, reused: 1, survivors: 0 })
-
-  const goneSnapshots = [
-    observation([root, descendant]),
-    observation([descendant]),
-    observation([]),
-  ]
-  const goneTerminations: number[] = []
-  const gone = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => goneSnapshots.shift() ?? observation([]),
-      terminate: async (instance: { pid: number }) => {
-        goneTerminations.push(instance.pid)
-        return { exitCode: 0, status: "delivered" }
-      },
-    },
-    root,
-  })
-  await gone.observe()
-  const goneSummary = await gone.cleanup(Promise.resolve(0))
-  expect(goneTerminations).toEqual([descendant.pid])
-  expect(goneSummary).toMatchObject({ absent: 1, delivered: 1, survivors: 0 })
-
-  const inaccessible = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => observation([root], [{ parentPid: root.pid, pid: 102 }]),
-      terminate: async () => ({ exitCode: 0, status: "delivered" }),
-    },
-    root,
-  })
-  await expect(inaccessible.observe()).rejects.toThrow("access")
-
-  const failedSnapshot = create({
-    adapter: {
-      captureRoot: async () => root,
-      snapshot: async () => { throw new Error("snapshot access failed") },
-      terminate: async () => ({ exitCode: 0, status: "delivered" }),
-    },
-    root,
-  })
-  await expect(failedSnapshot.observe()).rejects.toThrow("snapshot access failed")
-})
-
-test("real Windows adapter refuses to terminate a reused live PID identity", async () => {
-  if (process.platform !== "win32") return
-  const moduleUrl = new URL("../src/orchestration/task-verification-windows.ts", import.meta.url).href
-  const source = `
-const module = await import(${JSON.stringify(moduleUrl)})
-const adapter = module.realWindowsVerificationTreeAdapter()
-const current = await adapter.captureRoot({ rootPid: process.pid, spawnedAtUnixMillis: 0 })
-const result = await adapter.terminate({
-  ...current,
-  startedAtUnixMillis: current.startedAtUnixMillis + 1,
-})
-process.kill(process.pid, 0)
-process.stdout.write(JSON.stringify(result))
-`
-  const child = Bun.spawn([process.execPath, "-e", source], {
-    stderr: "pipe",
-    stdout: "pipe",
-    windowsHide: true,
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
+test("production Windows verification uses the native Job host without PID sampling", async () => {
+  const [typescriptSource, nativeSource] = await Promise.all([
+    readFile(new URL("../src/orchestration/task-verification-windows.ts", import.meta.url), "utf8"),
+    readFile(new URL("../../../crates/workflowd/src/verification_job.rs", import.meta.url), "utf8"),
   ])
-  expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" })
-  expect(JSON.parse(stdout)).toMatchObject({ status: "reused" })
+  expect(typescriptSource).toContain("--verification-job-host")
+  expect(typescriptSource).not.toContain("taskkill")
+  expect(typescriptSource).not.toContain("Toolhelp")
+  expect(nativeSource).toContain("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE")
+  expect(nativeSource).toContain("CREATE_SUSPENDED")
+  expect(nativeSource.indexOf("AssignProcessToJobObject")).toBeLessThan(
+    nativeSource.indexOf("ResumeThread"),
+  )
 })
 
-test("real Windows tracker cleans an exact descendant after its root exits", async () => {
+test("Windows timeout and output-limit paths deliver Job termination control", async () => {
   if (process.platform !== "win32") return
-  const windowsUrl = new URL("../src/orchestration/task-verification-windows.ts", import.meta.url).href
-  const verificationUrl = new URL("../src/orchestration/task-verification.ts", import.meta.url).href
-  const source = `
-const { spawn } = await import("node:child_process")
-const { mkdtemp, readFile, rm } = await import("node:fs/promises")
-const { join } = await import("node:path")
-const { tmpdir } = await import("node:os")
-const windows = await import(${JSON.stringify(windowsUrl)})
-const verification = await import(${JSON.stringify(verificationUrl)})
-const temporary = await mkdtemp(join(tmpdir(), "cycle-root-gone-"))
-const pidFile = join(temporary, "tree.json")
-const rootSource = [
-  "const {spawn}=require('node:child_process')",
-  "const {writeFileSync}=require('node:fs')",
-  "const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'})",
-  "child.unref()",
-  "writeFileSync(process.argv[1],JSON.stringify({descendant:child.pid}))",
-  "setTimeout(()=>process.exit(0),1500)",
-].join(";")
-const node = Bun.which("node")
-const spawnedAtUnixMillis = Date.now()
-const root = spawn(node, ["-e", rootSource, pidFile], { detached: true, stdio: "ignore" })
-const exited = new Promise((resolve, reject) => {
-  root.once("error", reject)
-  root.once("exit", (code) => resolve(code ?? 1))
-})
-try {
-  const adapter = windows.realWindowsVerificationTreeAdapter()
-  const identity = await adapter.captureRoot({ rootPid: root.pid, spawnedAtUnixMillis })
-  const tracker = verification.createWindowsVerificationOwnershipTracker({ adapter, root: identity })
-  await tracker.observe()
-  tracker.start()
-  let descendant
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    descendant = await readFile(pidFile, "utf8").then((value) => JSON.parse(value).descendant, () => undefined)
-    if (Number.isSafeInteger(descendant)) break
-    await Bun.sleep(25)
+  const before = windowsTerminationRequests
+  const repository = await createRepository()
+  try {
+    const revision = await git(repository, ["rev-parse", "HEAD"])
+    const timeoutReceipt = await runTaskVerification({
+      baseRevision: revision,
+      changedPaths: [],
+      directory: repository,
+      revision,
+      task: task(['node -e "setInterval(()=>{},1000)"']),
+      timeoutMillis: 25,
+    })
+    expect(timeoutReceipt.commands[0]?.status).toBe("timeout")
+    expect(windowsTerminationRequests).toBeGreaterThan(before)
+  } finally {
+    await rm(repository, { force: true, recursive: true })
   }
-  if (!Number.isSafeInteger(descendant)) throw new Error("descendant")
-  const rootExit = await exited
-  const summary = await tracker.cleanup(Promise.resolve(rootExit))
-  let descendantAlive = true
-  try { process.kill(descendant, 0) } catch { descendantAlive = false }
-  process.stdout.write(JSON.stringify({ descendantAlive, rootExit, summary }))
-} finally {
-  await rm(temporary, { force: true, recursive: true })
-}
-`
-  const child = Bun.spawn([process.execPath, "-e", source], {
-    stderr: "pipe",
-    stdout: "pipe",
-    windowsHide: true,
-  })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" })
-  expect(JSON.parse(stdout)).toMatchObject({
-    descendantAlive: false,
-    rootExit: 0,
-    summary: { absent: 1, delivered: 1, survivors: 0 },
-  })
-}, 20_000)
+}, { timeout: 30_000 })
 
 function task(verificationCommands: readonly string[]): ArchitecturePlanInput["tasks"][number] {
   return {

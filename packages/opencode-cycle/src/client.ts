@@ -414,6 +414,15 @@ export class LocalControlPlane {
     }
   }
 
+  async nativeBinaryPath(): Promise<string> {
+    const configuredBinaryPath =
+      this.#binaryPath ?? packagedBinaryPath(this.#platform, this.#architecture)
+    await access(configuredBinaryPath, constants.X_OK).catch((cause: unknown) => {
+      throw new ControlPlaneError(`workflowd binary is unavailable: ${configuredBinaryPath}`, { cause })
+    })
+    return realpath(configuredBinaryPath)
+  }
+
   async health(): Promise<ControlPlaneHealth> {
     const existing = await readSecret(this.#secretPath)
     let lastError: unknown
@@ -437,12 +446,7 @@ export class LocalControlPlane {
       this.#ownedProcess.exitCode !== null ||
       this.#ownedProcess.signalCode !== null
     ) {
-      const configuredBinaryPath =
-        this.#binaryPath ?? packagedBinaryPath(this.#platform, this.#architecture)
-      await access(configuredBinaryPath, constants.X_OK).catch((cause: unknown) => {
-        throw new ControlPlaneError(`workflowd binary is unavailable: ${configuredBinaryPath}`, { cause })
-      })
-      const binaryPath = await realpath(configuredBinaryPath)
+      const binaryPath = await this.nativeBinaryPath()
       const startedAtUnixMillis = Date.now()
       const argumentsList = ["--data-dir", this.#dataDirectory]
       if (this.#processOwnerToken !== undefined) {

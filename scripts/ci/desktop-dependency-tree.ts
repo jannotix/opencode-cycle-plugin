@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto"
 import { constants } from "node:fs"
-import { access, lstat, open, readdir, realpath } from "node:fs/promises"
+import {
+  access,
+  lstat,
+  open,
+  opendir,
+  readdir,
+  realpath,
+  type FileHandle,
+} from "node:fs/promises"
 import { dirname, join, relative, resolve, sep } from "node:path"
 
 import { assertNoReparseMaterial, assertStableOpenFile } from "../release/verified-file.js"
@@ -15,6 +23,23 @@ export interface DesktopDependencyTreeReceipt {
   readonly dependencyTotalBytes: number
   readonly dependencyTreeSha256: string
   readonly schemaVersion: 1
+}
+
+export interface DesktopDependencyTreeVerification {
+  readonly abort: () => Promise<void>
+  readonly receipt: DesktopDependencyTreeReceipt
+  readonly verifyAndClose: () => Promise<DesktopDependencyTreeReceipt>
+}
+
+interface HeldDependencyFile {
+  readonly handle: FileHandle
+  readonly metadata: string
+  readonly path: string
+}
+
+interface DependencyMembershipSnapshot {
+  readonly canonical: string
+  readonly paths: readonly string[]
 }
 
 interface PackageManifest {
@@ -83,6 +108,146 @@ export async function verifyDesktopDependencyTree(
     dependencyTreeSha256: createHash("sha256").update(canonical).digest("hex"),
     schemaVersion: 1,
   }
+}
+
+export async function openDesktopDependencyTreeVerification(
+  installedPlugin: string,
+): Promise<DesktopDependencyTreeVerification> {
+  const root = resolve(installedPlugin)
+  const rootHandle = await opendir(root)
+  const held: HeldDependencyFile[] = []
+  let closed = false
+  const close = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    await Promise.allSettled([
+      ...held.map((file) => file.handle.close()),
+      rootHandle.close(),
+    ])
+  }
+  try {
+    const initial = await captureDependencyMembership(root, held)
+    const receipt = await verifyDesktopDependencyTree(root)
+    const stable = await captureDependencyMembership(root)
+    if (stable.canonical !== initial.canonical) {
+      throw new Error("Desktop dependency tree changed while verified handles were opened")
+    }
+    return {
+      abort: close,
+      receipt,
+      async verifyAndClose() {
+        if (closed) throw new Error("Desktop dependency verification handles are closed")
+        try {
+          for (const file of held) {
+            const current = await file.handle.stat({ bigint: true })
+            if (membershipMetadata(current) !== file.metadata) {
+              throw new Error("Desktop dependency file changed while its verified handle was open")
+            }
+          }
+          const [current, currentReceipt] = await Promise.all([
+            captureDependencyMembership(root),
+            verifyDesktopDependencyTree(root),
+          ])
+          if (
+            current.canonical !== initial.canonical ||
+            JSON.stringify(currentReceipt) !== JSON.stringify(receipt)
+          ) throw new Error("Desktop dependency tree changed during module link proof")
+          await close()
+          return currentReceipt
+        } catch (error) {
+          await close()
+          throw error
+        }
+      },
+    }
+  } catch (error) {
+    await close()
+    throw error
+  }
+}
+
+async function captureDependencyMembership(
+  root: string,
+  held?: HeldDependencyFile[],
+): Promise<DependencyMembershipSnapshot> {
+  const records: string[] = []
+  const paths: string[] = []
+  let files = 0
+  let totalBytes = 0
+  const visit = async (path: string): Promise<void> => {
+    const details = await lstat(path, { bigint: true })
+    const resolved = resolve(path)
+    const real = await realpath(path)
+    if (
+      details.isSymbolicLink() || real !== resolved || !inside(resolved, root) ||
+      (!details.isDirectory() && (!details.isFile() || details.nlink !== 1n))
+    ) throw new Error("Desktop dependency membership contains a link, alias or non-private file")
+    paths.push(path)
+    const name = resolved === root ? "." : containedRelativePath(root, resolved)
+    if (details.isDirectory()) {
+      records.push(`${name}\0directory\0${membershipMetadata(details)}\n`)
+      const entries = await readdir(path, { withFileTypes: true })
+      entries.sort((left, right) => left.name.localeCompare(right.name))
+      for (const entry of entries) await visit(join(path, entry.name))
+      return
+    }
+    files += 1
+    totalBytes += Number(details.size)
+    if (
+      files > MAX_DEPENDENCY_FILES || details.size > BigInt(MAX_DEPENDENCY_FILE_BYTES) ||
+      totalBytes > MAX_DEPENDENCY_TREE_BYTES
+    ) throw new Error("Desktop dependency membership exceeds its bound")
+    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0
+    const handle = await open(path, constants.O_RDONLY | noFollow)
+    try {
+      const before = await handle.stat({ bigint: true })
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+        throw new Error("Desktop dependency membership file is not private")
+      }
+      const content = await handle.readFile()
+      const after = await handle.stat({ bigint: true })
+      assertStableOpenFile(before, after)
+      if (membershipMetadata(after) !== membershipMetadata(details)) {
+        throw new Error("Desktop dependency membership file changed identity")
+      }
+      const metadata = membershipMetadata(after)
+      records.push(
+        `${name}\0file\0${metadata}\0${createHash("sha256").update(content).digest("hex")}\n`,
+      )
+      if (held === undefined) await handle.close()
+      else held.push({ handle, metadata, path })
+    } catch (error) {
+      await handle.close().catch(() => undefined)
+      throw error
+    }
+  }
+  await visit(root)
+  for (let index = 0; index < paths.length; index += 512) {
+    await assertNoReparseMaterial(paths.slice(index, index + 512))
+  }
+  return { canonical: records.sort().join(""), paths }
+}
+
+function membershipMetadata(details: Awaited<ReturnType<typeof lstat>>): string {
+  const value = details as unknown as {
+    readonly ctimeNs?: bigint
+    readonly dev: bigint | number
+    readonly ino: bigint | number
+    readonly mode: bigint | number
+    readonly mtimeMs: number
+    readonly mtimeNs?: bigint
+    readonly nlink: bigint | number
+    readonly size: bigint | number
+  }
+  return [
+    String(value.dev),
+    String(value.ino),
+    String(value.size),
+    value.mtimeNs === undefined ? String(value.mtimeMs) : String(value.mtimeNs),
+    value.ctimeNs === undefined ? "unavailable" : String(value.ctimeNs),
+    String(value.nlink),
+    String(value.mode),
+  ].join("\0")
 }
 
 async function rejectAncestorDependencyRoots(root: string): Promise<void> {

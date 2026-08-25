@@ -18,16 +18,35 @@ export const OPENCODE_DESKTOP_VERSION = "1.18.21" as const
 export const DESKTOP_ASSET_METADATA = {
   "linux-x64": {
     name: "opencode-desktop-linux-x86_64.AppImage",
+    runtimeExecutable: {
+      name: "ai.opencode.desktop",
+      productVersion: "1.18.21",
+      sha256: "008c5cf72df686019c818d2cb0570df8137b49aa5dae64dcf017ea2656c5b7ac",
+    },
     sha256: "fb384fc4f030aca8624d775b8757cafa39b5871fc0eddeecebb128f25ed649d8",
     size: 158_944_115,
   },
   "windows-x64": {
     name: "opencode-desktop-win-x64.exe",
+    runtimeExecutable: {
+      name: "OpenCode.exe",
+      productVersion: "1.18.21.0",
+      sha256: "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999",
+    },
     sha256: "3bd1a81d8fcb377a6bda60a9abf8d412aca1c9c702218ddbbdf7c7b09deaa739",
     size: 126_209_592,
   },
 } as const satisfies Readonly<
-  Record<CertifiedPlatform, { readonly name: string; readonly sha256: string; readonly size: number }>
+  Record<CertifiedPlatform, {
+    readonly name: string
+    readonly runtimeExecutable: {
+      readonly name: string
+      readonly productVersion: string
+      readonly sha256: string
+    }
+    readonly sha256: string
+    readonly size: number
+  }>
 >
 export const DESKTOP_ASSET_NAMES: Readonly<Record<CertifiedPlatform, string>> = {
   "linux-x64": DESKTOP_ASSET_METADATA["linux-x64"].name,
@@ -244,27 +263,31 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     const moduleRuntime = requireExactRecord(
       evidence.moduleRuntime,
       [
-        "acknowledgementSha256",
         "bindingDigest",
+        "candidateDefaultExportLinked",
         "candidateEntrySha256",
-        "childExitCode",
-        "childWrapperSha256",
+        "candidateEvaluated",
         "dependencyFileCount",
         "dependencyPackageCount",
         "dependencyTotalBytes",
         "dependencyTreeSha256",
         "electronVersion",
+        "graphFileCount",
+        "graphSha256",
+        "linkedModuleCount",
+        "linkerSha256",
         "loaderSha256",
-        "moduleResolved",
+        "moduleLinked",
         "nativePackageSha256",
         "nodeVersion",
         "pluginPackageSha256",
         "productVersion",
         "revision",
         "runtimeExecutableSha256",
+        "runtimeProductVersion",
         "schemaVersion",
-        "supervisorSha256",
         "type",
+        "unsafeDynamicImportsRejected",
       ],
       "Desktop module runtime evidence",
     )
@@ -321,12 +344,16 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       loadDiagnostics.bytes < 1 ||
       loadDiagnostics.bytes > 64 * 1024 ||
       typeof loadDiagnostics.sha256 !== "string" ||
-      moduleRuntime.childExitCode !== 0 ||
-      moduleRuntime.moduleResolved !== true ||
+      moduleRuntime.candidateDefaultExportLinked !== true ||
+      moduleRuntime.candidateEvaluated !== false ||
+      moduleRuntime.unsafeDynamicImportsRejected !== true ||
+      moduleRuntime.moduleLinked !== true ||
       moduleRuntime.electronVersion !== "42.3.3" ||
       moduleRuntime.nodeVersion !== "24.15.0" ||
       moduleRuntime.productVersion !== OPENCODE_DESKTOP_VERSION ||
-      moduleRuntime.schemaVersion !== 2 ||
+      moduleRuntime.runtimeExecutableSha256 !== asset.runtimeExecutable.sha256 ||
+      moduleRuntime.runtimeProductVersion !== asset.runtimeExecutable.productVersion ||
+      moduleRuntime.schemaVersion !== 3 ||
       moduleRuntime.type !== "opencode-cycle-desktop-runtime-guard" ||
       typeof moduleRuntime.dependencyFileCount !== "number" ||
       !Number.isSafeInteger(moduleRuntime.dependencyFileCount) ||
@@ -337,17 +364,23 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
       typeof moduleRuntime.dependencyTotalBytes !== "number" ||
       !Number.isSafeInteger(moduleRuntime.dependencyTotalBytes) ||
       moduleRuntime.dependencyTotalBytes < 1 ||
-      typeof moduleRuntime.acknowledgementSha256 !== "string" ||
+      typeof moduleRuntime.graphFileCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.graphFileCount) ||
+      moduleRuntime.graphFileCount < 1 ||
+      typeof moduleRuntime.linkedModuleCount !== "number" ||
+      !Number.isSafeInteger(moduleRuntime.linkedModuleCount) ||
+      moduleRuntime.linkedModuleCount < moduleRuntime.graphFileCount ||
       typeof moduleRuntime.bindingDigest !== "string" ||
       typeof moduleRuntime.candidateEntrySha256 !== "string" ||
-      typeof moduleRuntime.childWrapperSha256 !== "string" ||
       typeof moduleRuntime.dependencyTreeSha256 !== "string" ||
+      typeof moduleRuntime.graphSha256 !== "string" ||
+      typeof moduleRuntime.linkerSha256 !== "string" ||
       typeof moduleRuntime.loaderSha256 !== "string" ||
       typeof moduleRuntime.nativePackageSha256 !== "string" ||
       typeof moduleRuntime.pluginPackageSha256 !== "string" ||
       typeof moduleRuntime.revision !== "string" ||
       typeof moduleRuntime.runtimeExecutableSha256 !== "string" ||
-      typeof moduleRuntime.supervisorSha256 !== "string" ||
+      typeof moduleRuntime.runtimeProductVersion !== "string" ||
 
       typeof evidence.nativePackageSha256 !== "string" ||
       typeof evidence.pluginPackageSha256 !== "string"
@@ -366,14 +399,13 @@ export function classifyCertificationEvidence(evidence: unknown): ClassifiedEvid
     validateDigest(daemon.startTokenSha256)
     validateDigest(daemon.runDigest)
     validateDigest(loadDiagnostics.sha256)
-    validateDigest(moduleRuntime.acknowledgementSha256)
     validateDigest(moduleRuntime.bindingDigest)
     validateDigest(moduleRuntime.candidateEntrySha256)
-    validateDigest(moduleRuntime.childWrapperSha256)
     validateDigest(moduleRuntime.dependencyTreeSha256)
+    validateDigest(moduleRuntime.graphSha256)
+    validateDigest(moduleRuntime.linkerSha256)
     validateDigest(moduleRuntime.loaderSha256)
     validateDigest(moduleRuntime.runtimeExecutableSha256)
-    validateDigest(moduleRuntime.supervisorSha256)
     validateRevision(moduleRuntime.revision)
 
     if (

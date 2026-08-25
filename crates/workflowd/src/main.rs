@@ -1,5 +1,7 @@
 use std::{ffi::OsString, path::PathBuf};
 
+mod verification_job;
+
 enum Command {
     Backup {
         data_directory: PathBuf,
@@ -13,6 +15,8 @@ enum Command {
         pid: u32,
         process_start_time_unix_millis: u64,
     },
+    VerificationJobChild,
+    VerificationJobHost,
 }
 
 #[tokio::main]
@@ -53,6 +57,12 @@ async fn main() {
                 eprintln!("workflowd certification exit verification failed: {error}");
                 std::process::exit(1);
             }
+        }
+        Ok(Command::VerificationJobChild) => {
+            std::process::exit(verification_job::run_child());
+        }
+        Ok(Command::VerificationJobHost) => {
+            std::process::exit(verification_job::run_host());
         }
         Err(error) => {
             eprintln!("workflowd failed: {error}");
@@ -113,8 +123,10 @@ fn parse_command(arguments: Vec<OsString>) -> Result<Command, &'static str> {
                 process_start_time_unix_millis: positive_u64(process_start)?,
             })
         }
+        [flag] if flag == "--verification-job-child" => Ok(Command::VerificationJobChild),
+        [flag] if flag == "--verification-job-host" => Ok(Command::VerificationJobHost),
         _ => Err(
-            "expected --data-dir <absolute-path>, the fully bound certification serve form, --certification-wait-exit <pid> --certification-process-start <millis>, or --backup-data-dir <absolute-path> --backup-to <absolute-path>",
+            "expected --data-dir <absolute-path>, the fully bound certification serve form, --certification-wait-exit <pid> --certification-process-start <millis>, --verification-job-host, --verification-job-child, or --backup-data-dir <absolute-path> --backup-to <absolute-path>",
         ),
     }
 }

@@ -1914,6 +1914,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
  "workflow-code-intel",
  "workflow-core",
  "workflow-ipc",

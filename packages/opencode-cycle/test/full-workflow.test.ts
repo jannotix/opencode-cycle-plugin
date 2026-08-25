@@ -1,10 +1,42 @@
-import { expect, test } from "bun:test"
-import { execFile } from "node:child_process"
+import { expect, mock, test } from "bun:test"
+import { execFile, spawn } from "node:child_process"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { runFullWorkflow } from "../src/orchestration/full-workflow.js"
+mock.module("../src/orchestration/task-verification-windows.js", () => ({
+  spawnWindowsVerificationJobHost(input: {
+    readonly args: readonly string[]
+    readonly directory: string
+    readonly environment: NodeJS.ProcessEnv
+    readonly tool: string
+  }) {
+    const child = spawn(input.tool, [...input.args], {
+      cwd: input.directory,
+      env: input.environment,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    if (child.pid === undefined || child.stdout === null || child.stderr === null) {
+      throw new Error("test Job host failed to start")
+    }
+    const exited = new Promise<number>((resolveExit, reject) => {
+      child.once("error", reject)
+      child.once("exit", (code) => resolveExit(code ?? 1))
+    })
+    return {
+      exited,
+      pid: child.pid,
+      stderr: child.stderr,
+      stdout: child.stdout,
+      async terminate() {
+        if (child.exitCode === null && child.signalCode === null) child.kill()
+        await exited
+      },
+    }
+  },
+}))
+const { runFullWorkflow } = await import("../src/orchestration/full-workflow.js")
 
 for (const mode of ["full", "quick"] as const) {
   test(`${mode} workflow automatically repairs a rejected candidate and reruns required gates`, async () => {
@@ -131,6 +163,9 @@ for (const mode of ["full", "quick"] as const) {
     async control() {
       statusCalls += 1
       return { state: statusCalls === 1 ? "paused" : "execution" }
+    },
+    async nativeBinaryPath() {
+      return process.execPath
     },
     async freezeCandidate(
       _project: string,

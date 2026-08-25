@@ -360,6 +360,7 @@ async function finalizeSubmittedTask(
     revision: result.revision,
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     task,
+    verificationHostPath: await controlPlane.nativeBinaryPath(),
   })
   await controlPlane.audit(
     observation(

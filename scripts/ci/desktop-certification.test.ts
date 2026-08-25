@@ -132,6 +132,11 @@ for (const platform of ["windows-x64", "linux-x64"] as const) {
 
 const asset: DesktopAsset = {
   name: "opencode-desktop-win-x64.exe",
+  runtimeExecutable: {
+    name: "OpenCode.exe",
+    productVersion: "1.18.21.0",
+    sha256: "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999",
+  },
   sha256: "a".repeat(64),
   size: 123,
   url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-win-x64.exe",
@@ -167,12 +172,22 @@ test("Desktop asset matrix is the exact official OpenCode 1.18.21 Windows/Linux 
     assets: {
       "linux-x64": {
         name: "opencode-desktop-linux-x86_64.AppImage",
+        runtimeExecutable: {
+          name: "ai.opencode.desktop",
+          productVersion: "1.18.21",
+          sha256: "008c5cf72df686019c818d2cb0570df8137b49aa5dae64dcf017ea2656c5b7ac",
+        },
         sha256: "fb384fc4f030aca8624d775b8757cafa39b5871fc0eddeecebb128f25ed649d8",
         size: 158_944_115,
         url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-linux-x86_64.AppImage",
       },
       "windows-x64": {
         name: "opencode-desktop-win-x64.exe",
+        runtimeExecutable: {
+          name: "OpenCode.exe",
+          productVersion: "1.18.21.0",
+          sha256: "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999",
+        },
         sha256: "3bd1a81d8fcb377a6bda60a9abf8d412aca1c9c702218ddbbdf7c7b09deaa739",
         size: 126_209_592,
         url: "https://github.com/anomalyco/opencode/releases/download/v1.18.21/opencode-desktop-win-x64.exe",
@@ -446,7 +461,7 @@ test("native certification requires an official Electron module-runtime guard be
   expect(launch).toBeGreaterThan(guard)
 })
 
-test("Desktop runtime guard isolates candidate import from the trusted supervisor", async () => {
+test("Desktop runtime guard uses the trusted non-evaluating linker under the pinned runtime", async () => {
   const node = Bun.which("node")
   expect(node).toBeString()
   const fixture = await createDesktopLoadFixture()
@@ -456,120 +471,51 @@ test("Desktop runtime guard isolates candidate import from the trusted superviso
       cwd: fixture.temporary,
       environment: fixture.environment,
       hostVersion: "1.18.21",
+      platform: "windows-x64",
       prepared: fixture.prepared,
       runtimeCommand: [node as string],
       scratch: fixture.temporary,
     })
-    const [childSource, supervisorSource] = await Promise.all([
-      readFile(plan.expected.childWrapper, "utf8"),
-      readFile(plan.expected.supervisor, "utf8"),
+    const linkerSource = await readFile(plan.expected.linker, "utf8")
+    const syntax = Bun.spawn([node as string, "--check", plan.expected.linker], {
+      stderr: "ignore",
+      stdout: "ignore",
+      windowsHide: true,
+    })
+    expect(await syntax.exited).toBe(0)
+    expect(plan.command).toEqual([
+      node as string,
+      "--no-warnings",
+      "--experimental-vm-modules",
+      "--experimental-import-meta-resolve",
+      plan.expected.linker,
     ])
-    const syntaxExits = await Promise.all(
-      [plan.expected.childWrapper, plan.expected.supervisor].map(async (path) => {
-        const child = Bun.spawn([node as string, "--check", path], {
-          stderr: "ignore",
-          stdout: "ignore",
-          windowsHide: true,
-        })
-        return child.exited
-      }),
+    expect(linkerSource).toContain("await entry.link(")
+    expect(linkerSource).toContain("SourceTextModule")
+    expect(linkerSource).not.toContain(".evaluate(")
+    expect(linkerSource).not.toContain("fork(")
+    expect(linkerSource).not.toContain("createHmac")
+    expect(linkerSource).not.toContain("await import(pathToFileURL(expected.candidateEntry)")
+    expect(plan.expected.runtimeExecutableSha256).toBe(
+      "c96920bb1d1a4dc5cee64d33c404224e3c37c79111007e3aea861b448e2c4999",
     )
-    expect(syntaxExits).toEqual([0, 0])
-
-    const encodedResultFile = JSON.stringify(plan.expected.resultFile).slice(1, -1)
-    const encodedBindingRoot = JSON.stringify(fixture.binding.root).slice(1, -1)
-    expect(plan.command).toEqual([node as string, plan.expected.supervisor])
-    expect(supervisorSource).toContain("fork(expected.childWrapper")
-    expect(supervisorSource).toContain(encodedResultFile)
-    expect(childSource).toContain("await import(pathToFileURL(expected.candidateEntry).href)")
-    expect(childSource).not.toContain(encodedResultFile)
-    expect(childSource).not.toContain(encodedBindingRoot)
-    expect(childSource).not.toContain(fixture.binding.nonce)
-    expect(Object.keys(plan.expected.childEnvironment).some((key) =>
-      key.startsWith("CYCLE_") || key.startsWith("OPENCODE_")
-    )).toBe(false)
+    expect(plan.expected.runtimeProductVersion).toBe("1.18.21.0")
     expect(plan.expected.dependencyTree).toEqual(fixture.prepared.dependencyTree)
-    expect(plan.expected.childWrapperSha256).toMatch(/^[0-9a-f]{64}$/u)
-    expect(plan.expected.supervisorSha256).toMatch(/^[0-9a-f]{64}$/u)
+    expect(plan.expected.linkerSha256).toMatch(/^[0-9a-f]{64}$/u)
   } finally {
     await rm(fixture.temporary, { force: true, recursive: true })
   }
 })
 
-test("runtime child acknowledgement cannot be replaced by exit zero or predictable output", async () => {
+test("Desktop runtime authority exposes no candidate-child HMAC path", async () => {
   const module = await import("./desktop-certification.js") as Record<string, unknown>
-  const acknowledge = module.createDesktopRuntimeAcknowledgement
-  const validate = module.validateDesktopRuntimeChildResult
-  const childEnvironment = module.desktopRuntimeChildEnvironment
-  expect(acknowledge).toBeFunction()
-  expect(validate).toBeFunction()
-  expect(childEnvironment).toBeFunction()
-  if (
-    typeof acknowledge !== "function" ||
-    typeof validate !== "function" ||
-    typeof childEnvironment !== "function"
-  ) return
-  const challenge = Buffer.from("11".repeat(32), "hex")
-  const payload = {
-    candidateEntrySha256: "a".repeat(64),
-    childWrapperSha256: "b".repeat(64),
-    dependencyTreeSha256: "c".repeat(64),
-    electronVersion: "42.3.3",
-    nodeVersion: "24.15.0",
-    runtimeExecutableSha256: "d".repeat(64),
-  }
-  const createAck = acknowledge as (challenge: Buffer, payload: Record<string, unknown>) => string
-  const verify = validate as (input: Record<string, unknown>) => void
-  const acknowledgement = createAck(challenge, payload)
-
-  expect(() => verify({
-    challenge,
-    exitCode: 0,
-    expectedPayload: payload,
-    stderr: Buffer.alloc(0),
-    stdout: Buffer.alloc(0),
-  })).toThrow("acknowledgement")
-  expect(() => verify({
-    challenge,
-    exitCode: 0,
-    expectedPayload: payload,
-    stderr: Buffer.alloc(0),
-    stdout: Buffer.from(JSON.stringify({
-      acknowledgement: "0".repeat(64),
-      payload,
-      type: "runtime-imported",
-    }) + "\n"),
-  })).toThrow("acknowledgement")
-  expect(() => verify({
-    challenge,
-    exitCode: 0,
-    expectedPayload: payload,
-    stderr: Buffer.alloc(0),
-    stdout: Buffer.from(JSON.stringify({
-      acknowledgement,
-      payload,
-      type: "runtime-imported",
-    }) + "\n"),
-  })).not.toThrow()
-
-  const privateEnvironment = (childEnvironment as (
-    environment: NodeJS.ProcessEnv,
-  ) => Record<string, string>)({
-    CYCLE_CERTIFICATION_NONCE: "private",
-    CYCLE_CERTIFICATION_ROOT: "private-root",
-    CYCLE_DESKTOP_RUNTIME_GUARD: "private-guard",
-    OPENCODE_CONFIG: "private-config",
-    PATH: "safe-path",
-    SystemRoot: "C:\\Windows",
-  })
-  expect(privateEnvironment).toEqual(expect.objectContaining({
-    ELECTRON_RUN_AS_NODE: "1",
-    PATH: "safe-path",
-    SystemRoot: "C:\\Windows",
-  }))
-  expect(Object.keys(privateEnvironment).some((key) =>
-    key.startsWith("CYCLE_") || key.startsWith("OPENCODE_")
-  )).toBe(false)
+  const source = await readFile(resolve(import.meta.dir, "desktop-certification.ts"), "utf8")
+  expect(module.createDesktopRuntimeAcknowledgement).toBeUndefined()
+  expect(module.validateDesktopRuntimeChildResult).toBeUndefined()
+  expect(source).not.toContain("desktopRuntimeChildSource")
+  expect(source).not.toContain("desktopRuntimeSupervisorSource")
+  expect(source).toContain("candidateEvaluated: false")
+  expect(source).toContain("moduleLinked: true")
 })
 
 test("Desktop dependency proof rejects ancestor fallback and binds a contained tree", async () => {
@@ -1381,6 +1327,11 @@ test("Desktop download retries a reset connection and verifies exact bytes", asy
     await fetchDesktopAsset(
       {
         name: "fixture",
+        runtimeExecutable: {
+          name: "fixture-runtime",
+          productVersion: "1.18.21",
+          sha256: "f".repeat(64),
+        },
         sha256: createHash("sha256").update(bytes).digest("hex"),
         size: bytes.length,
         url: "https://example.invalid/fixture",
