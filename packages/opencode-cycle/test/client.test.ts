@@ -572,12 +572,15 @@ test("missing required environment fails before filesystem access", () => {
   expect(() => resolveDataDirectory("freebsd", { HOME: "/home/person" })).toThrow(ControlPlaneError)
 })
 
-test("selects only certified native packages", () => {
+test("selects the native package shipped for each supported target", () => {
   expect(nativePackageName("win32", "x64")).toBe("@opencode-cycle/native-win32-x64")
   expect(nativePackageName("linux", "x64")).toBe("@opencode-cycle/native-linux-x64")
-  expect(() => nativePackageName("darwin", "x64")).toThrow(ControlPlaneError)
-  expect(() => nativePackageName("darwin", "arm64")).toThrow(ControlPlaneError)
+  // macOS is compatible but untested: the package resolves so the product
+  // runs, while certification stays a Windows and Linux claim only.
+  expect(nativePackageName("darwin", "x64")).toBe("@opencode-cycle/native-darwin-x64")
+  expect(nativePackageName("darwin", "arm64")).toBe("@opencode-cycle/native-darwin-arm64")
   expect(() => nativePackageName("linux", "arm64")).toThrow(ControlPlaneError)
+  expect(() => nativePackageName("win32", "arm64")).toThrow(ControlPlaneError)
   expect(() => nativePackageName("freebsd", "x64")).toThrow(ControlPlaneError)
 })
 

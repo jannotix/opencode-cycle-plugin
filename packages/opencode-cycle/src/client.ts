@@ -1501,9 +1501,10 @@ function requiredEnvironment(environment: NodeJS.ProcessEnv, name: string): stri
 
 export function nativePackageName(platform: NodeJS.Platform, architecture: string): string {
   const target = `${platform}-${architecture}`
-  if (!["linux-x64", "win32-x64"].includes(target)) {
+  if (!["darwin-arm64", "darwin-x64", "linux-x64", "win32-x64"].includes(target)) {
     throw new ControlPlaneError(
-      `unsupported native platform ${target}; supported targets are linux-x64 and win32-x64`,
+      `unsupported native platform ${target}; supported targets are ` +
+        "linux-x64, win32-x64, darwin-x64 and darwin-arm64",
     )
   }
   return `@opencode-cycle/native-${target}`
@@ -1512,9 +1513,15 @@ export function nativePackageName(platform: NodeJS.Platform, architecture: strin
 function packagedBinaryPath(platform: NodeJS.Platform, architecture: string): string {
   const packageName = nativePackageName(platform, architecture)
   try {
-    const resolved = platform === "linux"
+    // Every specifier stays a literal: the packaged Desktop module linker
+    // verifies this graph statically and rejects computed module loading.
+    const resolved = packageName === "@opencode-cycle/native-linux-x64"
       ? import.meta.resolve("@opencode-cycle/native-linux-x64")
-      : import.meta.resolve("@opencode-cycle/native-win32-x64")
+      : packageName === "@opencode-cycle/native-win32-x64"
+        ? import.meta.resolve("@opencode-cycle/native-win32-x64")
+        : packageName === "@opencode-cycle/native-darwin-arm64"
+          ? import.meta.resolve("@opencode-cycle/native-darwin-arm64")
+          : import.meta.resolve("@opencode-cycle/native-darwin-x64")
     return fileURLToPath(resolved)
   } catch (cause) {
     throw new ControlPlaneError(

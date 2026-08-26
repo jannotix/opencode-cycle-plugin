@@ -19,6 +19,8 @@ test("workspace publishes only OpenCode Cycle identities", async () => {
   expect(plugin.name).toBe("opencode-cycle")
   expect(plugin.repository).toBe("https://github.com/jannotix/opencode-cycle-plugin")
   expect(Object.keys(plugin.optionalDependencies).sort()).toEqual([
+    "@opencode-cycle/native-darwin-arm64",
+    "@opencode-cycle/native-darwin-x64",
     "@opencode-cycle/native-linux-x64",
     "@opencode-cycle/native-win32-x64",
   ])
@@ -39,6 +41,8 @@ test("workspace pins the certified toolchain and production allowlist", async ()
   )
   expect(plugin.version).toBe("1.0.0")
   expect(root.workspaces).toEqual([
+    "packages/native-darwin-arm64",
+    "packages/native-darwin-x64",
     "packages/native-linux-x64",
     "packages/native-win32-x64",
     "packages/opencode-cycle",
@@ -56,12 +60,16 @@ test("workspace pins the certified toolchain and production allowlist", async ()
     "NOTICE",
   ])
   expect(plugin.optionalDependencies).toEqual({
+    "@opencode-cycle/native-darwin-arm64": "1.0.0",
+    "@opencode-cycle/native-darwin-x64": "1.0.0",
     "@opencode-cycle/native-linux-x64": "1.0.0",
     "@opencode-cycle/native-win32-x64": "1.0.0",
   })
 })
 
 for (const [target, os, cpu] of [
+  ["darwin-arm64", "darwin", "arm64"],
+  ["darwin-x64", "darwin", "x64"],
   ["linux-x64", "linux", "x64"],
   ["win32-x64", "win32", "x64"],
 ] as const) {

@@ -253,6 +253,8 @@ export async function collectPackedJavaScriptInventory(
   const lock = parseBunLock(lockText)
   const expectedNames = new Map([
     [`opencode-cycle-${releaseVersion}.tgz`, PRODUCT_IDENTITY.mainPackage],
+    [`opencode-cycle-native-darwin-arm64-${releaseVersion}.tgz`, "@opencode-cycle/native-darwin-arm64"],
+    [`opencode-cycle-native-darwin-x64-${releaseVersion}.tgz`, "@opencode-cycle/native-darwin-x64"],
     [`opencode-cycle-native-linux-x64-${releaseVersion}.tgz`, "@opencode-cycle/native-linux-x64"],
     [`opencode-cycle-native-win32-x64-${releaseVersion}.tgz`, "@opencode-cycle/native-win32-x64"],
   ])
@@ -496,6 +498,8 @@ function assertPackedManifestAllowlist(manifest: PackedManifest): void {
     : {}
   const optionalDependencies = manifest.name === PRODUCT_IDENTITY.mainPackage
     ? {
+        "@opencode-cycle/native-darwin-arm64": "1.0.0",
+        "@opencode-cycle/native-darwin-x64": "1.0.0",
         "@opencode-cycle/native-linux-x64": "1.0.0",
         "@opencode-cycle/native-win32-x64": "1.0.0",
       }

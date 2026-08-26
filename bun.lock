@@ -21,6 +21,14 @@
         "yaml": "2.9.0",
       },
     },
+    "packages/native-darwin-arm64": {
+      "name": "@opencode-cycle/native-darwin-arm64",
+      "version": "1.0.0",
+    },
+    "packages/native-darwin-x64": {
+      "name": "@opencode-cycle/native-darwin-x64",
+      "version": "1.0.0",
+    },
     "packages/native-linux-x64": {
       "name": "@opencode-cycle/native-linux-x64",
       "version": "1.0.0",
@@ -39,6 +47,8 @@
         "puppeteer-core": "25.6.0",
       },
       "optionalDependencies": {
+        "@opencode-cycle/native-darwin-arm64": "1.0.0",
+        "@opencode-cycle/native-darwin-x64": "1.0.0",
         "@opencode-cycle/native-linux-x64": "1.0.0",
         "@opencode-cycle/native-win32-x64": "1.0.0",
       },
@@ -74,6 +84,10 @@
     "@opencode-ai/plugin": ["@opencode-ai/plugin@1.18.21", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.18.21", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-wQXMbSvg3pG75F8fYAiJxYuyr6Cl9Hd74lSCY2yznZnejpwa+ksd2kMphmgSo+/UgLhb2AId9KAI6dsRhprzTg=="],
 
     "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.21", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-k6iHQ5C8wOPglk+LgFyYnst168cGMQYumgpbVoeXJ+iC1AtvwD5zmjuF8CxMze/y9G1K2bOeO6p9yRvA7eHZLA=="],
+
+    "@opencode-cycle/native-darwin-arm64": ["@opencode-cycle/native-darwin-arm64@workspace:packages/native-darwin-arm64"],
+
+    "@opencode-cycle/native-darwin-x64": ["@opencode-cycle/native-darwin-x64@workspace:packages/native-darwin-x64"],
 
     "@opencode-cycle/native-linux-x64": ["@opencode-cycle/native-linux-x64@workspace:packages/native-linux-x64"],
 

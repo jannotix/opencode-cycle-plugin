@@ -4,21 +4,27 @@ import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 
 import { auditProductIdentity } from "./check-product-identity.js"
-import { NATIVE_PACKAGE_NAMES, SHIPPED_NATIVE_PACKAGE_NAMES } from "../product-identity.js"
+import {
+  CERTIFIED_NATIVE_PACKAGE_NAMES,
+  NATIVE_PACKAGE_NAMES,
+  SHIPPED_NATIVE_PACKAGE_NAMES,
+} from "../product-identity.js"
 
 const legacyProduct = ["OpenCode", "WorkFlow"].join(" ")
 const legacyPackage = ["opencode", "workflow"].join("-")
 const legacyPluginExport = `OpenCode${"Workflow"}`
 const legacyCommand = `/${"workflow"}`
 
-test("v1 declares exactly the supported Windows and Linux native packages", () => {
+test("v1 ships four native packages and certifies only Windows and Linux", () => {
   const expected = [
+    "@opencode-cycle/native-darwin-arm64",
+    "@opencode-cycle/native-darwin-x64",
     "@opencode-cycle/native-linux-x64",
     "@opencode-cycle/native-win32-x64",
   ] as const
   expect(NATIVE_PACKAGE_NAMES).toEqual(expected)
   expect(SHIPPED_NATIVE_PACKAGE_NAMES).toEqual(expected)
-  expect(JSON.stringify({ NATIVE_PACKAGE_NAMES, SHIPPED_NATIVE_PACKAGE_NAMES })).not.toContain("darwin")
+  expect(JSON.stringify(CERTIFIED_NATIVE_PACKAGE_NAMES)).not.toContain("darwin")
 })
 
 test(

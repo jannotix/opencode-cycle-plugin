@@ -7,6 +7,8 @@ import { NATIVE_PACKAGE_NAMES } from "../product-identity.js"
 import { inspectTarGz } from "./tar-archive.js"
 
 export const NATIVE_TARGETS = {
+  "darwin-arm64": { cpu: "arm64", executable: "workflowd", os: "darwin" },
+  "darwin-x64": { cpu: "x64", executable: "workflowd", os: "darwin" },
   "linux-x64": { cpu: "x64", executable: "workflowd", os: "linux" },
   "win32-x64": { cpu: "x64", executable: "workflowd.exe", os: "win32" },
 } as const

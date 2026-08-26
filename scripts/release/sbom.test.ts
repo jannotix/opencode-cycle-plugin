@@ -129,6 +129,8 @@ describe("release SBOM", () => {
     const packed = await Promise.all(
       [
         ["opencode-cycle", `opencode-cycle-${version}.tgz`],
+        ["native-darwin-arm64", `opencode-cycle-native-darwin-arm64-${version}.tgz`],
+        ["native-darwin-x64", `opencode-cycle-native-darwin-x64-${version}.tgz`],
         ["native-linux-x64", `opencode-cycle-native-linux-x64-${version}.tgz`],
         ["native-win32-x64", `opencode-cycle-native-win32-x64-${version}.tgz`],
       ].map(async ([directory, name]) => {
@@ -139,6 +141,8 @@ describe("release SBOM", () => {
     const lock = await readFile(join(root, "bun.lock"), "utf8")
     const inventory = await collectPackedJavaScriptInventory(root, packed, version, lock)
     expect(inventory.roots).toEqual([
+      "@opencode-cycle/native-darwin-arm64@1.0.0",
+      "@opencode-cycle/native-darwin-x64@1.0.0",
       "@opencode-cycle/native-linux-x64@1.0.0",
       "@opencode-cycle/native-win32-x64@1.0.0",
       "opencode-cycle@1.0.0",
