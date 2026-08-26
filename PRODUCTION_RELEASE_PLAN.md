@@ -452,7 +452,36 @@ target host before changing the certified-host policy.
 bun scripts/ci/desktop-certification.ts --platform <windows-x64|linux-x64> --plugin-archive <canonical-plugin.tgz> --plugin-provenance <canonical-plugin.provenance.json> --native-archive <native.tgz> --revision <provisional-sha> --output <provisional-receipt.json>
 ```
 
-**Status:** Not started
+**Status:** Blocked on a product finding. Both lanes were run on revision
+`b57680b` from one canonical plugin archive built on the Linux lane
+(`960b3cd9…`, byte-identical on both), with native archives built on their own
+operating systems and the official 1.18.21 assets verified against the pinned
+digests. Both lanes fail at the same stage: `plugin_entry_started=failed`,
+after `certification_env_prepared`, `config_tree_prepared`,
+`config_path_discovered`, `plugin_specifier_resolved`, `effective_env_validated`
+and `candidate_module_resolved` all pass.
+
+The failure is not platform-specific and is not caused by the M1 changes. The
+module runtime guard completes inside the real Desktop 1.18.21 runtime
+(Electron 42.3.3, Node 24.15.0) on both lanes and produces a receipt whose
+`graphSha256`, `graphFileCount` 44, `linkedEsmModuleCount` 42 and
+`suppressedOptionalRootCount` 3 match the packed real-tree proof exactly. The
+generated loader's `expectedPluginOptions` were compared against the Desktop
+config in a preserved scratch and are identical, including key order.
+
+No 1.18.21 Desktop proof has ever succeeded in this environment: every retained
+Windows and Linux receipt records `desktop.version` 1.18.16 and predates the
+module-runtime-guard design entirely, so there is no earlier 1.18.21 evidence
+to compare against.
+
+The remaining unknown is which of the three loader binding checks rejects the
+entry — `validateDesktopPluginInput`, the `binaryPath` comparison, or the
+`options` comparison. Their thrown error is caught and discarded by design, and
+the load-diagnostic status vocabulary is a fixed sanitized set, so isolating it
+requires an owner-approved change to the certification harness diagnostics or
+an investigation of how OpenCode 1.18.21 invokes a plugin compared with
+1.18.16. That work is not started; T06 must not promote 1.18.21 until it is
+resolved.
 
 ### T06 — Promote OpenCode 1.18.21 and remove stale certification claims
 
