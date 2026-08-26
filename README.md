@@ -1,5 +1,9 @@
 # Cycle for OpenCode
 
+<p align="center">
+  <img src="assets/logo.svg" width="160" alt="Cycle logo">
+</p>
+
 Cycle for OpenCode is a native OpenCode plugin for evidence-gated software delivery. It adds one primary `Cycle` agent without replacing OpenCode `Plan` or `Build`.
 
 ## What it is
