@@ -281,10 +281,25 @@ Desktop certification claim.
 **Verification:**
 
 ```text
-bun test packages/opencode-cycle/test/client.test.ts scripts/packaging/plugin-package.test.ts scripts/release/release-manifest.test.ts scripts/release/publication-plan.test.ts scripts/release/release-workflow.test.ts
+bun test packages/opencode-cycle/test/client.test.ts packages/opencode-cycle/test/capabilities.test.ts scripts/packaging/plugin-package.test.ts scripts/release/release-manifest.test.ts scripts/release/publication-plan.test.ts scripts/release/release-workflow.test.ts
 ```
 
-**Status:** Not started
+**Status:** Completed. The two macOS native packages are restored as
+platform-bound workspace members and declared by the plugin as exact-version
+optional dependencies; the client resolves each supported target through a
+literal specifier so the packaged Desktop linker still verifies the graph
+statically. The Release Candidate workflow builds and package-verifies
+`darwin-x64` on `macos-13` and `darwin-arm64` on `macos-15`, and its Desktop
+job remains a Windows and Linux matrix with no macOS lane. Certified and
+compatible-but-untested are now distinct in the release contract: the manifest
+carries a separate `compatibility` array whose record type has no evidence
+field at all, so an untested platform cannot hold a Desktop receipt even under
+malformed input, and the manifest schema is version 2. Publication refuses to
+proceed if a macOS platform is presented as certified, if a compatibility
+status is upgraded, or if the untested platforms are not declared. `/cycle
+doctor` capability output reports platform status and never reports certified
+on an untested platform. README, user manual, getting-started guide and the
+verification guide state the approved wording.
 
 ### T02a — Migrate the publish workflow to npm trusted publishing
 

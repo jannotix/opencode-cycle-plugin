@@ -4,9 +4,12 @@ import { resolve } from "node:path"
 
 import {
   CERTIFIED_HOST_VERSIONS,
+  CERTIFIED_PLATFORM_TARGETS,
+  COMPATIBLE_PLATFORM_TARGETS,
   MINIMUM_HOST_VERSION,
   negotiateCapabilities,
   parseHostVersion,
+  platformCompatibility,
 } from "../src/capabilities.js"
 
 const supportedClient = () => ({
@@ -15,11 +18,43 @@ const supportedClient = () => ({
   session: { abort() {}, children() {}, create() {}, prompt() {}, promptAsync() {} },
 })
 
+test("reports macOS as compatible but untested and never as certified", () => {
+  expect(CERTIFIED_PLATFORM_TARGETS).toEqual(["linux-x64", "win32-x64"])
+  expect(COMPATIBLE_PLATFORM_TARGETS).toEqual(["darwin-arm64", "darwin-x64"])
+
+  for (const [platform, architecture] of [["darwin", "x64"], ["darwin", "arm64"]] as const) {
+    const compatibility = platformCompatibility(platform, architecture)
+    expect(compatibility.supported).toBeTrue()
+    expect(compatibility.certified).toBeFalse()
+    expect(compatibility.message).toContain("compatible but untested")
+
+    // The product still runs; it simply must not claim certification.
+    const result = negotiateCapabilities(supportedClient(), "1.18.16", platform, architecture)
+    expect(result.safeMode).toBeFalse()
+    expect(result.reasons).toEqual([])
+    expect(result.certified).toBeFalse()
+    expect(result.platform.certified).toBeFalse()
+    expect(result.warnings.join(" ")).toContain("compatible but untested")
+  }
+
+  for (const [platform, architecture] of [["linux", "x64"], ["win32", "x64"]] as const) {
+    const result = negotiateCapabilities(supportedClient(), "1.18.16", platform, architecture)
+    expect(result.certified).toBeTrue()
+    expect(result.platform.certified).toBeTrue()
+    expect(result.warnings).toEqual([])
+  }
+
+  const unsupported = negotiateCapabilities(supportedClient(), "1.18.16", "freebsd", "x64")
+  expect(unsupported.platform.supported).toBeFalse()
+  expect(unsupported.safeMode).toBeTrue()
+  expect(unsupported.reasons).toContain("Unsupported platform")
+})
+
 test("enables certified hosts without safe mode", () => {
   expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.16", "1.18.18"])
   expect(MINIMUM_HOST_VERSION).toBe("1.18.16")
   for (const version of CERTIFIED_HOST_VERSIONS) {
-    const result = negotiateCapabilities(supportedClient(), version)
+    const result = negotiateCapabilities(supportedClient(), version, "win32", "x64")
     expect(result.safeMode).toBeFalse()
     expect(result.certified).toBeTrue()
     expect(result.host.certified).toBeTrue()

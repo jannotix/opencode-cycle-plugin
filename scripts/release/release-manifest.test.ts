@@ -8,6 +8,7 @@ import {
   buildReleaseManifest,
   CERTIFIED_PLATFORMS,
   classifyCertificationEvidence,
+  COMPATIBLE_PLATFORMS,
   DECLARED_DESKTOP_PLATFORMS,
   verifyArtifactDirectory,
 } from "./release-manifest.js"
@@ -23,6 +24,8 @@ const qualityEvidence = [
 
 const expectedArtifactContents = new Map([
   [`opencode-cycle-${version}.tgz`, "plugin"],
+  [`opencode-cycle-native-darwin-arm64-${version}.tgz`, "darwin-arm64"],
+  [`opencode-cycle-native-darwin-x64-${version}.tgz`, "darwin-x64"],
   [`opencode-cycle-native-linux-x64-${version}.tgz`, "linux"],
   [`opencode-cycle-native-win32-x64-${version}.tgz`, "windows"],
 ])
@@ -52,6 +55,20 @@ function manifestCertifications() {
       pluginArtifact: { name: plugin.name, sha256: plugin.sha256 },
       revision,
       status: "certified" as const,
+    }
+  })
+}
+
+function manifestCompatibility() {
+  const artifacts = new Map(manifestArtifacts().map((artifact) => [artifact.name, artifact]))
+  return (["darwin-arm64", "darwin-x64"] as const).map((platform) => {
+    const native = artifacts.get(
+      `opencode-cycle-native-${platform}-${version}.tgz`,
+    ) as ReturnType<typeof manifestArtifacts>[number]
+    return {
+      nativeArtifact: { name: native.name, sha256: native.sha256 },
+      platform,
+      status: "compatible-but-untested" as const,
     }
   })
 }
@@ -236,15 +253,19 @@ async function runManifestFixture(options: {
 }
 
 describe("release manifest", () => {
-  test("v1 declares only Windows x64 and Linux x64", () => {
+  test("v1 certifies only Windows x64 and Linux x64", () => {
     expect(DECLARED_DESKTOP_PLATFORMS).toEqual(["linux-x64", "windows-x64"])
     expect(CERTIFIED_PLATFORMS).toEqual(["linux-x64", "windows-x64"])
+    expect(COMPATIBLE_PLATFORMS).toEqual(["darwin-arm64", "darwin-x64"])
+    expect(CERTIFIED_PLATFORMS.some((platform) =>
+      (COMPATIBLE_PLATFORMS as readonly string[]).includes(platform))).toBeFalse()
   })
   test("sorts artifacts and rejects missing certification lanes", () => {
     expect(() =>
       buildReleaseManifest({
         artifacts: manifestArtifacts(),
         certifications: [manifestCertifications()[1] as ReturnType<typeof manifestCertifications>[number]],
+        compatibility: manifestCompatibility(),
         qualityEvidence,
         revision,
         version,
@@ -262,8 +283,63 @@ describe("release manifest", () => {
       },
     }
     expect(() => buildReleaseManifest({
-      artifacts: manifestArtifacts(), certifications, qualityEvidence, revision, version,
+      artifacts: manifestArtifacts(),
+      certifications,
+      compatibility: manifestCompatibility(),
+      qualityEvidence,
+      revision,
+      version,
     })).toThrow("same plugin package SHA-256")
+  })
+
+  test("macOS ships only as compatible but untested, never as certified", () => {
+    const base = {
+      artifacts: manifestArtifacts(),
+      certifications: manifestCertifications(),
+      qualityEvidence,
+      revision,
+      version,
+    }
+    const manifest = buildReleaseManifest({ ...base, compatibility: manifestCompatibility() })
+    expect(manifest.compatibility.map((item) => `${item.platform}:${item.status}`)).toEqual([
+      "darwin-arm64:compatible-but-untested",
+      "darwin-x64:compatible-but-untested",
+    ])
+    expect(manifest.certifications.map((item) => item.platform)).toEqual([
+      "linux-x64",
+      "windows-x64",
+    ])
+
+    // A macOS platform must never be accepted as a certification lane.
+    const smuggled = manifestCertifications()
+    expect(() => buildReleaseManifest({
+      ...base,
+      certifications: [
+        ...smuggled,
+        { ...smuggled[0]!, platform: "darwin-x64" as never },
+      ],
+      compatibility: manifestCompatibility(),
+    })).toThrow(/certification platform/u)
+
+    // A compatibility record must never carry certification material.
+    expect(() => buildReleaseManifest({
+      ...base,
+      compatibility: manifestCompatibility().map((item, index) =>
+        index === 0 ? { ...item, evidenceSha256: "a".repeat(64) } as never : item),
+    })).toThrow(/compatibility record/u)
+
+    // Its status must not be silently upgraded.
+    expect(() => buildReleaseManifest({
+      ...base,
+      compatibility: manifestCompatibility().map((item, index) =>
+        index === 0 ? { ...item, status: "certified" } as never : item),
+    })).toThrow(/compatible-but-untested/u)
+
+    // Every declared untested platform must be present.
+    expect(() => buildReleaseManifest({
+      ...base,
+      compatibility: [manifestCompatibility()[0] as ReturnType<typeof manifestCompatibility>[number]],
+    })).toThrow(/Missing compatibility declaration/u)
   })
 
   test("rejects a missing Windows or Linux release artifact", async () => {
@@ -272,10 +348,16 @@ describe("release manifest", () => {
     expect((await runManifestFixture({ artifacts })).exitCode).not.toBe(0)
   })
 
-  test("rejects any macOS release material", async () => {
+  test("rejects a missing macOS release artifact", async () => {
     const artifacts = new Map(expectedArtifactContents)
-    artifacts.set(`opencode-cycle-native-darwin-x64-${version}.tgz`, "macos")
+    artifacts.delete(`opencode-cycle-native-darwin-x64-${version}.tgz`)
     expect((await runManifestFixture({ artifacts })).exitCode).not.toBe(0)
+  })
+
+  test("rejects a Desktop receipt that claims a macOS platform", async () => {
+    const evidence = certificationEvidence()
+    evidence[2] = { ...evidence[2], platform: "darwin-x64" }
+    expect((await runManifestFixture({ evidence })).exitCode).not.toBe(0)
   })
 
   test("rejects a receipt bound to a different revision", async () => {
@@ -365,6 +447,7 @@ describe("release manifest", () => {
     const input = {
       artifacts: manifestArtifacts().reverse(),
       certifications: manifestCertifications().reverse(),
+      compatibility: manifestCompatibility().reverse(),
       qualityEvidence: [...qualityEvidence].reverse(),
       revision,
       version,
@@ -373,8 +456,11 @@ describe("release manifest", () => {
     const manifest = buildReleaseManifest(input)
 
     expect(manifest.product).toBe("Cycle for OpenCode")
+    expect(manifest.schemaVersion).toBe(2)
     expect(manifest.artifacts.map((artifact) => artifact.name)).toEqual([
       `opencode-cycle-${version}.tgz`,
+      `opencode-cycle-native-darwin-arm64-${version}.tgz`,
+      `opencode-cycle-native-darwin-x64-${version}.tgz`,
       `opencode-cycle-native-linux-x64-${version}.tgz`,
       `opencode-cycle-native-win32-x64-${version}.tgz`,
     ])
@@ -385,6 +471,10 @@ describe("release manifest", () => {
     expect(manifest.certifications.map((item) => item.status)).toEqual([
       "certified",
       "certified",
+    ])
+    expect(manifest.compatibility.map((item) => item.platform)).toEqual([
+      "darwin-arm64",
+      "darwin-x64",
     ])
     expect(manifest.qualityEvidence.map((item) => item.name)).toEqual([
       "codebase-500k",

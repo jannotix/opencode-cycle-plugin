@@ -641,7 +641,7 @@ Useful commands:
 
 ## 23. Updates, Backups, and Removal
 
-Before changing plugin versions, close OpenCode Desktop and copy the entire data directory. Version 1.0.0 supports Windows x64 and Linux x64 only; it does not ship macOS packages. Supported installations keep the existing data-directory folder name so current installs are not moved:
+Before changing plugin versions, close OpenCode Desktop and copy the entire data directory. Version 1.0.0 certifies Windows x64 and Linux x64 on OpenCode Desktop 1.18.21; macOS x64 and macOS arm64 ship as compatible but untested, meaning their packages are published and resolvable and no Desktop certification evidence covers them. Supported installations keep the existing data-directory folder name so current installs are not moved:
 
 | Platform | Data directory |
 | --- | --- |

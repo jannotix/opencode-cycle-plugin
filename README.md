@@ -29,7 +29,7 @@ Cycle for OpenCode keeps the original request immutable, separates implementatio
 - Small work stays cheap (`auto` / `quick`). Risky work takes the full independent cycle.
 - Real project tools and Git freeze/delivery, not a summary of what an agent claims it did.
 - Durable state lives outside the OpenCode install, so OpenCode updates do not wipe workflows.
-- Version 1.0.0 supports Windows x64 and Linux x64 only; it does not ship macOS packages.
+- Version 1.0.0 certifies Windows x64 and Linux x64; macOS x64 and arm64 are compatible but untested.
 
 ## Install
 
@@ -57,6 +57,17 @@ No separate application, Rust toolchain, service account or API key is required.
 2. Restart OpenCode Desktop.
 
 This disables the plugin and keeps your project files. Local Cycle state is preserved on purpose. Delete it only after OpenCode is closed and you no longer need history, memory or recoverable worktrees.
+
+## Platform support
+
+| Platform | Status |
+| --- | --- |
+| Windows x64 | Certified on OpenCode Desktop 1.18.21 |
+| Linux x64 | Certified on OpenCode Desktop 1.18.21 |
+| macOS x64 | Compatible but untested |
+| macOS arm64 | Compatible but untested |
+
+Certified means a Desktop certification receipt exists for that platform on the released revision. Compatible but untested means the packages are built, published and resolvable, and no Desktop certification evidence covers them; `/cycle doctor` reports the distinction for the platform you are on.
 
 The product name is Cycle for OpenCode. Supported installations keep the existing data-directory folder name so current installs are not moved:
 

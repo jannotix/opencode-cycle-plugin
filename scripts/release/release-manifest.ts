@@ -8,10 +8,17 @@ export const REQUIRED_CERTIFIED_PLATFORMS = ["linux-x64", "windows-x64"] as cons
 export const DECLARED_DESKTOP_PLATFORMS = REQUIRED_CERTIFIED_PLATFORMS
 export const CERTIFIED_PLATFORMS = DECLARED_DESKTOP_PLATFORMS
 
+// macOS ships as a published, resolvable package with no Desktop certification
+// lane, receipt or claim. It is never a member of the certified platform set.
+export const COMPATIBLE_PLATFORMS = ["darwin-arm64", "darwin-x64"] as const
+export const COMPATIBILITY_STATUS = "compatible-but-untested" as const
+
 export const QUALITY_EVIDENCE_NAMES = ["codebase-500k", "critical-suite"] as const
 
 export type CertifiedPlatform = (typeof DECLARED_DESKTOP_PLATFORMS)[number]
+export type CompatiblePlatform = (typeof COMPATIBLE_PLATFORMS)[number]
 export type CertificationStatus = "certified"
+export type CompatibilityStatus = typeof COMPATIBILITY_STATUS
 export type QualityEvidenceName = (typeof QUALITY_EVIDENCE_NAMES)[number]
 
 export const OPENCODE_DESKTOP_VERSION = "1.18.21" as const
@@ -53,7 +60,9 @@ export const DESKTOP_ASSET_NAMES: Readonly<Record<CertifiedPlatform, string>> = 
   "windows-x64": DESKTOP_ASSET_METADATA["windows-x64"].name,
 }
 
-const NATIVE_PACKAGE_BY_PLATFORM: Readonly<Record<CertifiedPlatform, string>> = {
+const NATIVE_PACKAGE_BY_PLATFORM: Readonly<Record<CertifiedPlatform | CompatiblePlatform, string>> = {
+  "darwin-arm64": "@opencode-cycle/native-darwin-arm64",
+  "darwin-x64": "@opencode-cycle/native-darwin-x64",
   "linux-x64": "@opencode-cycle/native-linux-x64",
   "windows-x64": "@opencode-cycle/native-win32-x64",
 }
@@ -78,6 +87,15 @@ export interface ReleaseCertification {
   readonly status: CertificationStatus
 }
 
+// A compatibility record has no evidence field at all: a macOS platform cannot
+// carry a Desktop receipt even by malformed input, because the shape that
+// would hold one does not exist for it.
+export interface ReleaseCompatibility {
+  readonly nativeArtifact: ArtifactBinding
+  readonly platform: CompatiblePlatform
+  readonly status: CompatibilityStatus
+}
+
 export interface ReleaseQualityEvidence {
   readonly evidenceSha256: string
   readonly name: QualityEvidenceName
@@ -87,6 +105,7 @@ export interface ReleaseQualityEvidence {
 export interface ReleaseManifestInput {
   readonly artifacts: readonly ReleaseArtifact[]
   readonly certifications: readonly ReleaseCertification[]
+  readonly compatibility: readonly ReleaseCompatibility[]
   readonly qualityEvidence: readonly ReleaseQualityEvidence[]
   readonly revision: string
   readonly version: string
@@ -95,10 +114,11 @@ export interface ReleaseManifestInput {
 export interface ReleaseManifest {
   readonly artifacts: readonly ReleaseArtifact[]
   readonly certifications: readonly ReleaseCertification[]
+  readonly compatibility: readonly ReleaseCompatibility[]
   readonly product: typeof PRODUCT_IDENTITY.product
   readonly qualityEvidence: readonly ReleaseQualityEvidence[]
   readonly revision: string
-  readonly schemaVersion: 1
+  readonly schemaVersion: 2
   readonly version: string
 }
 
@@ -165,6 +185,33 @@ export function buildReleaseManifest(input: ReleaseManifestInput): ReleaseManife
     if (!certificationPlatforms.has(platform)) throw new Error(`Missing certification evidence: ${platform}`)
   }
 
+  const compatibilityPlatforms = new Set<CompatiblePlatform>()
+  for (const item of input.compatibility) {
+    if (!isRecord(item)) throw new Error("Release compatibility record is malformed")
+    if (!(COMPATIBLE_PLATFORMS as readonly string[]).includes(item.platform)) {
+      throw new Error(`Unsupported compatibility platform: ${String(item.platform)}`)
+    }
+    if (compatibilityPlatforms.has(item.platform)) {
+      throw new Error(`Duplicate compatibility platform: ${item.platform}`)
+    }
+    compatibilityPlatforms.add(item.platform)
+    if (item.status !== COMPATIBILITY_STATUS) {
+      throw new Error(`Compatibility status must be ${COMPATIBILITY_STATUS}: ${item.platform}`)
+    }
+    // An untested platform must never smuggle certification material.
+    requireExactKeys(item, ["nativeArtifact", "platform", "status"], "Release compatibility record")
+    validateArtifactBinding(
+      item.nativeArtifact,
+      nativeArtifactName(item.platform, input.version),
+      artifacts,
+    )
+  }
+  for (const platform of COMPATIBLE_PLATFORMS) {
+    if (!compatibilityPlatforms.has(platform)) {
+      throw new Error(`Missing compatibility declaration: ${platform}`)
+    }
+  }
+
   const qualityNames = new Set<QualityEvidenceName>()
   for (const item of input.qualityEvidence) {
     if (!(QUALITY_EVIDENCE_NAMES as readonly string[]).includes(item.name)) {
@@ -187,12 +234,15 @@ export function buildReleaseManifest(input: ReleaseManifestInput): ReleaseManife
     certifications: [...input.certifications].sort((left, right) =>
       left.platform.localeCompare(right.platform),
     ),
+    compatibility: [...input.compatibility].sort((left, right) =>
+      left.platform.localeCompare(right.platform),
+    ),
     product: PRODUCT_IDENTITY.product,
     qualityEvidence: [...input.qualityEvidence].sort((left, right) =>
       left.name.localeCompare(right.name),
     ),
     revision: input.revision,
-    schemaVersion: 1,
+    schemaVersion: 2,
     version: input.version,
   }
 }
@@ -590,6 +640,20 @@ export async function createReleaseManifest(options: CreateReleaseManifestOption
         status: "certified" as const,
       }
     })
+  // Compatibility is derived from the shipped archives alone. There is no
+  // certification directory input for it, so no receipt can ever be consumed
+  // or substituted for an untested platform.
+  const compatibility = COMPATIBLE_PLATFORMS.map((platform) => {
+    const nativeArtifact = requireArtifact(
+      artifactsByName,
+      nativeArtifactName(platform, options.version),
+    )
+    return {
+      nativeArtifact: { name: nativeArtifact.name, sha256: nativeArtifact.sha256 },
+      platform,
+      status: COMPATIBILITY_STATUS,
+    }
+  })
   const qualityEvidence = classified
     .filter((item) => item.kind === "quality")
     .map((item) => ({
@@ -600,6 +664,7 @@ export async function createReleaseManifest(options: CreateReleaseManifestOption
   const manifest = buildReleaseManifest({
     artifacts,
     certifications,
+    compatibility,
     qualityEvidence,
     revision: options.revision,
     version: options.version,
@@ -614,9 +679,10 @@ export async function readReleaseManifest(path: string): Promise<ReleaseManifest
   if (
     !isRecord(value) ||
     value.product !== PRODUCT_IDENTITY.product ||
-    value.schemaVersion !== 1 ||
+    value.schemaVersion !== 2 ||
     !Array.isArray(value.artifacts) ||
     !Array.isArray(value.certifications) ||
+    !Array.isArray(value.compatibility) ||
     !Array.isArray(value.qualityEvidence) ||
     typeof value.revision !== "string" ||
     typeof value.version !== "string"
@@ -666,7 +732,7 @@ function archiveName(packageName: string, version: string): string {
   return `${packageName.replace(/^@/u, "").replace("/", "-")}-${version}.tgz`
 }
 
-function nativeArtifactName(platform: CertifiedPlatform, version: string): string {
+function nativeArtifactName(platform: CertifiedPlatform | CompatiblePlatform, version: string): string {
   return archiveName(NATIVE_PACKAGE_BY_PLATFORM[platform], version)
 }
 

@@ -20,6 +20,8 @@ test("checksum inventory exactly matches the release manifest artifact allowlist
     const revision = "a".repeat(40)
     const contents = new Map([
       [`opencode-cycle-${version}.tgz`, Buffer.from("plugin")],
+      [`opencode-cycle-native-darwin-arm64-${version}.tgz`, Buffer.from("darwin-arm64")],
+      [`opencode-cycle-native-darwin-x64-${version}.tgz`, Buffer.from("darwin-x64")],
       [`opencode-cycle-native-linux-x64-${version}.tgz`, Buffer.from("linux")],
       [`opencode-cycle-native-win32-x64-${version}.tgz`, Buffer.from("windows")],
     ])
@@ -54,6 +56,16 @@ test("checksum inventory exactly matches the release manifest artifact allowlist
           certification("linux-x64", "linux-x64"),
           certification("windows-x64", "win32-x64"),
         ],
+        compatibility: (["darwin-arm64", "darwin-x64"] as const).map((platform) => {
+          const native = byName.get(
+            `opencode-cycle-native-${platform}-${version}.tgz`,
+          ) as typeof plugin
+          return {
+            nativeArtifact: { name: native.name, sha256: native.sha256 },
+            platform,
+            status: "compatible-but-untested" as const,
+          }
+        }),
         qualityEvidence: [
           { evidenceSha256: "d".repeat(64), name: "codebase-500k", revision },
           { evidenceSha256: "e".repeat(64), name: "critical-suite", revision },
@@ -69,6 +81,8 @@ test("checksum inventory exactly matches the release manifest artifact allowlist
     const lines = (await Bun.file(output).text()).trim().split("\n")
     expect(lines.map((line) => line.split("  ")[1])).toEqual([
       `artifacts/opencode-cycle-${version}.tgz`,
+      `artifacts/opencode-cycle-native-darwin-arm64-${version}.tgz`,
+      `artifacts/opencode-cycle-native-darwin-x64-${version}.tgz`,
       `artifacts/opencode-cycle-native-linux-x64-${version}.tgz`,
       `artifacts/opencode-cycle-native-win32-x64-${version}.tgz`,
     ])

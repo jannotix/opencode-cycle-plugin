@@ -4,7 +4,7 @@ Cycle for OpenCode is published only from a release candidate that passes all qu
 
 ## 1.0.0 platform coverage
 
-Version 1.0.0 supports and certifies OpenCode Desktop on Windows x64 and Linux x64 only. It does not ship macOS packages.
+Version 1.0.0 certifies OpenCode Desktop on Windows x64 and Linux x64 only. macOS x64 and macOS arm64 ship as compatible but untested: their native archives are built and package-verified on matching macOS runners and published, and no macOS Desktop certification lane, receipt or substitution exists.
 
 ## Published files
 

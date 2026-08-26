@@ -12,9 +12,17 @@ export interface CapabilityReport {
   readonly capabilities: readonly HostCapability[]
   readonly certified: boolean
   readonly host: HostCompatibility
+  readonly platform: PlatformCompatibility
   readonly reasons: readonly string[]
   readonly safeMode: boolean
   readonly warnings: readonly string[]
+}
+
+export interface PlatformCompatibility {
+  readonly certified: boolean
+  readonly message: string
+  readonly supported: boolean
+  readonly target: string
 }
 
 export interface HostCompatibility {
@@ -47,7 +55,48 @@ export const CERTIFIED_HOST_VERSIONS = ["1.18.16", "1.18.18"] as const
 export const MINIMUM_HOST_VERSION = "1.18.16" as const
 export const SUPPORTED_HOST_MAJOR = 1
 
+// Desktop certification evidence exists for these targets only.
+export const CERTIFIED_PLATFORM_TARGETS = ["linux-x64", "win32-x64"] as const
+// These ship and run, with no Desktop certification claimed for them.
+export const COMPATIBLE_PLATFORM_TARGETS = ["darwin-arm64", "darwin-x64"] as const
+
 const CERTIFIED_HOST_VERSION_SET = new Set<string>(CERTIFIED_HOST_VERSIONS)
+const CERTIFIED_PLATFORM_SET = new Set<string>(CERTIFIED_PLATFORM_TARGETS)
+const COMPATIBLE_PLATFORM_SET = new Set<string>(COMPATIBLE_PLATFORM_TARGETS)
+
+export function platformCompatibility(
+  platform: NodeJS.Platform,
+  architecture: string,
+): PlatformCompatibility {
+  const target = `${platform}-${architecture}`
+  if (CERTIFIED_PLATFORM_SET.has(target)) {
+    return {
+      certified: true,
+      message: `${target} is a certified platform.`,
+      supported: true,
+      target,
+    }
+  }
+  if (COMPATIBLE_PLATFORM_SET.has(target)) {
+    return {
+      certified: false,
+      message:
+        `${target} is compatible but untested. Cycle runs and its packages are ` +
+        `published for this platform, and no Desktop certification evidence covers it. ` +
+        `Certified evidence covers ${CERTIFIED_PLATFORM_TARGETS.join(", ")}.`,
+      supported: true,
+      target,
+    }
+  }
+  return {
+    certified: false,
+    message:
+      `${target} is not a supported platform. Supported targets are ` +
+      `${[...CERTIFIED_PLATFORM_TARGETS, ...COMPATIBLE_PLATFORM_TARGETS].join(", ")}.`,
+    supported: false,
+    target,
+  }
+}
 
 const capabilityPaths: Readonly<Record<HostCapability, readonly string[]>> = {
   "agent-list": ["app", "agents"],
@@ -144,6 +193,8 @@ export function hostCompatibility(version: string | undefined): HostCompatibilit
 export function negotiateCapabilities(
   client: unknown,
   hostVersion?: string,
+  platform: NodeJS.Platform = process.platform,
+  architecture: string = process.arch,
 ): CapabilityReport {
   const capabilities = REQUIRED_CAPABILITIES.filter((capability) =>
     hasFunction(client, capabilityPaths[capability]),
@@ -152,6 +203,7 @@ export function negotiateCapabilities(
     (capability) => `Missing required capability: ${capability}`,
   )
   const host = hostCompatibility(hostVersion)
+  const platformCompatibilityReport = platformCompatibility(platform, architecture)
   const reasons = [...missing]
   if (!host.compatible) {
     reasons.push(
@@ -162,12 +214,23 @@ export function negotiateCapabilities(
           : "Unsupported OpenCode host version",
     )
   }
-  const warnings = host.compatible && !host.certified ? [host.message] : []
+  if (!platformCompatibilityReport.supported) {
+    reasons.push("Unsupported platform")
+  }
+  const warnings = [
+    ...(host.compatible && !host.certified ? [host.message] : []),
+    ...(platformCompatibilityReport.supported && !platformCompatibilityReport.certified
+      ? [platformCompatibilityReport.message]
+      : []),
+  ]
 
   return {
     capabilities,
-    certified: host.certified && missing.length === 0,
+    // A certified claim requires a certified host *and* a certified platform:
+    // an untested platform must never be reported as certified.
+    certified: host.certified && platformCompatibilityReport.certified && missing.length === 0,
     host,
+    platform: platformCompatibilityReport,
     reasons,
     safeMode: reasons.length > 0,
     warnings,

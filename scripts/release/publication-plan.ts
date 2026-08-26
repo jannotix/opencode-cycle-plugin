@@ -5,6 +5,8 @@ import { PRODUCT_IDENTITY, SHIPPED_NATIVE_PACKAGE_NAMES } from "../product-ident
 import { inspectTarGz } from "../packaging/tar-archive.js"
 import {
   assertArtifactInventoryMatchesManifest,
+  COMPATIBILITY_STATUS,
+  COMPATIBLE_PLATFORMS,
   readReleaseManifest,
   REQUIRED_CERTIFIED_PLATFORMS,
   QUALITY_EVIDENCE_NAMES,
@@ -19,6 +21,7 @@ const PACKAGE_NAMES = [
 interface PublicationManifest {
   readonly artifacts: readonly { readonly name: string; readonly sha256: string; readonly size: number }[]
   readonly certifications: readonly { readonly platform: string; readonly status?: string }[]
+  readonly compatibility: readonly { readonly platform: string; readonly status?: string }[]
   readonly product: string
   readonly qualityEvidence: readonly { readonly name: string }[]
   readonly revision: string
@@ -31,7 +34,7 @@ export function buildPublicationPlan(
   version: string,
   revision: string,
 ): string[] {
-  if (manifest.product !== PRODUCT_IDENTITY.product || manifest.schemaVersion !== 1) {
+  if (manifest.product !== PRODUCT_IDENTITY.product || manifest.schemaVersion !== 2) {
     throw new Error("Release manifest identity is invalid")
   }
   if (manifest.version !== version) throw new Error("Release manifest version does not match")
@@ -43,6 +46,21 @@ export function buildPublicationPlan(
     REQUIRED_CERTIFIED_PLATFORMS,
     "desktop certification",
   )
+  // Publishing a macOS archive is allowed only while it is still marked
+  // untested; a certified claim for it must stop publication.
+  requireExactSet(
+    manifest.compatibility
+      .filter((item) => item.status === COMPATIBILITY_STATUS)
+      .map((item) => item.platform),
+    COMPATIBLE_PLATFORMS,
+    "platform compatibility",
+  )
+  const certifiedPlatforms = new Set(manifest.certifications.map((item) => item.platform))
+  for (const platform of COMPATIBLE_PLATFORMS) {
+    if (certifiedPlatforms.has(platform)) {
+      throw new Error(`Untested platform must not be certified: ${platform}`)
+    }
+  }
   requireExactSet(
     manifest.qualityEvidence.map((item) => item.name),
     QUALITY_EVIDENCE_NAMES,
