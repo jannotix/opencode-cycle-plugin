@@ -413,11 +413,23 @@ verification and an independent reviewer.
 
 ```text
 bun test packages/opencode-cycle/test/task-verification.test.ts packages/opencode-cycle/test/task-review.test.ts packages/opencode-cycle/test/executor.test.ts packages/opencode-cycle/test/full-workflow.test.ts
-cargo test -p workflow-store verification
-cargo test -p workflowd verification
+cargo test -p workflow-store --test verification --test workflow_persistence
+cargo test -p workflowd --test verification_contract --test verification_runner --test windows_verification_job
 ```
 
-**Status:** Implemented previously; final-revision verification pending
+The Rust commands name their test binaries. The earlier `cargo test -p
+<crate> verification` form filtered on test *function* names: in
+`workflow-store` no function carries that word, so the command selected zero
+tests and still exited zero, and in `workflowd` it silently skipped the three
+dedicated verification binaries. A gate that passes without executing anything
+is not evidence.
+
+**Status:** Completed on the current revision. The Bun invariant suites pass
+30 of 30. The corrected Rust commands execute 8 tests in `workflow-store`,
+including `verified_task_closure_is_atomic_payload_bound_and_advances_dependents`,
+and 13 tests across the three `workflowd` verification binaries. The previous
+command form was replaced rather than waived; independent review remains open
+before a receipt row is added.
 
 ### T05 — Run provisional OpenCode 1.18.21 Desktop proof
 
