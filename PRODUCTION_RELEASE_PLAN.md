@@ -296,6 +296,11 @@ workflow before the final source revision is frozen.
 - `.github/workflows/publish.yml` publishes through GitHub Actions OIDC with
   `id-token: write`; it has no `NODE_AUTH_TOKEN` or `secrets.NPM_TOKEN` publish
   path.
+- `actions/setup-node` declares no `registry-url`, so no `.npmrc` credential
+  template is written into the job at all.
+- The job fails closed before publishing when the OIDC request context is
+  absent or any static npm credential is present in the environment or in an
+  `.npmrc` reachable by the publish step.
 - The pinned npm CLI and the publish commands support first-publication public
   access and trusted-publishing provenance for every archive in the publication
   order.
@@ -308,12 +313,21 @@ workflow before the final source revision is frozen.
 
 ```text
 bun test scripts/release/release-workflow.test.ts
-if (rg -n 'NODE_AUTH_TOKEN|secrets\.NPM_TOKEN' .github/workflows/publish.yml) { throw 'Static npm publish token found' }
+if (rg -n '^\s*(NODE_AUTH_TOKEN|NPM_TOKEN)\s*:|secrets\s*\.\s*\w*NPM' .github/workflows/publish.yml) { throw 'Static npm publish token found' }
 ```
 
-The second command must complete without throwing.
+The second command must complete without throwing. It matches a credential
+*assignment*, not the fail-closed shell assertion that proves the same variable
+is empty; a blanket name search would forbid the guard that enforces the rule.
 
-**Status:** Not started
+**Status:** Completed. `publish.yml` authenticates only through trusted
+publishing: the `NODE_AUTH_TOKEN`/`secrets.NPM_TOKEN` step environment is
+removed, `registry-url` is removed so setup-node writes no `_authToken`
+template, and a new pre-publish step fails closed unless the OIDC request
+context is present and no static credential exists in the environment or in any
+reachable `.npmrc`. The release-workflow test proves each property structurally
+and was verified red against the previous token-based workflow before the fix.
+No package version, package, tag, or GitHub Release was created.
 
 ### T03 — Restore a complete public-source and quality baseline
 

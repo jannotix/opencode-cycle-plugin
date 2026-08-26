@@ -34,11 +34,14 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.3.14
+      # registry-url is deliberately absent: it writes an _authToken template
+      # into .npmrc, and a credential file is exactly what must not exist on
+      # this path. The default registry is registry.npmjs.org and trusted
+      # publishing mints its own short-lived credential.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 24.18.0
           package-manager-cache: false
-          registry-url: https://registry.npmjs.org
       - name: Download the sealed candidate
         env:
           CANDIDATE_ARTIFACT: opencode-cycle-${{ inputs.version }}-release-candidate
@@ -61,9 +64,20 @@ jobs:
           bun scripts/release/publication-plan.ts --candidate candidate --version "$VERSION" --revision "$revision" --output candidate/publication-order.txt
       - name: Install the certified npm publisher
         run: npm install --global npm@12.0.2
+      - name: Prove trusted publishing is the only available credential
+        shell: bash
+        run: |
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+          test -z "${NODE_AUTH_TOKEN:-}"
+          test -z "${NPM_TOKEN:-}"
+          for config in "$HOME/.npmrc" "$GITHUB_WORKSPACE/.npmrc" .npmrc; do
+            if [ -f "$config" ] && grep -q '_authToken' "$config"; then
+              echo "A static npm credential is configured in $config" >&2
+              exit 1
+            fi
+          done
       - name: Publish native packages before the plugin
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           while IFS= read -r archive; do
