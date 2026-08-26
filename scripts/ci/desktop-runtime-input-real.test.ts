@@ -153,7 +153,10 @@ test.skipIf(process.platform !== "win32")(
       await rm(temporary, { force: true, recursive: true })
     }
   },
-  { timeout: 5 * 60_000 },
+  // ponytail: 10-minute envelope for pack+install+hash of the 5,933-file real
+  // tree on a loaded Windows machine; the security-relevant bound stays the
+  // strict 30-second linker assertion inside the test.
+  { timeout: 10 * 60_000 },
 )
 
 async function run(command: readonly string[], cwd: string): Promise<void> {

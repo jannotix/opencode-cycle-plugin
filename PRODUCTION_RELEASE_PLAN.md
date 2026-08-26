@@ -246,7 +246,19 @@ cargo test --workspace --all-features
 git status --short
 ```
 
-**Status:** In progress, uncommitted
+**Status:** Completed. The R5 hardening landed at `b4c2463` but left the Windows
+suite red: the module-level eager Windows reparse inspector in
+`scripts/release/verified-file.ts` spawned a persistent PowerShell worker that
+kept every importing process alive, so success-path linker and tool-runtime
+child processes finished their work but never exited and their tests timed out.
+The commit containing this status update makes the inspector lazy and
+reference-counted — idle worker unreferenced so hosts can exit, pending
+requests referenced so a verification cannot be silently abandoned — and
+recalibrates two machine-bound test budgets (sbom cross-check to the standard
+30 s, real-tree runtime-input envelope to 10 min) without weakening any
+functional or security assertion; the 30 s linker bound inside the real-tree
+test is unchanged. Full Bun, Rust, and check gates pass on Windows on this
+commit; independent review remains open before a receipt row is added.
 
 ### T02 — Implement macOS compatible-but-untested packaging
 

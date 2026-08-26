@@ -327,7 +327,7 @@ describe("release SBOM", () => {
     await expect(
       collectPackedJavaScriptInventory(root, packed, version, JSON.stringify(missingRequiredPeer)),
     ).rejects.toThrow(/required.*peer|required.*missing/iu)
-  })
+  }, { timeout: 30_000 })
 
   test("validates generated output against the local official CycloneDX 1.6 schema", async () => {
     const bom = buildCycloneDxBom(

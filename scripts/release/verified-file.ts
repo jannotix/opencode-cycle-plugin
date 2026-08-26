@@ -44,13 +44,6 @@ interface VerifiedFileReader {
 
 const productionReader = createReader({})
 let windowsInspector: WindowsReparseInspector | undefined
-const windowsInspectorReady = process.platform === "win32"
-  ? Promise.resolve().then(async () => {
-    windowsInspector = new WindowsReparseInspector()
-    await windowsInspector.inspect([])
-  })
-  : Promise.resolve()
-await windowsInspectorReady
 
 export function readVerifiedFileDirectory(directory: string): Promise<VerifiedFile[]> {
   return productionReader.readDirectory(directory)
@@ -244,7 +237,6 @@ function createReader(hooks: ReaderHooks): VerifiedFileReader {
 
 async function assertNoWindowsReparse(paths: readonly string[]): Promise<void> {
   if (process.platform !== "win32") return
-  await windowsInspectorReady
   windowsInspector ??= new WindowsReparseInspector()
   const value = await windowsInspector.inspect(paths.map(windowsExtendedLengthPath))
   if (
@@ -283,6 +275,17 @@ class WindowsReparseInspector {
     this.#child.stderr.on("data", (chunk: Buffer) => { this.#stderr += chunk.toString("utf8") })
     this.#child.once("error", (error) => this.close(error))
     this.#child.once("exit", () => this.close(new Error(`Windows reparse detection failed closed: ${this.diagnostic()}`)))
+    this.setReferenced(false)
+  }
+
+  // The idle worker must never keep the host process alive; a pending request
+  // must, so a verification cannot be silently abandoned by process exit.
+  private setReferenced(referenced: boolean): void {
+    for (const value of [this.#child, this.#child.stdin, this.#child.stdout, this.#child.stderr]) {
+      const handle = value as { ref?: () => void; unref?: () => void } | null
+      if (referenced) handle?.ref?.()
+      else handle?.unref?.()
+    }
   }
 
   inspect(paths: readonly string[]): Promise<unknown> {
@@ -295,6 +298,7 @@ class WindowsReparseInspector {
     if (this.#closed !== undefined || this.#child.stdin === null) return Promise.reject(this.#closed ?? new Error("Windows reparse detection failed closed"))
     return new Promise((resolve, reject) => {
       this.#waiters.push({ resolve, reject })
+      this.setReferenced(true)
       this.#child.stdin!.write(`${JSON.stringify({ paths })}\n`, "utf8", (error) => { if (error !== null) this.close(error) })
     })
   }
@@ -307,6 +311,7 @@ class WindowsReparseInspector {
       const line = this.#buffer.slice(0, index); this.#buffer = this.#buffer.slice(index + 1)
       const waiter = this.#waiters.shift()
       if (waiter === undefined) { this.close(new Error("Windows reparse detection returned an unsolicited response")); return }
+      if (this.#waiters.length === 0) this.setReferenced(false)
       try { waiter.resolve(JSON.parse(line) as unknown) } catch { waiter.reject(new Error("Windows reparse detection returned malformed output")) }
     }
   }
@@ -315,6 +320,8 @@ class WindowsReparseInspector {
     if (this.#closed !== undefined) return
     this.#closed = error
     while (this.#waiters.length > 0) this.#waiters.shift()!.reject(error)
+    this.setReferenced(false)
+    try { this.#child.kill() } catch { /* worker already gone */ }
   }
 
   private diagnostic(): string {
