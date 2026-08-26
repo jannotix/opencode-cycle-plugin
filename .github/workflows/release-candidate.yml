@@ -73,6 +73,15 @@ jobs:
           - target: linux-x64
             runner: ubuntu-latest
             binary: target/release/workflowd
+          # macOS archives are built and package-verified on matching runners.
+          # They ship as compatible but untested: no Desktop certification lane
+          # exists for them below, and none may be substituted.
+          - target: darwin-x64
+            runner: macos-13
+            binary: target/release/workflowd
+          - target: darwin-arm64
+            runner: macos-15
+            binary: target/release/workflowd
     runs-on: ${{ matrix.runner }}
     env:
       RUSTUP_TOOLCHAIN: 1.97.1

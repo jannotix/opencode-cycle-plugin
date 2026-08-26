@@ -105,6 +105,40 @@ test("one canonical Linux plugin package is the immutable input to both Desktop 
   expect(desktopRuns.every((run) => !run.includes("bun pm pack"))).toBeTrue()
 })
 
+test("macOS is built and packaged on matching runners but never Desktop-certified", async () => {
+  const candidate = await workflow("release-candidate.yml")
+  const native = candidate.jobs.native?.strategy?.matrix?.include ?? []
+
+  // All four shipped native archives are produced, each on its own operating
+  // system: a cross-built archive would not prove the binary it ships.
+  expect(native.map((item) => item.target).sort()).toEqual([
+    "darwin-arm64",
+    "darwin-x64",
+    "linux-x64",
+    "win32-x64",
+  ])
+  for (const entry of native) {
+    const expectedRunner = entry.target?.startsWith("darwin")
+      ? /^macos-/u
+      : entry.target === "win32-x64"
+        ? /^windows-/u
+        : /^ubuntu-/u
+    expect(entry.runner).toMatch(expectedRunner)
+  }
+
+  // Certification stays a Windows and Linux claim. No macOS Desktop lane,
+  // receipt or substitution may exist anywhere in the workflow.
+  const desktop = candidate.jobs.desktop?.strategy?.matrix?.include ?? []
+  expect(desktop.map((item) => item.platform).sort()).toEqual(["linux-x64", "windows-x64"])
+  expect(JSON.stringify(candidate.jobs.desktop)).not.toContain("darwin")
+  expect(JSON.stringify(candidate.jobs.desktop)).not.toContain("macos")
+
+  // The sealed candidate still collects every native archive, macOS included.
+  const nativeDownload = (candidate.jobs.candidate?.steps ?? []).find((step) =>
+    step.uses?.startsWith("actions/download-artifact@") && step.with?.pattern === "native-*")
+  expect(nativeDownload?.with?.["merge-multiple"]).toBeTrue()
+})
+
 test("publication authenticates through trusted publishing, never a static npm token", async () => {
   const publish = await workflow("publish.yml")
   const source = await workflowSource("publish.yml")

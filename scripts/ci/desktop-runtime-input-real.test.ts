@@ -126,16 +126,22 @@ test.skipIf(process.platform !== "win32")(
         }).toEqual({
           fullTreeFileCount: 5_933,
           graphFileCount: 44,
-          graphSha256: "0e4ab2e41519a41a9d6a902730b470259d6d351b509aab7f512e7bd9bc57343c",
+          graphSha256: "d7543a33aeaea012d804b7e6ec21e294584db6afdc252db4905ccad17d02b5f1",
           linkedEsmModuleCount: 42,
-          runtimeInputContentBytes: 25_566_400,
+          runtimeInputContentBytes: 25_569_195,
           runtimeInputFileCount: 2_776,
-          runtimeInputSerializedBytes: 25_860_402,
+          runtimeInputSerializedBytes: 25_863_197,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,
           moduleLoadingProof: "static-literal-plugin-host-with-isolated-worker-v1",
           runtimeInputSha256: input.runtimeInputSha256,
+          // This Windows tree resolves its own native package and suppresses
+          // the three optional roots for the platforms it is not: linux-x64,
+          // darwin-x64 and darwin-arm64. Suppression is confined to declared,
+          // entirely absent optional roots, so a broken or partially installed
+          // native package still fails the graph instead of being skipped.
+          suppressedOptionalRootCount: 3,
           unverifiedPluginHostModuleLoadingRejected: true,
           verifiedAssetFileCount: 2,
           verifiedCommonJsModuleCount: 0,
