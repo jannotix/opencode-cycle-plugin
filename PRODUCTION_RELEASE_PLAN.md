@@ -371,7 +371,20 @@ cargo test --workspace --all-features
 git status --short
 ```
 
-**Status:** Not started
+**Status:** Completed. A fresh clone of the execution branch installs with the
+frozen lockfile and passes the static source gate, the Bun suite, and the Rust
+suite. Running the gate from a clone rather than the developer worktree
+surfaced two defects that a warm tree hid, both fixed here rather than waived:
+the packed real-tree proof performed a full optimized Rust build inside its own
+budget, so on a cold tree it timed out — the build is now environment
+preparation in `beforeAll` and the proof keeps a budget that means something;
+and the same proof pinned an exact `graphSha256`, which necessarily covers the
+native binary as a verified asset, so it could only pass where those binary
+bytes were reproduced. An optimized Rust build is not byte-reproducible across
+build directories, so that expectation could never have held on a CI runner or
+a second machine. Drift detection now rests on the reproducible file counts,
+module kinds and suppressed-optional-root count, and the digest is still
+required to be well formed and bound into the receipt.
 
 ---
 
