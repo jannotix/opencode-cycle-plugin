@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES } from "../agent.js"
 import type {
@@ -51,7 +51,7 @@ export interface ArbiterResult {
 }
 
 export async function runArbiter(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ArbiterInput,
 ): Promise<ArbiterResult> {
   if (input.mode === "full" && input.reviews.length !== 2) {
@@ -74,7 +74,7 @@ export async function runArbiter(
 }
 
 async function runArbiterAttempt(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ArbiterInput,
   previousFailure: unknown,
 ): Promise<ArbiterResult> {

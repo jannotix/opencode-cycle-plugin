@@ -1,9 +1,9 @@
-import type { PluginInput } from "@opencode-ai/plugin"
-import type { SessionStatus } from "@opencode-ai/sdk"
+import type { HostClient } from "../host.js"
+import type { HostSessionStatus } from "../host.js"
 
-type PromptOptions = Parameters<PluginInput["client"]["session"]["prompt"]>[0]
+type PromptOptions = Parameters<HostClient["session"]["prompt"]>[0]
 type PromptData = NonNullable<
-  Awaited<ReturnType<PluginInput["client"]["session"]["prompt"]>>["data"]
+  Awaited<ReturnType<HostClient["session"]["prompt"]>>["data"]
 >
 
 interface PromptWaitOptions {
@@ -21,7 +21,7 @@ export const ROLE_PROMPT_LIMITS = {
 const MAXIMUM_CONSECUTIVE_POLL_FAILURES = 5
 
 export async function promptSessionAndWait(
-  client: PluginInput["client"],
+  client: HostClient,
   options: PromptOptions,
   waitOptions: PromptWaitOptions = {},
 ): Promise<PromptData> {
@@ -74,7 +74,7 @@ export async function promptSessionAndWait(
       }
 
       let response: PromptData | undefined
-      let status: SessionStatus | undefined
+      let status: HostSessionStatus | undefined
       try {
         const statusResponse = await session.status({
           query: directory === undefined ? {} : { directory },
@@ -133,7 +133,7 @@ export async function promptSessionAndWait(
 }
 
 async function abortSession(
-  session: PluginInput["client"]["session"],
+  session: HostClient["session"],
   sessionId: string,
   directory: string | undefined,
 ): Promise<void> {

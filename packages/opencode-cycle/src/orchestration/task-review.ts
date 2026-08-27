@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES } from "../agent.js"
 import type { ArchitecturePlanInput } from "../client.js"
@@ -53,7 +53,7 @@ export interface TaskReviewResult {
 }
 
 export async function runTaskReview(
-  client: PluginInput["client"],
+  client: HostClient,
   input: TaskReviewInput,
 ): Promise<TaskReviewResult> {
   assertVerificationBinding(input)

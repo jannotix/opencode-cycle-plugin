@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
 
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES } from "../agent.js"
 import { PRODUCT_NAME } from "../product.js"
@@ -64,7 +64,7 @@ type ExecutorTaskResult = Omit<SubmittedTaskExecutionResult, "status"> & {
 }
 
 export async function runExecutionPlan(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ExecutionInput,
 ): Promise<readonly TaskExecutionResult[]> {
   input.signal?.throwIfAborted()
@@ -80,7 +80,7 @@ export async function runExecutionPlan(
 }
 
 async function runSequentialTasks(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ExecutionInput,
   tasks: readonly PlannedTask[],
 ): Promise<readonly TaskExecutionResult[]> {
@@ -98,7 +98,7 @@ async function runSequentialTasks(
 }
 
 async function runDisjointParallelTasks(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ExecutionInput,
   tasks: readonly PlannedTask[],
 ): Promise<readonly TaskExecutionResult[]> {
@@ -168,7 +168,7 @@ async function removeWorktree(repository: string, worktree: string): Promise<voi
 }
 
 async function runExecutorTask(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ExecutionInput,
   task: PlannedTask,
 ): Promise<ExecutorTaskResult> {

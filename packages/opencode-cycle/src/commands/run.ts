@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 
-import type { Part } from "@opencode-ai/sdk"
+import type { HostPart } from "../host.js"
 
 export interface CapturedWorkflowRequest {
   readonly attachmentHashes: readonly string[]
@@ -10,19 +10,19 @@ export interface CapturedWorkflowRequest {
 }
 
 export async function captureWorkflowRequest(
-  parts: readonly Part[],
+  parts: readonly HostPart[],
   worktree: string,
 ): Promise<CapturedWorkflowRequest> {
   const originalRequest = parts
     .filter(
-      (part): part is Extract<Part, { type: "text" }> =>
+      (part): part is Extract<HostPart, { type: "text" }> =>
         part.type === "text" && part.synthetic !== true && part.ignored !== true,
     )
     .map((part) => part.text)
     .join("")
   if (!originalRequest) throw new Error("Cycle requires a non-empty original user request")
   const attachments = parts.filter(
-    (part): part is Extract<Part, { type: "file" }> => part.type === "file",
+    (part): part is Extract<HostPart, { type: "file" }> => part.type === "file",
   )
   const attachmentHashes = await Promise.all(
     attachments.map((part) => attachmentDigest(part, worktree)),
@@ -31,7 +31,7 @@ export async function captureWorkflowRequest(
 }
 
 async function attachmentDigest(
-  part: Extract<Part, { type: "file" }>,
+  part: Extract<HostPart, { type: "file" }>,
   worktree: string,
 ): Promise<string> {
   if (part.url.startsWith("data:")) {

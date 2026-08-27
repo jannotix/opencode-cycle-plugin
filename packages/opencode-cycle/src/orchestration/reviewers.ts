@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES } from "../agent.js"
 import type {
@@ -52,7 +52,7 @@ export interface IndependentReview {
 }
 
 export async function runIndependentReviews(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ReviewInput,
 ): Promise<readonly [IndependentReview, IndependentReview]> {
   const functional = runReviewer(client, input, "functional_reviewer")
@@ -61,7 +61,7 @@ export async function runIndependentReviews(
 }
 
 async function runReviewer(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ReviewInput,
   role: ReviewerRole,
 ): Promise<IndependentReview> {
@@ -79,7 +79,7 @@ async function runReviewer(
 }
 
 async function runReviewerAttempt(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ReviewInput,
   role: ReviewerRole,
   previousFailure: unknown,

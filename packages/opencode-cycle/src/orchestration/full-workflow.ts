@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 import { randomUUID } from "node:crypto"
 
 import type { RoleModels, RoleVariants } from "../agent.js"
@@ -43,7 +43,7 @@ export interface FullWorkflowResult {
 }
 
 export async function runFullWorkflow(
-  client: PluginInput["client"],
+  client: HostClient,
   controlPlane: LocalControlPlane,
   input: FullWorkflowInput,
 ): Promise<FullWorkflowResult> {
@@ -345,7 +345,7 @@ export async function runFullWorkflow(
 }
 
 async function finalizeSubmittedTask(
-  client: PluginInput["client"],
+  client: HostClient,
   controlPlane: LocalControlPlane,
   input: FullWorkflowInput,
   directory: string,

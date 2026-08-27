@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES } from "../agent.js"
 import type { ArchitecturePlanInput } from "../client.js"
@@ -54,7 +54,7 @@ export class ArchitectOutputError extends Error {
 }
 
 export async function runArchitect(
-  client: PluginInput["client"],
+  client: HostClient,
   input: ArchitectInput,
 ): Promise<ArchitectResult> {
   input.signal?.throwIfAborted()

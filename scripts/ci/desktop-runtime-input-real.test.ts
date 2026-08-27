@@ -26,7 +26,7 @@ beforeAll(async () => {
 }, 30 * 60_000)
 
 test.skipIf(process.platform !== "win32")(
-  "real packed Windows tree minimizes 5,933 held files with a truthful verified graph",
+  "real packed Windows tree minimizes 5,934 held files with a truthful verified graph",
   async () => {
     const root = fileURLToPath(new URL("../../", import.meta.url))
     const temporary = await mkdtemp(join(tmpdir(), "cycle-real-runtime-input-"))
@@ -132,7 +132,7 @@ test.skipIf(process.platform !== "win32")(
           runtimeInputFileCount: input.runtimeInputFileCount,
           runtimeInputSerializedBytes: input.runtimeInputSerializedBytes,
         }).toEqual({
-          fullTreeFileCount: 5_933,
+          fullTreeFileCount: 5_934,
           graphFileCount: 44,
           // The graph digest covers the native binary as a verified asset, and
           // an optimized Rust build is not byte-reproducible across build
@@ -142,9 +142,9 @@ test.skipIf(process.platform !== "win32")(
           // a well-formed SHA-256 bound into the receipt.
           graphSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
           linkedEsmModuleCount: 42,
-          runtimeInputContentBytes: 25_570_310,
-          runtimeInputFileCount: 2_776,
-          runtimeInputSerializedBytes: 25_864_312,
+          runtimeInputContentBytes: 25_570_321,
+          runtimeInputFileCount: 2_777,
+          runtimeInputSerializedBytes: 25_864_388,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,

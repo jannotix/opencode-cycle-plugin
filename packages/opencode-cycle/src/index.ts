@@ -1,7 +1,12 @@
 import { join } from "node:path"
 
-import type { Config, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
-import type { Part } from "@opencode-ai/sdk"
+import type {
+  HostConfig as Config,
+  HostPart as Part,
+  HostPlugin as Plugin,
+  HostPluginInput as PluginInput,
+  HostPluginOptions as PluginOptions,
+} from "./host.js"
 
 import {
   permissionPresetFromOptions,

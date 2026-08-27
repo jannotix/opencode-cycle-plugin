@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path"
 
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import type { RoleModels, RoleVariants } from "../agent.js"
 import { digest, observation } from "../audit-events.js"
@@ -73,7 +73,7 @@ export interface EarlyRecoveryContext {
 }
 
 export async function recoverWorkflowRetry(
-  client: PluginInput["client"],
+  client: HostClient,
   controlPlane: RecoveryControlPlane,
   input: RetryRecoveryInput,
 ): Promise<unknown> {

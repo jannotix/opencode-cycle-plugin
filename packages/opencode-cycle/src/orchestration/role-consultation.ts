@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { HostClient } from "../host.js"
 
 import { ROLE_AGENT_NAMES, type RoleModels, type RoleVariants } from "../agent.js"
 import type { WorkflowRole } from "../permissions.js"
@@ -27,11 +27,11 @@ interface RoleConsultationOptions {
 }
 
 export class RoleConsultations {
-  readonly #client: PluginInput["client"]
+  readonly #client: HostClient
   readonly #options: RoleConsultationOptions
   readonly #sessions = new Map<string, string>()
 
-  constructor(client: PluginInput["client"], options: RoleConsultationOptions) {
+  constructor(client: HostClient, options: RoleConsultationOptions) {
     this.#client = client
     this.#options = options
   }
