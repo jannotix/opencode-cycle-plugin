@@ -134,6 +134,11 @@ test.skipIf(process.platform !== "win32")(
         }).toEqual({
           fullTreeFileCount: 5_934,
           graphFileCount: 44,
+          // These byte totals are measured, and they drift with any change to
+          // shipped code. Update them only from a manifest diff that names the
+          // files responsible: the previous values were set from a measurement
+          // that later failed to reproduce, and the discrepancy was found only
+          // because the arithmetic was made to close file by file.
           // The graph digest covers the native binary as a verified asset, and
           // an optimized Rust build is not byte-reproducible across build
           // directories, so its exact value is environment-bound and cannot be
@@ -142,9 +147,9 @@ test.skipIf(process.platform !== "win32")(
           // a well-formed SHA-256 bound into the receipt.
           graphSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
           linkedEsmModuleCount: 42,
-          runtimeInputContentBytes: 25_570_321,
+          runtimeInputContentBytes: 25_574_535,
           runtimeInputFileCount: 2_777,
-          runtimeInputSerializedBytes: 25_864_388,
+          runtimeInputSerializedBytes: 25_868_602,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,
