@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { beforeAll, expect, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
@@ -12,6 +12,26 @@ import { digest } from "../src/audit-events.js"
 
 const root = fileURLToPath(new URL("../../../", import.meta.url))
 const binary = join(root, "target", "debug", process.platform === "win32" ? "workflowd.exe" : "workflowd")
+
+// The first spawn of a freshly built daemon pays a one-off operating system
+// cost before the process can serve anything: on Windows the new binary is
+// scanned on first execution. That is preparation, not a property these tests
+// measure, and paying it inside the first test's budget made the suite pass
+// from a warm tree and time out from a clean clone. Pay it once, here.
+beforeAll(async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-warmup-"))
+  const controlPlane = new LocalControlPlane({
+    binaryPath: binary,
+    dataDirectory,
+    stopOwnedProcessOnDispose: true,
+  })
+  try {
+    await controlPlane.health()
+  } finally {
+    await controlPlane.dispose()
+    await rm(dataDirectory, { force: true, recursive: true })
+  }
+}, 180_000)
 
 test("task closure canonical digests match the Rust protocol vectors", () => {
   const taskId = "018f0000-0000-7000-8000-000000000001"
