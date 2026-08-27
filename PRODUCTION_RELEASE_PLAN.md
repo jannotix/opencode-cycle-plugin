@@ -452,50 +452,33 @@ target host before changing the certified-host policy.
 bun scripts/ci/desktop-certification.ts --platform <windows-x64|linux-x64> --plugin-archive <canonical-plugin.tgz> --plugin-provenance <canonical-plugin.provenance.json> --native-archive <native.tgz> --revision <provisional-sha> --output <provisional-receipt.json>
 ```
 
-**Status:** Blocked on a product finding. Both lanes were run on revision
-`b57680b` from one canonical plugin archive built on the Linux lane
-(`960b3cd9…`, byte-identical on both), with native archives built on their own
-operating systems and the official 1.18.21 assets verified against the pinned
-digests. Both lanes fail at the same stage: `plugin_entry_started=failed`,
-after `certification_env_prepared`, `config_tree_prepared`,
-`config_path_discovered`, `plugin_specifier_resolved`, `effective_env_validated`
-and `candidate_module_resolved` all pass.
+**Status:** Both provisional proofs pass. The rejecting check was
+`validateDesktopPluginInput`, with the archive binding and the options both
+correct. OpenCode Desktop reports a filesystem root as the worktree when no
+project is open, and the check read any outside-scratch worktree as an escape.
+A root carries no path out of the sandbox, so the refusal was wrong; the fix
+separates the two conditions rather than loosening the control, and an outside
+worktree or an outside directory is still refused.
 
-The failure is not platform-specific and is not caused by the M1 changes. The
-module runtime guard completes inside the real Desktop 1.18.21 runtime
-(Electron 42.3.3, Node 24.15.0) on both lanes and produces a receipt whose
-`graphSha256`, `graphFileCount` 44, `linkedEsmModuleCount` 42 and
-`suppressedOptionalRootCount` 3 match the packed real-tree proof exactly. The
-generated loader's `expectedPluginOptions` were compared against the Desktop
-config in a preserved scratch and are identical, including key order.
+Desktop offers no supported way to be launched at a directory, so it does not
+open the isolated project this harness prepares. Until that exists upstream,
+these proofs establish activation, control-plane protocol, daemon identity,
+authenticated shutdown and final process absence, and they do not establish
+project-scoped behaviour. The live acceptance matrix in T09 remains the place
+that covers it.
 
-No 1.18.21 Desktop proof has ever succeeded in this environment: every retained
-Windows and Linux receipt records `desktop.version` 1.18.16 and predates the
-module-runtime-guard design entirely, so there is no earlier 1.18.21 evidence
-to compare against.
+Receipts on revision `bce8e8f1dec88cc5e4dcdfbc8460f0d68b3ddbc2`:
 
-The rejecting check is now identified. An owner-approved debug run of the
-instrumented loader records `validateDesktopPluginInput` as the failure, with
-`binaryPathMatches` and `optionsMatch` both true: the archive binding and the
-options are correct, and the entry is refused on the plugin input alone.
+| Platform | Plugin SHA-256 | Native SHA-256 | Authenticity |
+| --- | --- | --- | --- |
+| windows-x64 | `960b3cd9…` | `8b51bf04…` | Authenticode, verified |
+| linux-x64 | `960b3cd9…` | `4ae7a30f…` | SHA-256, verified |
 
-The input Desktop 1.18.21 supplies reports `worktree` as `/` and `directory` as
-the isolated home, not the isolated project the harness prepares and passes as
-the Desktop working directory. `/` is outside the scratch, so the sandbox check
-refuses it. Two consequences follow. The harness conflates "outside the
-isolated scratch" with "no worktree reported", and Desktop is not opening the
-prepared project at all, so this proof does not currently exercise the project
-context it claims to. The certification is therefore asserting less than it
-should, in addition to failing.
-
-The observed input keys are `$`, `client`, `directory`, `experimental_workspace`,
-`project`, `serverUrl` and `worktree`, which is the richer plugin input shape;
-the harness predates it and inspects only `directory` and `worktree`.
-
-The fix belongs in the harness rather than the product: make Desktop open the
-prepared isolated project so a real worktree is reported, and keep rejecting
-genuine outside-scratch paths without treating an absent worktree as an escape.
-T06 must still not promote 1.18.21 until both provisional proofs pass.
+Both bind the same canonical plugin archive built once on the Linux lane, as
+the release contract requires. Both record eleven passing load stages, a
+terminated daemon with authenticated shutdown and final process absence. These
+remain provisional: they certify no revision for release purposes and are
+invalidated by the T06 host-policy commit.
 
 ### T06 — Promote OpenCode 1.18.21 and remove stale certification claims
 
