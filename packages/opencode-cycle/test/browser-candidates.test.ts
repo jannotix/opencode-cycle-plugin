@@ -3,6 +3,7 @@ import { expect, test } from "bun:test"
 import {
   browserCandidates,
   launchFirstUsableBrowser,
+  orderedBrowserCandidates,
 } from "../src/browser/managed-browser-session.js"
 
 test("a browser that cannot launch is skipped for the next candidate", async () => {
@@ -53,4 +54,31 @@ test("Windows still prefers Edge, then Chrome", () => {
     "Chrome/Application/chrome.exe",
     "Chrome/Application/chrome.exe",
   ])
+})
+
+test("a managed browser is tried only after the installed ones", async () => {
+  // Preference is unchanged for anyone whose system browser works: the managed
+  // build is a fallback for machines where none of them can be driven, not a
+  // replacement for them.
+  const order = await orderedBrowserCandidates({
+    installed: async () => ["/pf/msedge.exe", "/pf/chrome.exe"],
+    managed: async () => ["/cache/chrome-152/chrome.exe"],
+  })
+  expect(order).toEqual(["/pf/msedge.exe", "/pf/chrome.exe", "/cache/chrome-152/chrome.exe"])
+})
+
+test("an explicit executable overrides every discovery", async () => {
+  const order = await orderedBrowserCandidates({
+    configured: "/explicit/browser.exe",
+    installed: async () => ["/pf/chrome.exe"],
+    managed: async () => ["/cache/chrome.exe"],
+  })
+  expect(order).toEqual(["/explicit/browser.exe"])
+})
+
+test("no browser anywhere is reported with the managed cache named", async () => {
+  const attempt = launchFirstUsableBrowser([], async () => ({}))
+  await expect(attempt).rejects.toThrow(
+    "No supported stable Chrome, Edge or Chromium installation was found",
+  )
 })

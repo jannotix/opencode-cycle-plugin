@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
 import { basename, isAbsolute, join, relative, resolve } from "node:path"
 
 import type {
@@ -11,6 +12,8 @@ import type {
 
 // @ts-expect-error The pinned runtime wrapper is bundled and typed at this boundary.
 import puppeteerRuntime from "./puppeteer-runtime.js"
+// @ts-expect-error The pinned browsers wrapper is bundled and typed at this boundary.
+import * as browsersRuntime from "./puppeteer-browsers-runtime.js"
 
 import {
   isLoopback,
@@ -39,25 +42,34 @@ export class ManagedBrowserSessionFactory implements BrowserSessionFactory {
     readonly artifactDirectory: string
     readonly sessionId: string
   }): Promise<ManagedBrowserSession> {
-    const installed = await installedBrowserExecutables(this.#options.browserExecutable)
+    const installed = await orderedBrowserCandidates(
+      this.#options.browserExecutable === undefined
+        ? {}
+        : { configured: this.#options.browserExecutable },
+    )
     const identity = createHash("sha256").update(input.sessionId).digest("hex").slice(0, 16)
     const evidenceDirectory = join(input.artifactDirectory, "evidence", identity, randomUUID())
-    const profileDirectory = join(input.artifactDirectory, "profiles", `${identity}-${randomUUID()}`)
-    await Promise.all([
-      mkdir(evidenceDirectory, { recursive: true }),
-      mkdir(profileDirectory, { recursive: true }),
-    ])
+    await mkdir(evidenceDirectory, { recursive: true })
     const origins = new Set(input.allowedOrigins)
-    const { browser } = await launchFirstUsableBrowser(installed, (candidate) =>
-      puppeteer.launch({
+    // Each attempt gets its own profile. A browser that fails to start can
+    // leave lock files behind, and reusing one directory across candidates
+    // would let the first failure poison every later attempt.
+    let profileDirectory = ""
+    const { browser } = await launchFirstUsableBrowser(installed, async (candidate) => {
+      const attemptProfile = join(input.artifactDirectory, "profiles", `${identity}-${randomUUID()}`)
+      await mkdir(attemptProfile, { recursive: true })
+      const launched = await puppeteer.launch({
         args: ["--disable-background-networking", "--disable-sync"],
         browser: "chrome",
         defaultViewport: { height: 900, width: 1440 },
         executablePath: candidate,
         headless: this.#options.headless,
         timeout: 15_000,
-        userDataDir: profileDirectory,
-      }))
+        userDataDir: attemptProfile,
+      })
+      profileDirectory = attemptProfile
+      return launched
+    })
     const page = (await browser.pages())[0] ?? (await browser.newPage())
     await page.setRequestInterception(true)
     page.on("request", async (request) => {
@@ -450,6 +462,47 @@ export async function resolveBrowserExecutable(configured?: string): Promise<str
       ? "No supported stable Chrome, Edge or Chromium installation was found"
       : "Configured browser executable does not exist",
   )
+}
+
+/**
+ * Browsers already present in the managed cache.
+ *
+ * Only browsers that are already installed are considered. The pinned runtime
+ * wrapper deliberately does not expose the installer, so this path can never
+ * download or execute something new; it reuses what the toolchain has already
+ * placed on this machine.
+ */
+export async function managedBrowserExecutables(): Promise<string[]> {
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR ?? join(homedir(), ".cache", "puppeteer")
+  try {
+    const installed = await browsersRuntime.getInstalledBrowsers({ cacheDir })
+    return installed
+      .filter((entry: { browser: string }) => entry.browser === "chrome")
+      .map((entry: { executablePath: string }) => entry.executablePath)
+      .sort()
+      .reverse()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Candidates in the order they should be attempted.
+ *
+ * An explicitly configured executable wins outright. Otherwise the browsers
+ * installed on the system come first, so a machine with a working browser
+ * behaves exactly as before, and the managed cache is consulted only when none
+ * of them can be driven.
+ */
+export async function orderedBrowserCandidates(input: {
+  readonly configured?: string
+  readonly installed?: () => Promise<string[]>
+  readonly managed?: () => Promise<string[]>
+} = {}): Promise<string[]> {
+  if (input.configured !== undefined) return [input.configured]
+  const installed = await (input.installed ?? (() => installedBrowserExecutables()))()
+  const managed = await (input.managed ?? managedBrowserExecutables)()
+  return [...installed, ...managed.filter((path) => !installed.includes(path))]
 }
 
 /** Every candidate that exists on disk, in preference order. */
