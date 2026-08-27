@@ -4,7 +4,7 @@ Cycle for OpenCode is a native OpenCode plugin. It has no separate window, dashb
 
 ## Requirements
 
-- OpenCode Desktop 1.18.16 or newer on the 1.x line. Release evidence currently covers `1.18.16` and `1.18.18`; dependencies and official asset metadata are pinned to `1.18.21`, but that version remains compatible and uncertified until both native Desktop lanes pass in Phase B. Promoting it will require a new source candidate and complete recertification. A newer 1.x Desktop update keeps Cycle running when the required plugin capabilities are present; `/cycle doctor` and `/cycle help` report that the host is compatible but uncertified. Safe mode is only for hosts below 1.18.16, a different major version, or a missing plugin capability.
+- OpenCode Desktop 1.18.16 or newer on the 1.x line. Release evidence covers `1.18.21`, the certified host: both the Windows x64 and Linux x64 Desktop lanes pass on it from the same canonical plugin archive. Earlier 1.x versions, including `1.18.16` and `1.18.18`, remain compatible and keep Cycle running when the required plugin capabilities are present; `/cycle doctor` and `/cycle help` report that the host is compatible but uncertified. Safe mode is only for hosts below 1.18.16, a different major version, or a missing plugin capability.
 - Git available on PATH. Implementation, freeze and delivery require a Git repository; unversioned folders cannot complete a governed workflow.
 - At least 2 GiB of free disk space and 1 GiB of available memory beyond the active project's own tools.
 - The model providers you want to use already configured in OpenCode.

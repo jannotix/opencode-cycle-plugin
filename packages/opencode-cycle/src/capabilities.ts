@@ -51,7 +51,12 @@ const REQUIRED_CAPABILITIES: readonly HostCapability[] = [
   "session-create",
 ]
 
-export const CERTIFIED_HOST_VERSIONS = ["1.18.16", "1.18.18"] as const
+// Certification follows the evidence, never the other way round: only a host
+// with a Desktop receipt on the released revision belongs here. 1.18.16 and
+// 1.18.18 were certified against earlier revisions and are now compatible
+// historical hosts, so the floor below stays where it is and they keep
+// running without carrying a claim their evidence no longer supports.
+export const CERTIFIED_HOST_VERSIONS = ["1.18.21"] as const
 export const MINIMUM_HOST_VERSION = "1.18.16" as const
 export const SUPPORTED_HOST_MAJOR = 1
 

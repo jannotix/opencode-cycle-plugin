@@ -502,7 +502,26 @@ bun run check
 git status --short
 ```
 
-**Status:** Not started
+**Status:** Completed in the commit carrying this status update. Certification
+now follows the evidence: `CERTIFIED_HOST_VERSIONS` is exactly `1.18.21`, the
+only host with Desktop receipts on this revision. The compatibility floor is
+unchanged at 1.18.16, so 1.18.16 through 1.18.20 keep running as compatible
+historical hosts and report plainly that they are outside the certified
+evidence set, rather than carrying a claim their evidence no longer supports.
+The getting-started guide was the last place still presenting 1.18.16 and
+1.18.18 as current release evidence and now states the same thing.
+
+Promotion invalidates the T05 provisional receipts for final release purposes:
+they were produced on `bce8e8f`, before this commit, and only the final frozen
+revision in T07 through T09 can carry release certification.
+
+Two consequences of the promotion were corrected rather than papered over. The
+Desktop-certification registration test now activates on the certified host
+instead of 1.18.16, and the uncertified activation path — a warning naming the
+certified evidence, which is what most 1.x hosts now take — had no coverage at
+all and gained a test. The packed real-tree byte counts moved by exactly the
+362 bytes that `dist/capabilities.js` grew, measured against a build of the
+previous source rather than assumed.
 
 ---
 

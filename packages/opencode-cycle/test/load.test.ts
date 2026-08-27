@@ -696,7 +696,7 @@ test("records successful native registration for Desktop certification", async (
     },
   }
   try {
-    const hooks = await OpenCodeCycle(input as never, { dataDirectory, hostVersion: "1.18.16" })
+    const hooks = await OpenCodeCycle(input as never, { dataDirectory, hostVersion: "1.18.21" })
     expect(
       await readFile(join(dataDirectory, "desktop-activation.json"), "utf8").catch(() => undefined),
     ).toBeUndefined()
@@ -708,7 +708,7 @@ test("records successful native registration for Desktop certification", async (
         body: {
           level: "info",
           message: "Cycle for OpenCode activated",
-          extra: { host_certified: true, host_version: "1.18.16", product_version: "1.0.0" },
+          extra: { host_certified: true, host_version: "1.18.21", product_version: "1.0.0" },
           service: "opencode-cycle",
         },
       },
@@ -721,13 +721,50 @@ test("records successful native registration for Desktop certification", async (
   }
 })
 
+test("an uncertified but compatible host activates with a warning, not silence", async () => {
+  const logs: { readonly body: Record<string, unknown> }[] = []
+  const dataDirectory = await mkdtemp(join(tmpdir(), "opencode-cycle-uncertified-"))
+  const input = {
+    ...supportedInput,
+    client: {
+      ...supportedInput.client,
+      app: {
+        ...supportedInput.client.app,
+        log: async (entry: unknown) => {
+          logs.push(entry as { readonly body: Record<string, unknown> })
+          return {}
+        },
+      },
+    },
+  }
+  try {
+    const hooks = await OpenCodeCycle(input as never, { dataDirectory, hostVersion: "1.18.16" })
+    await hooks.config?.({ agent: {}, command: {} } as never)
+
+    // 1.18.16 was certified against an earlier revision. It still runs, and it
+    // must say plainly that it is no longer covered by release evidence
+    // instead of reporting a certification it cannot support.
+    expect(logs).toHaveLength(1)
+    const body = logs[0]?.body as Record<string, unknown>
+    expect(body.level).toBe("warn")
+    expect(body.message).toBe("Cycle for OpenCode activated")
+    const extra = body.extra as Record<string, unknown>
+    expect(extra.host_certified).toBeFalse()
+    expect(extra.host_version).toBe("1.18.16")
+    expect(String(extra.host_notice)).toContain("1.18.21")
+    expect(String(extra.host_notice)).toContain("not in the certified evidence set")
+  } finally {
+    await rm(dataDirectory, { force: true, recursive: true })
+  }
+})
+
 test("capability failure returns inert hooks without throwing", async () => {
   const hooks = await OpenCodeCycle({ client: {} } as never, { hostVersion: "1.18.16" })
   expect(Object.keys(hooks)).toEqual(["config"])
   const config = { command: {} }
   await hooks.config?.(config as never)
   expect(config.command.cycle?.template).toContain("did not start")
-  expect(config.command.cycle?.template).toContain("1.18.16")
+  expect(config.command.cycle?.template).toContain("1.18.21")
 })
 
 test("safe mode logs one controlled warning for unreadable or other-major host versions", async () => {

@@ -29,7 +29,7 @@ test("reports macOS as compatible but untested and never as certified", () => {
     expect(compatibility.message).toContain("compatible but untested")
 
     // The product still runs; it simply must not claim certification.
-    const result = negotiateCapabilities(supportedClient(), "1.18.16", platform, architecture)
+    const result = negotiateCapabilities(supportedClient(), "1.18.21", platform, architecture)
     expect(result.safeMode).toBeFalse()
     expect(result.reasons).toEqual([])
     expect(result.certified).toBeFalse()
@@ -38,20 +38,24 @@ test("reports macOS as compatible but untested and never as certified", () => {
   }
 
   for (const [platform, architecture] of [["linux", "x64"], ["win32", "x64"]] as const) {
-    const result = negotiateCapabilities(supportedClient(), "1.18.16", platform, architecture)
+    const result = negotiateCapabilities(supportedClient(), "1.18.21", platform, architecture)
     expect(result.certified).toBeTrue()
     expect(result.platform.certified).toBeTrue()
     expect(result.warnings).toEqual([])
   }
 
-  const unsupported = negotiateCapabilities(supportedClient(), "1.18.16", "freebsd", "x64")
+  const unsupported = negotiateCapabilities(supportedClient(), "1.18.21", "freebsd", "x64")
   expect(unsupported.platform.supported).toBeFalse()
   expect(unsupported.safeMode).toBeTrue()
   expect(unsupported.reasons).toContain("Unsupported platform")
 })
 
 test("enables certified hosts without safe mode", () => {
-  expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.16", "1.18.18"])
+  // Certification follows the evidence: 1.18.21 is the only host with a
+  // Desktop receipt on the released revision.
+  expect(CERTIFIED_HOST_VERSIONS).toEqual(["1.18.21"])
+  // The compatibility floor is unchanged, so hosts from 1.18.16 upward keep
+  // running; they are simply no longer presented as certified.
   expect(MINIMUM_HOST_VERSION).toBe("1.18.16")
   for (const version of CERTIFIED_HOST_VERSIONS) {
     const result = negotiateCapabilities(supportedClient(), version, "win32", "x64")
@@ -71,8 +75,11 @@ test("enables certified hosts without safe mode", () => {
   }
 })
 
-test("newer 1.x Desktop updates stay active when required capabilities exist", () => {
-  for (const version of ["1.18.17", "1.18.19", "1.18.20", "1.18.21", "1.19.0"]) {
+test("other 1.x Desktop versions stay active but are never reported certified", () => {
+  // 1.18.16 and 1.18.18 carried certification claims before 1.18.21 was
+  // proven. They keep working and must now report as compatible only, so no
+  // stale claim outlives its evidence.
+  for (const version of ["1.18.16", "1.18.17", "1.18.18", "1.18.19", "1.18.20", "1.19.0"]) {
     const result = negotiateCapabilities(supportedClient(), version)
     expect(result.safeMode).toBeFalse()
     expect(result.certified).toBeFalse()
