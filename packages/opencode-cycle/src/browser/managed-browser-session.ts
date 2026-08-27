@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve } from "node:path"
+import { basename, isAbsolute, join, relative, resolve } from "node:path"
 
 import type {
   Browser,
@@ -39,7 +39,7 @@ export class ManagedBrowserSessionFactory implements BrowserSessionFactory {
     readonly artifactDirectory: string
     readonly sessionId: string
   }): Promise<ManagedBrowserSession> {
-    const executablePath = await resolveBrowserExecutable(this.#options.browserExecutable)
+    const installed = await installedBrowserExecutables(this.#options.browserExecutable)
     const identity = createHash("sha256").update(input.sessionId).digest("hex").slice(0, 16)
     const evidenceDirectory = join(input.artifactDirectory, "evidence", identity, randomUUID())
     const profileDirectory = join(input.artifactDirectory, "profiles", `${identity}-${randomUUID()}`)
@@ -48,15 +48,16 @@ export class ManagedBrowserSessionFactory implements BrowserSessionFactory {
       mkdir(profileDirectory, { recursive: true }),
     ])
     const origins = new Set(input.allowedOrigins)
-    const browser = await puppeteer.launch({
-      args: ["--disable-background-networking", "--disable-sync"],
-      browser: "chrome",
-      defaultViewport: { height: 900, width: 1440 },
-      executablePath,
-      headless: this.#options.headless,
-      timeout: 15_000,
-      userDataDir: profileDirectory,
-    })
+    const { browser } = await launchFirstUsableBrowser(installed, (candidate) =>
+      puppeteer.launch({
+        args: ["--disable-background-networking", "--disable-sync"],
+        browser: "chrome",
+        defaultViewport: { height: 900, width: 1440 },
+        executablePath: candidate,
+        headless: this.#options.headless,
+        timeout: 15_000,
+        userDataDir: profileDirectory,
+      }))
     const page = (await browser.pages())[0] ?? (await browser.newPage())
     await page.setRequestInterception(true)
     page.on("request", async (request) => {
@@ -441,17 +442,59 @@ function fillValue(command: BrowserCommand): string {
 }
 
 export async function resolveBrowserExecutable(configured?: string): Promise<string> {
-  const candidates = configured === undefined ? browserCandidates(process.platform, process.env) : [configured]
-  for (const candidate of candidates) {
-    try {
-      await access(candidate)
-      return candidate
-    } catch {}
-  }
+  const candidates = await installedBrowserExecutables(configured)
+  const first = candidates[0]
+  if (first !== undefined) return first
   throw new Error(
     configured === undefined
       ? "No supported stable Chrome, Edge or Chromium installation was found"
       : "Configured browser executable does not exist",
+  )
+}
+
+/** Every candidate that exists on disk, in preference order. */
+export async function installedBrowserExecutables(configured?: string): Promise<string[]> {
+  const candidates = configured === undefined
+    ? browserCandidates(process.platform, process.env)
+    : [configured]
+  const installed: string[] = []
+  for (const candidate of candidates) {
+    try {
+      await access(candidate)
+      installed.push(candidate)
+    } catch {}
+  }
+  return installed
+}
+
+/**
+ * Launch the first candidate that actually works.
+ *
+ * Existing on disk does not make a browser usable: on Windows the Edge path can
+ * hold a launcher stub that spawns the real process and exits zero, which the
+ * automation library reports only as an opaque launch failure. Committing to
+ * the first path that exists leaves managed browser QA permanently broken on
+ * such a machine, so a candidate that cannot launch yields to the next one.
+ *
+ * Failures name the executable, never its directory, because this error
+ * reaches users and agent output.
+ */
+export async function launchFirstUsableBrowser<T>(
+  candidates: readonly string[],
+  launch: (executablePath: string) => Promise<T>,
+): Promise<{ browser: T; executablePath: string }> {
+  const tried: string[] = []
+  for (const candidate of candidates) {
+    try {
+      return { browser: await launch(candidate), executablePath: candidate }
+    } catch {
+      tried.push(basename(candidate))
+    }
+  }
+  throw new Error(
+    tried.length === 0
+      ? "No supported stable Chrome, Edge or Chromium installation was found"
+      : `No installed browser could be launched: tried ${tried.join(", ")}`,
   )
 }
 
