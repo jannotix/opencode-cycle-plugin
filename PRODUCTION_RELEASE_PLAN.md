@@ -474,14 +474,28 @@ Windows and Linux receipt records `desktop.version` 1.18.16 and predates the
 module-runtime-guard design entirely, so there is no earlier 1.18.21 evidence
 to compare against.
 
-The remaining unknown is which of the three loader binding checks rejects the
-entry — `validateDesktopPluginInput`, the `binaryPath` comparison, or the
-`options` comparison. Their thrown error is caught and discarded by design, and
-the load-diagnostic status vocabulary is a fixed sanitized set, so isolating it
-requires an owner-approved change to the certification harness diagnostics or
-an investigation of how OpenCode 1.18.21 invokes a plugin compared with
-1.18.16. That work is not started; T06 must not promote 1.18.21 until it is
-resolved.
+The rejecting check is now identified. An owner-approved debug run of the
+instrumented loader records `validateDesktopPluginInput` as the failure, with
+`binaryPathMatches` and `optionsMatch` both true: the archive binding and the
+options are correct, and the entry is refused on the plugin input alone.
+
+The input Desktop 1.18.21 supplies reports `worktree` as `/` and `directory` as
+the isolated home, not the isolated project the harness prepares and passes as
+the Desktop working directory. `/` is outside the scratch, so the sandbox check
+refuses it. Two consequences follow. The harness conflates "outside the
+isolated scratch" with "no worktree reported", and Desktop is not opening the
+prepared project at all, so this proof does not currently exercise the project
+context it claims to. The certification is therefore asserting less than it
+should, in addition to failing.
+
+The observed input keys are `$`, `client`, `directory`, `experimental_workspace`,
+`project`, `serverUrl` and `worktree`, which is the richer plugin input shape;
+the harness predates it and inspects only `directory` and `worktree`.
+
+The fix belongs in the harness rather than the product: make Desktop open the
+prepared isolated project so a real worktree is reported, and keep rejecting
+genuine outside-scratch paths without treating an absent worktree as an escape.
+T06 must still not promote 1.18.21 until both provisional proofs pass.
 
 ### T06 — Promote OpenCode 1.18.21 and remove stale certification claims
 
