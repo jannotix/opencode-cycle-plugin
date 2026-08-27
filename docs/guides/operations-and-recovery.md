@@ -33,7 +33,7 @@ Normal work requires no command sequence: select `Cycle` and state the desired o
 
 | Symptom | Meaning | Recovery |
 | --- | --- | --- |
-| `safe mode` | A required host capability is missing, the Desktop version is below 1.18.16, or the major version is not 1. | Preserve data, restore a 1.x Desktop at or above 1.18.16, then run `doctor`. An uncertified but compatible 1.x update is not safe mode; `doctor` reports it and Cycle continues. |
+| `safe mode` | A required host capability is missing, the Desktop version is below 1.18.16, or the major version is not 1. | Preserve data, restore a 1.x Desktop at or above 1.18.16, then run `doctor`. An uncertified but compatible 1.x update is not safe mode; `doctor` reports it and Cycle continues. On OpenCode 2.x and later, safe mode is expected: the plugin API changed with the major version and a Cycle build targeting it is required. |
 | `cpu_pressure`, `memory_pressure`, or `disk_pressure` | Admission reserve would be violated. | Stop unrelated heavy work or free disk; admission retries without consuming a repair cycle. |
 | `concurrency_limit` or `fair_queue` | Another governed workflow currently owns capacity. | Wait; the lease is renewed while active and expires after a crash. |
 | `blocked` after rejection | The five-cycle repair budget is exhausted. | Inspect evidence and the original request, amend inputs if needed, then explicitly authorize recovery. |

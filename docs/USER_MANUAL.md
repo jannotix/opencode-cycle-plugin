@@ -618,7 +618,7 @@ Inspect the effective policy with:
 
 | Symptom | Meaning | Correct response |
 | --- | --- | --- |
-| `safe mode` | Required host capability missing, Desktop below 1.18.16, or major version is not 1 | Restore OpenCode 1.x at or above 1.18.16 and run `doctor`. Newer 1.x updates are compatible warnings, not safe mode. |
+| `safe mode` | Required host capability missing, Desktop below 1.18.16, or a major version other than 1 | Restore OpenCode 1.x at or above 1.18.16 and run `doctor`. Newer 1.x updates are compatible warnings, not safe mode. On OpenCode 2.x and later the plugin API differs and a Cycle build targeting that major version is required. |
 | `cpu_pressure`, `memory_pressure`, `disk_pressure` | A machine reserve would be violated | Free resources; the retry does not consume a repair cycle |
 | `concurrency_limit` or `fair_queue` | Another workflow owns capacity | Wait for normal admission |
 | `blocked` after rejection | Five candidate repair cycles were exhausted | Inspect request and evidence, amend deliberately, then retry |

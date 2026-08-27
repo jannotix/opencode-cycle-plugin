@@ -69,6 +69,23 @@ This disables the plugin and keeps your project files. Local Cycle state is pres
 
 Certified means a Desktop certification receipt exists for that platform on the released revision. Compatible but untested means the packages are built, published and resolvable, and no Desktop certification evidence covers them; `/cycle doctor` reports the distinction for the platform you are on.
 
+## Supported OpenCode versions
+
+Cycle for OpenCode 1.x targets the OpenCode 1.x plugin API.
+
+| Host | Status |
+| --- | --- |
+| OpenCode Desktop 1.18.21 | Certified: Windows x64 and Linux x64 Desktop receipts exist for this release |
+| OpenCode Desktop 1.18.16 to 1.18.20, and newer 1.x | Compatible: Cycle runs and reports that the host is outside the certified evidence set |
+| OpenCode Desktop below 1.18.16 | Safe mode: Cycle loads but stays inert |
+| OpenCode 2.x and later | Safe mode: the plugin API changed with the major version, so a separate Cycle build targeting it is required |
+
+Certification follows evidence, not intent: a host appears as certified only
+while a Desktop receipt exists for it on the released revision. On an
+incompatible major version Cycle does not crash. It loads, stays inert, and
+says that the plugin API differs and that a build targeting that host is
+needed, so the refusal cannot be mistaken for a defect.
+
 The product name is Cycle for OpenCode. Supported installations keep the existing data-directory folder name so current installs are not moved:
 
 | Platform | Data directory |
