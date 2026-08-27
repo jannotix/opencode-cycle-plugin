@@ -907,6 +907,63 @@ test("entry binding debug names the failing check only when explicitly enabled",
   }
 }, 30_000)
 
+test("a rootless host worktree activates while a real outside path stays refused", async () => {
+  const node = Bun.which("node")
+  expect(node).toBeString()
+
+  // OpenCode Desktop reports a filesystem root as the worktree when no project
+  // is open, and there is no supported way to launch it at a directory. That
+  // carries no path out of the sandbox, so it must not be read as an escape.
+  // Any other outside-scratch path is a real leak and stays refused.
+  for (const [label, directory, worktree, accepted] of [
+    ["root worktree", "<scratch>", "/", true],
+    ["scratch worktree", "<scratch>", "<scratch>", true],
+    ["outside worktree", "<scratch>", "<outside>", false],
+    ["outside directory", "<outside>", "<scratch>", false],
+  ] as const) {
+    const fixture = await createDesktopLoadFixture(undefined, "windows-x64", true)
+    try {
+      const source = await readFile(fixture.prepared.pluginLoader, "utf8")
+      const expectedOptions = /const expectedPluginOptions = (\{.*\})/u.exec(source)?.[1]
+      expect(expectedOptions, label).toBeString()
+
+      const outside = resolve(fixture.temporary, "..", "cycle-cert-outside-fixture")
+      const resolvePlaceholder = (value: string) =>
+        value === "<scratch>" ? fixture.temporary : value === "<outside>" ? outside : value
+      const runner = join(fixture.temporary, `worktree-${label.replace(/\s+/gu, "-")}.mjs`)
+      await writeFile(
+        runner,
+        `import loader from ${JSON.stringify(pathToFileURL(fixture.prepared.pluginLoader).href)}
+` +
+          `await loader({ directory: ${JSON.stringify(resolvePlaceholder(directory))}, ` +
+          `worktree: ${JSON.stringify(resolvePlaceholder(worktree))} }, ${expectedOptions})
+`,
+        "utf8",
+      )
+      const child = Bun.spawn([node as string, runner], {
+        cwd: fixture.temporary,
+        env: fixture.environment,
+        stderr: "ignore",
+        stdout: "ignore",
+      })
+      await child.exited
+
+      const diagnostics = await readFile(fixture.prepared.diagnosticsFile, "utf8")
+      if (accepted) {
+        expect(diagnostics, label).toContain('"stage":"plugin_entry_started","status":"passed"')
+      } else {
+        expect(diagnostics, label).toContain('"stage":"plugin_entry_started","status":"failed"')
+        const captured = JSON.parse(
+          await readFile(join(fixture.temporary, "desktop-entry-binding-debug.json"), "utf8"),
+        ) as Record<string, unknown>
+        expect(captured.reason, label).toBe("plugin input")
+      }
+    } finally {
+      await rm(fixture.temporary, { force: true, recursive: true })
+    }
+  }
+}, 30_000)
+
 test("Desktop load diagnostics distinguish export mismatch from dependency resolution", async () => {
   const node = Bun.which("node")
   expect(node).toBeString()

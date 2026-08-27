@@ -1050,7 +1050,7 @@ function recordEntryBindingDebug(error, input, options) {
 `
     : ""
   const loader = `import { closeSync, fsyncSync, openSync, readFileSync, statSync, writeSync } from "node:fs"
-import { dirname, join, relative, resolve, sep } from "node:path"
+import { dirname, join, parse, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 ${diagnosticWriter}
@@ -1308,9 +1308,23 @@ function validateDesktopEffectiveEnvironment() {
 }
 
 function validateDesktopPluginInput(input) {
-  for (const value of [input?.directory, input?.worktree]) {
-    if (value !== undefined && !isInsideDesktopScratch(value)) throw new Error("plugin input")
+  if (input?.directory !== undefined && !isInsideDesktopScratch(input.directory)) {
+    throw new Error("plugin input")
   }
+  const worktree = input?.worktree
+  if (worktree === undefined || isInsideDesktopScratch(worktree)) return
+  // The host reports a filesystem root as the worktree when no project is
+  // open, and it offers no supported way to be launched at a directory. A root
+  // carries no path out of the sandbox, so it is not an isolation failure and
+  // must not be read as one. Any other outside-scratch worktree is a real leak
+  // of operator material and stays refused.
+  if (!isRootWorktree(worktree)) throw new Error("plugin input")
+}
+
+function isRootWorktree(value) {
+  if (typeof value !== "string" || value.length === 0) return false
+  const resolved = resolve(value)
+  return resolved === sep || resolved === parse(resolved).root
 }
 `
 }
