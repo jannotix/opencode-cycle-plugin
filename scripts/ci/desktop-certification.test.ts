@@ -334,7 +334,7 @@ export default async function CandidateFixture(input, options) {
   }
 }
 CandidateFixture.finalizeDesktopCertification = async () => {}
-`, platform: "linux-x64" | "windows-x64" = "windows-x64") {
+`, platform: "linux-x64" | "windows-x64" = "windows-x64", debugEntryBinding = false) {
   const temporary = await mkdtemp(join(tmpdir(), "cycle-cert-desktop-load-"))
   const certificationRoot = join(temporary, "certification")
   const packedPlugin = join(temporary, "packed-plugin")
@@ -375,6 +375,7 @@ CandidateFixture.finalizeDesktopCertification = async () => {}
   const prepared = await prepareDesktopCertificationLoad({
     certification: binding,
     dataDirectory,
+    ...(debugEntryBinding ? { debugEntryBinding: true } : {}),
     environment: effectiveEnvironment,
     hostVersion: "1.18.21",
     nativeExecutable,
@@ -833,6 +834,78 @@ test("Desktop load diagnostics fail closed at candidate module resolution withou
     await rm(fixture.temporary, { force: true, recursive: true })
   }
 }, 20_000)
+
+test("entry binding debug names the failing check only when explicitly enabled", async () => {
+  const node = Bun.which("node")
+  expect(node).toBeString()
+
+  // Default runs must carry no debug capture at all: the loader is part of the
+  // certified evidence through its own digest, so instrumentation may never
+  // appear unless it was asked for.
+  const quiet = await createDesktopLoadFixture()
+  try {
+    const source = await readFile(quiet.prepared.pluginLoader, "utf8")
+    expect(source).not.toContain("recordEntryBindingDebug")
+    expect(source).not.toContain("desktop-entry-binding-debug")
+    expect(source).toContain("  } catch {\n    recordDesktopLoadDiagnostic(\"plugin_entry_started\", \"failed\")")
+  } finally {
+    await rm(quiet.temporary, { force: true, recursive: true })
+  }
+
+  // Each of the three binding checks must be individually identifiable, so a
+  // failing activation says which one rejected it instead of only that one did.
+  for (const [label, driver, expectedReason] of [
+    [
+      "plugin input",
+      (loaderUrl: string, options: string) =>
+        `import loader from ${loaderUrl}\n` +
+        `await loader({ directory: "/outside/scratch", worktree: "/outside/scratch" }, ${options})\n`,
+      "plugin input",
+    ],
+    [
+      "options mismatch",
+      (loaderUrl: string, _options: string) =>
+        `import loader from ${loaderUrl}\n` +
+        `await loader({ directory: undefined, worktree: undefined }, { unexpected: true })\n`,
+      "options mismatch",
+    ],
+  ] as const) {
+    const fixture = await createDesktopLoadFixture(undefined, "windows-x64", true)
+    try {
+      const source = await readFile(fixture.prepared.pluginLoader, "utf8")
+      expect(source, label).toContain("recordEntryBindingDebug")
+
+      const expected = /const expectedPluginOptions = (\{.*\})/u.exec(source)?.[1]
+      expect(expected, label).toBeString()
+      const runner = join(fixture.temporary, `drive-${label.replace(/\s+/gu, "-")}.mjs`)
+      await writeFile(
+        runner,
+        driver(JSON.stringify(pathToFileURL(fixture.prepared.pluginLoader).href), expected as string),
+        "utf8",
+      )
+      const child = Bun.spawn([node as string, runner], {
+        cwd: fixture.temporary,
+        env: fixture.environment,
+        stderr: "ignore",
+        stdout: "ignore",
+      })
+      expect(await child.exited, label).not.toBe(0)
+
+      const debugFile = join(fixture.temporary, "desktop-entry-binding-debug.json")
+      const captured = JSON.parse(await readFile(debugFile, "utf8")) as Record<string, unknown>
+      expect(captured.reason, label).toBe(expectedReason)
+
+      // The sanitized diagnostics stay exactly as they are: the debug capture
+      // is a separate scratch-only file and never reaches the receipt.
+      const diagnostics = await readFile(fixture.prepared.diagnosticsFile, "utf8")
+      expect(diagnostics, label).toContain('"stage":"plugin_entry_started","status":"failed"')
+      expect(diagnostics, label).not.toContain("reason")
+      expect(diagnostics, label).not.toContain(fixture.temporary)
+    } finally {
+      await rm(fixture.temporary, { force: true, recursive: true })
+    }
+  }
+}, 30_000)
 
 test("Desktop load diagnostics distinguish export mismatch from dependency resolution", async () => {
   const node = Bun.which("node")

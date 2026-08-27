@@ -102,6 +102,7 @@ const OFFICIAL_DESKTOP_RUNTIME = {
   nodeVersion: "24.15.0",
 } as const
 const DESKTOP_LOAD_DIAGNOSTIC_TYPE = "opencode-cycle-desktop-load-diagnostic"
+export const ENTRY_BINDING_DEBUG_FILE = "desktop-entry-binding-debug.json"
 const DESKTOP_LOAD_DIAGNOSTIC_STAGES = [
   "certification_env_prepared",
   "config_tree_prepared",
@@ -505,6 +506,7 @@ async function main(): Promise<void> {
     preparedLoad = await prepareDesktopCertificationLoad({
       certification,
       dataDirectory,
+      ...(debugProfile ? { debugEntryBinding: true } : {}),
       environment,
       hostVersion: matrix.version,
       nativeExecutable,
@@ -778,6 +780,9 @@ export async function cleanupDesktopCertificationProcesses(input: {
 export async function prepareDesktopCertificationLoad(input: {
   readonly certification: DesktopCertificationBinding
   readonly dataDirectory: string
+  // Emits which entry-binding check rejected an activation, into the scratch
+  // root only. Off by default so a certified loader carries no instrumentation.
+  readonly debugEntryBinding?: boolean
   readonly environment: NodeJS.ProcessEnv
   readonly hostVersion: string
   readonly nativeExecutable: string
@@ -845,6 +850,7 @@ export async function prepareDesktopCertificationLoad(input: {
       runtimeGuardDiagnosticsFile,
       input.scratch,
       input.environment,
+      input.debugEntryBinding === true,
     )
   } catch (error) {
     try {
@@ -971,6 +977,7 @@ async function installPackedPluginTree(
   runtimeGuardDiagnosticsFile: string,
   scratch: string,
   environment: NodeJS.ProcessEnv,
+  debugEntryBinding: boolean,
 ): Promise<Omit<
   PreparedDesktopCertificationLoad,
   "diagnosticsFile" | "runtimeGuardDiagnosticsFile" | "shellWrapper"
@@ -1002,6 +1009,46 @@ async function installPackedPluginTree(
     join(configDirectory, "opencode.json"),
     environmentBindingsForLoader(environment),
   )
+  // The entry-binding guard rejects an activation without saying which of its
+  // three checks refused it, because a receipt must not carry raw paths or
+  // options. When a run explicitly asks to be debugged, the same rejection also
+  // writes those raw values to the scratch root, which is discarded unless the
+  // operator keeps it, and never to the evidence root.
+  const entryBindingDebugWriter = debugEntryBinding
+    ? `
+function recordEntryBindingDebug(error, input, options) {
+  try {
+    const inputRecord = input !== null && typeof input === "object" ? input : {}
+    const payload = {
+      reason: error !== null && typeof error === "object" && "message" in error
+        ? String(error.message)
+        : "unknown",
+      binaryPathMatches: binaryPath === expectedPluginOptions.binaryPath,
+      optionsMatch: JSON.stringify(options) === JSON.stringify(expectedPluginOptions),
+      actualBinaryPath: binaryPath,
+      expectedBinaryPath: expectedPluginOptions.binaryPath,
+      actualOptions: options === undefined ? null : options,
+      expectedOptions: expectedPluginOptions,
+      inputKeys: Object.keys(inputRecord).sort(),
+      inputDirectory: inputRecord.directory === undefined ? null : inputRecord.directory,
+      inputWorktree: inputRecord.worktree === undefined ? null : inputRecord.worktree,
+      directoryInsideScratch: isInsideDesktopScratch(inputRecord.directory),
+      worktreeInsideScratch: isInsideDesktopScratch(inputRecord.worktree),
+      scratchRoot: desktopCertificationScratch,
+    }
+    const handle = openSync(${JSON.stringify(join(scratch, ENTRY_BINDING_DEBUG_FILE))}, "w", 0o600)
+    try {
+      writeSync(handle, JSON.stringify(payload, null, 2) + "\\n", undefined, "utf8")
+      fsyncSync(handle)
+    } finally {
+      closeSync(handle)
+    }
+  } catch {
+    // Debug capture must never change how an activation behaves.
+  }
+}
+`
+    : ""
   const loader = `import { closeSync, fsyncSync, openSync, readFileSync, statSync, writeSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -1063,14 +1110,14 @@ recordDesktopLoadDiagnostic("candidate_module_resolved", "passed")
 
 const binaryPath = fileURLToPath(new URL("../opencode-cycle/bin/${nativeBinary}", import.meta.url))
 const expectedPluginOptions = ${JSON.stringify(pluginOptions)}
-
+${entryBindingDebugWriter}
 export default async function OpenCodeCyclePlugin(input, options) {
   try {
     validateDesktopPluginInput(input)
     if (binaryPath !== expectedPluginOptions.binaryPath) throw new Error("binary mismatch")
     if (JSON.stringify(options) !== JSON.stringify(expectedPluginOptions)) throw new Error("options mismatch")
-  } catch {
-    recordDesktopLoadDiagnostic("plugin_entry_started", "failed")
+  } catch${debugEntryBinding ? " (error)" : ""} {
+${debugEntryBinding ? "    recordEntryBindingDebug(error, input, options)\n" : ""}    recordDesktopLoadDiagnostic("plugin_entry_started", "failed")
     throw new Error("Cycle certification plugin entry binding is invalid")
   }
   recordDesktopLoadDiagnostic("plugin_entry_started", "passed")
