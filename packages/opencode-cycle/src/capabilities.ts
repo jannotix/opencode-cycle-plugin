@@ -60,6 +60,15 @@ export const CERTIFIED_HOST_VERSIONS = ["1.18.21"] as const
 export const MINIMUM_HOST_VERSION = "1.18.16" as const
 export const SUPPORTED_HOST_MAJOR = 1
 
+// A major version change carries a different plugin API, so this build
+// cannot run there at all. The wording says what is incompatible and what
+// would be needed, because "did not start" alone reads as a defect. It
+// never names a release date or promises a build that does not exist.
+export const UNSUPPORTED_MAJOR_GUIDANCE =
+  "Cycle for OpenCode 1.x implements the OpenCode 1.x plugin API. This host runs a " +
+  "different major version, whose plugin API is not compatible, and needs a Cycle " +
+  "build that targets it."
+
 // Desktop certification evidence exists for these targets only.
 export const CERTIFIED_PLATFORM_TARGETS = ["linux-x64", "win32-x64"] as const
 // These ship and run, with no Desktop certification claimed for them.
@@ -167,7 +176,7 @@ export function hostCompatibility(version: string | undefined): HostCompatibilit
       certified: false,
       certifiedVersions,
       compatible: false,
-      message: `OpenCode ${version} is outside major version ${SUPPORTED_HOST_MAJOR}. Cycle did not start.`,
+      message: `OpenCode ${version} is outside major version ${SUPPORTED_HOST_MAJOR}. ${UNSUPPORTED_MAJOR_GUIDANCE} Cycle did not start.`,
       minimumVersion: MINIMUM_HOST_VERSION,
       version,
     }
@@ -211,12 +220,15 @@ export function negotiateCapabilities(
   const platformCompatibilityReport = platformCompatibility(platform, architecture)
   const reasons = [...missing]
   if (!host.compatible) {
+    const parsedHost = host.version === null ? undefined : parseHostVersion(host.version)
     reasons.push(
       host.version === null
         ? "OpenCode host version is unavailable"
-        : parseHostVersion(host.version) === undefined
+        : parsedHost === undefined
           ? "OpenCode host version is unreadable"
-          : "Unsupported OpenCode host version",
+          : parsedHost.major !== SUPPORTED_HOST_MAJOR
+            ? UNSUPPORTED_MAJOR_GUIDANCE
+            : "Unsupported OpenCode host version",
     )
   }
   if (!platformCompatibilityReport.supported) {

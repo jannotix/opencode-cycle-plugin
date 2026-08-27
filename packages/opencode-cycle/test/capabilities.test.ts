@@ -89,6 +89,38 @@ test("other 1.x Desktop versions stay active but are never reported certified", 
   }
 })
 
+test("a future major says what is wrong and what is needed, without echoing the host", () => {
+  for (const version of ["2.0.0", "2.1.4", "3.0.0"]) {
+    const result = negotiateCapabilities(supportedClient(), version)
+
+    // The plugin API changed with the major version, so this build cannot run
+    // here. Saying only "did not start" leaves the user guessing at a bug.
+    expect(result.safeMode).toBeTrue()
+    expect(result.host.compatible).toBeFalse()
+    expect(result.host.message).toContain("plugin API")
+    expect(result.host.message).toContain("Cycle did not start")
+
+    const reasons = result.reasons.join(" ")
+    expect(reasons).toContain("plugin API")
+    expect(reasons).toContain("build that targets it")
+
+    // A host-supplied version string must never be echoed into the reasons,
+    // which reach an agent template.
+    expect(reasons).not.toContain(version)
+  }
+})
+
+test("supported 1.x hosts never enter safe mode, however far ahead", () => {
+  // A newer 1.x must keep working: the contract is the major version, not a
+  // list someone has to remember to extend.
+  for (const version of ["1.18.16", "1.18.21", "1.19.0", "1.30.7", "1.999.999"]) {
+    const result = negotiateCapabilities(supportedClient(), version, "win32", "x64")
+    expect(result.safeMode, version).toBeFalse()
+    expect(result.host.compatible, version).toBeTrue()
+    expect(result.reasons, version).toEqual([])
+  }
+})
+
 test("pins the OpenCode plugin and SDK dependency graph to the certified Desktop release", async () => {
   const root = resolve(import.meta.dir, "../../..")
   for (const manifestPath of [
@@ -132,7 +164,11 @@ test("unreadable or other-major hosts enter safe mode without echoing the versio
     const result = negotiateCapabilities(supportedClient(), version)
     expect(result.safeMode).toBeTrue()
     expect(result.host.compatible).toBeFalse()
-    expect(result.reasons.some((reason) => reason.includes("host version"))).toBeTrue()
+    // The reason must identify the host as the problem. An unreadable version
+    // and an incompatible major are different faults and are worded
+    // differently; both must still say which one it is.
+    expect(result.reasons.some((reason) =>
+      reason.includes("host version") || reason.includes("plugin API"))).toBeTrue()
     expect(result.reasons.join(" ")).not.toContain(version)
   }
 })

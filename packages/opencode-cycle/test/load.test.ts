@@ -7,6 +7,7 @@ import { promisify } from "node:util"
 
 import OpenCodeCycle, * as pluginModule from "../src/index.js"
 import { LocalControlPlane } from "../src/control-plane.js"
+import { UNSUPPORTED_MAJOR_GUIDANCE } from "../src/capabilities.js"
 
 const execFileAsync = promisify(execFile)
 
@@ -793,9 +794,12 @@ test("safe mode logs one controlled warning for unreadable or other-major host v
         message: "Cycle for OpenCode entered safe mode",
         extra: {
           product_version: "1.0.0",
+          // The operator log is where an incompatible major must be explained,
+          // not merely refused: it names the plugin-API mismatch and what a
+          // working install would need.
           reasons:
             options.hostVersion === "2.0.0"
-              ? "Unsupported OpenCode host version"
+              ? UNSUPPORTED_MAJOR_GUIDANCE
               : "OpenCode host version is unreadable",
         },
         service: "opencode-cycle",
