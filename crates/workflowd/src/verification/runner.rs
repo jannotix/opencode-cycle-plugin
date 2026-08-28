@@ -2,14 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use workflow_core::{
-    CandidateManifest, ContentDigest, EvidenceId, EvidenceRecord, EvidenceStatus, WorkflowTimestamp,
+    CandidateManifest, ContentDigest, EvidenceId, EvidenceRecord, EvidenceStatus,
+    EvidenceValidationError, WorkflowTimestamp,
 };
 use workflow_ipc::ManagedBrowserAttestation;
 use workflow_ledger::Redactor;
@@ -35,6 +36,7 @@ pub struct VerificationRun {
 pub enum VerificationRunError {
     CandidateChanged,
     EvidenceMismatch,
+    EvidenceInvalid(EvidenceValidationError),
     Io(std::io::Error),
     Join(tokio::task::JoinError),
 }
@@ -47,6 +49,16 @@ impl std::fmt::Display for VerificationRunError {
             }
             Self::EvidenceMismatch => {
                 formatter.write_str("candidate evidence identifiers do not match the plan")
+            }
+            // A rejected record is not an identifier mismatch. Reporting it as
+            // one sends an operator looking for a divergence between plan and
+            // candidate that does not exist; the record's own reason is a
+            // fixed vocabulary and carries no values.
+            Self::EvidenceInvalid(error) => {
+                write!(
+                    formatter,
+                    "verification evidence record is invalid: {error}"
+                )
             }
             Self::Io(error) => error.fmt(formatter),
             Self::Join(error) => error.fmt(formatter),
@@ -156,6 +168,7 @@ fn managed_browser_gate(
     });
     let (session_id, operations, receipt_digest) = valid?;
     let started_at = WorkflowTimestamp::now();
+    let started_instant = Instant::now();
     let output = format!(
         "Managed browser receipt {receipt_digest} from session {session_id} passed operations: {}.",
         operations.join(", ")
@@ -168,7 +181,7 @@ fn managed_browser_gate(
         tool: "opencode-cycle-managed-browser".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         started_at,
-        finished_at: WorkflowTimestamp::now(),
+        finished_at: monotonic_finish(started_at, started_instant),
         exit_code: Some(0),
         output_digest: ContentDigest::of(output.as_bytes()),
         status: EvidenceStatus::Passed,
@@ -263,6 +276,7 @@ async fn run_gate(
     exact_files: &[CandidateFilePayload],
 ) -> Result<GateResult, VerificationRunError> {
     let started_at = WorkflowTimestamp::now();
+    let started_instant = Instant::now();
     let candidate_digest = manifest.digest();
     let (exit_code, output, output_digest, status, skip_reason, tool, tool_version) =
         match &gate.executor {
@@ -350,7 +364,7 @@ async fn run_gate(
         tool,
         tool_version,
         started_at,
-        finished_at: WorkflowTimestamp::now(),
+        finished_at: monotonic_finish(started_at, started_instant),
         exit_code,
         output_digest,
         status,
@@ -358,11 +372,26 @@ async fn run_gate(
     };
     record
         .validate()
-        .map_err(|_| VerificationRunError::EvidenceMismatch)?;
+        .map_err(VerificationRunError::EvidenceInvalid)?;
     Ok(GateResult {
         output: Redactor::default().value(output),
         record,
     })
+}
+
+/// Derive when a gate finished from how long it actually ran.
+///
+/// A second wall-clock reading is not a safe end time: a clock that steps
+/// backwards mid-gate produces a record that finished before it started, which
+/// the record's own validation rejects even though the gate passed. Elapsed
+/// time comes from the monotonic clock, so the ordering holds through any
+/// adjustment, while the receipt keeps wall-clock times for auditing.
+fn monotonic_finish(started_at: WorkflowTimestamp, started: Instant) -> WorkflowTimestamp {
+    let elapsed = i128::try_from(started.elapsed().as_nanos()).unwrap_or(i128::MAX);
+    WorkflowTimestamp::from_unix_timestamp_nanos(
+        started_at.unix_timestamp_nanos().saturating_add(elapsed),
+    )
+    .unwrap_or(started_at)
 }
 
 async fn probe_tool_version(directory: &Path, program: &str) -> String {
@@ -558,6 +587,45 @@ fn invocation(gate: &VerificationGate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gate_never_finishes_before_it_started() {
+        // A wall clock that steps backwards mid-gate used to produce a record
+        // the evidence validator rejected, and that rejection was reported as
+        // an identifier mismatch. Elapsed time now comes from the monotonic
+        // clock, so the ordering cannot invert however the clock is adjusted.
+        let started_at = WorkflowTimestamp::now();
+        let started = Instant::now();
+        let finished_at = monotonic_finish(started_at, started);
+        assert!(finished_at.unix_timestamp_nanos() >= started_at.unix_timestamp_nanos());
+
+        let record = EvidenceRecord {
+            id: EvidenceId::new(),
+            candidate_digest: ContentDigest::of(b"candidate"),
+            kind: workflow_core::EvidenceKind::Inspection,
+            invocation: "candidate-integrity".to_owned(),
+            tool: "workflow-candidate-integrity".to_owned(),
+            tool_version: "1.0.0".to_owned(),
+            started_at,
+            finished_at,
+            exit_code: Some(0),
+            output_digest: ContentDigest::of(b"output"),
+            status: EvidenceStatus::Passed,
+            skip_reason: None,
+        };
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn a_rejected_record_reports_its_own_reason() {
+        let error =
+            VerificationRunError::EvidenceInvalid(EvidenceValidationError::InvalidTimeRange);
+        let message = error.to_string();
+        assert!(message.contains("evidence record is invalid"));
+        assert!(message.contains("timestamps are invalid"));
+        // The identifier mismatch keeps its own, distinct meaning.
+        assert!(!message.contains("identifiers do not match"));
+    }
 
     #[cfg(windows)]
     #[test]
