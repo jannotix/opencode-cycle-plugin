@@ -80,7 +80,10 @@ function outputChannel(): { bytes: number; hash: Hash; truncated: boolean } {
   return { bytes: 0, hash: createHash("sha256"), truncated: false }
 }
 
-const root = fileURLToPath(new URL("../../", import.meta.url))
+// A directory URL resolves with a trailing separator, which is not a canonical
+// path: evidence redaction rejects any sensitive path that does not equal its
+// own resolution, and rejected the repository root before the gate could start.
+const root = resolve(fileURLToPath(new URL("../../", import.meta.url)))
 const packageRoot = join(root, "packages", PRODUCT_IDENTITY.mainPackage)
 const gateOutput = new BoundedGateOutput()
 let scratch: string | undefined
@@ -492,6 +495,11 @@ process.exit(await child.exited)
       errorDigest: digestOfficialEvidenceError(error),
       gateOutput: gateOutput.summary(),
       ...(revision === undefined ? {} : { revision }),
+    }).catch((failure: unknown) => {
+      // A gate that dies before its first stage cannot publish a valid receipt.
+      // Reporting that instead of the failure it was recording would hide the
+      // reason the gate died, so it is surfaced alongside and never in place.
+      console.error("Official Electron evidence failure receipt was not published:", failure)
     })
   }
   throw error

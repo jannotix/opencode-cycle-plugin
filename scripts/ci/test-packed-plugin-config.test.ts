@@ -89,3 +89,17 @@ test("echoing a child's diagnostics can never abort the gate", async () => {
   expect(gate).toContain("forwardGateDiagnostics(value)")
   expect(gate).toMatch(/function forwardGateDiagnostics[\s\S]{0,240}catch/u)
 })
+
+test("the authoritative gate can open its evidence and never hides why it could not", async () => {
+  const gate = await readFile(resolve(import.meta.dir, "test-packed-plugin.ts"), "utf8")
+
+  // A directory URL resolves with a trailing separator. Evidence redaction
+  // requires a sensitive path to equal its own resolution, so registering an
+  // unresolved repository root threw before the gate recorded its first stage,
+  // and the evidence directory it left behind began at "gate-failed".
+  expect(gate).toContain('const root = resolve(fileURLToPath(new URL("../../", import.meta.url)))')
+
+  // Publishing the failure receipt can itself fail on such a directory. Its
+  // error must accompany the failure it records, never replace it.
+  expect(gate).toMatch(/finalizeFailure\(\{[\s\S]{0,320}\}\)\.catch\(/u)
+})
