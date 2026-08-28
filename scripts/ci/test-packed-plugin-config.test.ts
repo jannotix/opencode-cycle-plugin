@@ -65,7 +65,10 @@ test("Linux package proof uses a short isolated endpoint while the prior product
   )
   expect(Buffer.byteLength(posix.join(shortData, "runtime", "workflow.sock"))).toBe(91)
 
-  const scratch = resolve("C:\\task", `${packedPluginScratchPrefix("linux")}XXXXXX`)
+  // The Linux layout must be measured from a Linux base. A Windows base was
+  // resolved against the current directory on a Linux lane, which made the
+  // measured endpoint depend on where the checkout happened to live.
+  const scratch = posix.join(taskTmp, `${packedPluginScratchPrefix("linux")}XXXXXX`)
   const dataDirectory = packedPluginDataDirectory(scratch, "linux")
   expect(packedPluginDaemonEndpointEvidence(dataDirectory, "linux").endpointPathBytes)
     .toBeLessThanOrEqual(MAX_LINUX_UNIX_SOCKET_PATH_BYTES)
