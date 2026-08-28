@@ -15,6 +15,7 @@ import {
   serializeDesktopDependencyTreeManifest,
 } from "./desktop-dependency-tree.js"
 import { bundledDesktopRuntimeLinker } from "./desktop-runtime-linker.js"
+import { systemTarExecutable } from "../system-tar.js"
 
 // Building the release daemon is environment preparation, not the property
 // under test: on a cold tree it is a full optimized Rust build, while on a
@@ -44,7 +45,7 @@ test.skipIf(process.platform !== "win32")(
       await run(["bun", "pm", "pack", "--destination", temporary], packageRoot)
       const archiveName = (await readdir(temporary)).find((name) => name.endsWith(".tgz"))
       expect(archiveName).toBeString()
-      await run(["tar", "-xf", join(temporary, archiveName as string), "-C", extracted], root)
+      await run([systemTarExecutable(), "-xf", join(temporary, archiveName as string), "-C", extracted], root)
       const installedPlugin = join(extracted, "package")
       await run([
         "bun",

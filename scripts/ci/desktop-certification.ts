@@ -39,6 +39,7 @@ import {
   type CertifiedPlatform,
 } from "../release/release-manifest.js"
 import { PRODUCT_IDENTITY } from "../product-identity.js"
+import { systemTarExecutable } from "../system-tar.js"
 import { readVerifiedFileDirectory, readVerifiedRegularFile, type VerifiedFile } from "../release/verified-file.js"
 import { assertSourceUnchanged, captureCleanSource } from "./source-state.js"
 import { prepareReceiptOutput, publishReceiptAtomically } from "./receipt-output.js"
@@ -478,8 +479,8 @@ async function main(): Promise<void> {
     const pluginDirectory = join(scratch, "plugin")
     const nativeDirectory = join(scratch, "native")
     await Promise.all([mkdir(pluginDirectory), mkdir(nativeDirectory)])
-    await run(["tar", "-xf", pluginArchive, "-C", pluginDirectory], root, environment)
-    await run(["tar", "-xf", nativeArchive, "-C", nativeDirectory], root, environment)
+    await run([systemTarExecutable(environment), "-xf", pluginArchive, "-C", pluginDirectory], root, environment)
+    await run([systemTarExecutable(environment), "-xf", nativeArchive, "-C", nativeDirectory], root, environment)
     const installedPlugin = join(pluginDirectory, "package")
     const nativeExecutable = join(
       nativeDirectory,

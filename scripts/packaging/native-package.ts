@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path"
 
 import { NATIVE_PACKAGE_NAMES } from "../product-identity.js"
 import { inspectTarGz } from "./tar-archive.js"
+import { systemTarExecutable } from "../system-tar.js"
 
 export const NATIVE_TARGETS = {
   "darwin-arm64": { cpu: "arm64", executable: "workflowd", os: "darwin" },
@@ -59,7 +60,7 @@ export async function packageNative(
     if (JSON.stringify(listing) !== JSON.stringify(expected)) {
       throw new Error(`Native archive allowlist mismatch: ${listing.join(", ")}`)
     }
-    await run(["tar", "-xf", archive, "-C", extracted], resolvedRoot)
+    await run([systemTarExecutable(), "-xf", archive, "-C", extracted], resolvedRoot)
     const [sourceDigest, packedDigest] = await Promise.all([
       digest(resolve(binary)),
       digest(join(extracted, "package", "bin", definition.executable)),

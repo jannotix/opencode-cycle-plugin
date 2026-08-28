@@ -31,6 +31,7 @@ import {
   type OfficialRuntimeEvidenceSession,
 } from "./official-runtime-evidence.js"
 import { OPENCODE_11821_HOST_PROOF_PROVENANCE, type OpenCodeHostProofReceipt } from "./opencode-1.18.21-host-proof.js"
+import { systemTarExecutable } from "../system-tar.js"
 import {
   packedPluginDaemonEndpointEvidence,
   packedPluginDataDirectory,
@@ -209,7 +210,7 @@ process.exit(await child.exited)
     }
     await recordStage("plugin-pack-completed")
   }
-  const listing = (await run(["tar", "-tf", archive], root)).split(/\r?\n/u).filter(Boolean)
+  const listing = (await run([systemTarExecutable(), "-tf", archive], root)).split(/\r?\n/u).filter(Boolean)
   for (const required of ["package/package.json", "package/dist/index.js", "package/LICENSE", "package/NOTICE"]) {
     if (!listing.includes(required)) throw new Error(`Packed plugin is missing ${required}`)
   }
@@ -222,7 +223,7 @@ process.exit(await child.exited)
     throw new Error(`Packed plugin contains non-production file ${unexpected}`)
   }
 
-  await run(["tar", "-xf", archive, "-C", extracted], root)
+  await run([systemTarExecutable(), "-xf", archive, "-C", extracted], root)
   const installedPackage = join(extracted, "package")
   await run(
     ["bun", "install", "--backend=copyfile", "--ignore-scripts", "--linker=hoisted", "--production", "--no-save", native.archive],
