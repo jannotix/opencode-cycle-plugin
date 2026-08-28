@@ -77,3 +77,15 @@ test("Linux package proof uses a short isolated endpoint while the prior product
     `MAX_UNIX_SOCKET_PATH_BYTES: usize = ${MAX_LINUX_UNIX_SOCKET_PATH_BYTES}`,
   )
 })
+
+test("echoing a child's diagnostics can never abort the gate", async () => {
+  const gate = await readFile(resolve(import.meta.dir, "test-packed-plugin.ts"), "utf8")
+
+  // The gate mirrors a child's stderr so an operator can watch a long run.
+  // That is a convenience, not evidence: an unguarded write let a broken pipe
+  // on this process's own stderr kill a gate that was otherwise progressing,
+  // after the isolated install had already produced output.
+  expect(gate).not.toContain('if (channel === "stderr") process.stderr.write(value)')
+  expect(gate).toContain("forwardGateDiagnostics(value)")
+  expect(gate).toMatch(/function forwardGateDiagnostics[\s\S]{0,240}catch/u)
+})

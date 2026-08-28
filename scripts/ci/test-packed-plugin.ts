@@ -512,6 +512,23 @@ process.exit(await child.exited)
   ])
 }
 
+/**
+ * Mirror a child's diagnostics for an operator watching a long gate.
+ *
+ * This is a convenience, never evidence. Writing to this process's own stderr
+ * can fail with a broken pipe depending on how the gate was invoked, and an
+ * unguarded write turned that into a failed release gate part way through an
+ * otherwise healthy run. The captured bytes are still recorded and bounded by
+ * the gate output; only the echo is best effort.
+ */
+function forwardGateDiagnostics(value: Uint8Array): void {
+  try {
+    process.stderr.write(value)
+  } catch {
+    // An operator loses the live echo; the gate keeps its evidence and runs on.
+  }
+}
+
 async function readGateOutput(
   stream: ReadableStream<Uint8Array>,
   channel: "stderr" | "stdout",
@@ -527,7 +544,7 @@ async function readGateOutput(
         child.kill()
         throw new PackageGateFailure("output_limit")
       }
-      if (channel === "stderr") process.stderr.write(value)
+      if (channel === "stderr") forwardGateDiagnostics(value)
       chunks.push(Buffer.from(value))
     }
   } finally {

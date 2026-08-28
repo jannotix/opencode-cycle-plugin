@@ -92,24 +92,50 @@ export async function runDesktopRuntimeLinker(
     return value === "" || (value !== ".." && !value.startsWith(`..${sep}`))
   }
 
-  if (
-    typeof SourceTextModule !== "function" || typeof SyntheticModule !== "function" ||
-    !isAbsolute(root) || root !== expected.installedPlugin ||
-    !isAbsolute(expected.candidateEntry) || !inside(expected.candidateEntry) ||
-    !Number.isSafeInteger(expected.fullTreeFileCount) || expected.fullTreeFileCount < 1 ||
-    !Number.isSafeInteger(expected.runtimeInputFileCount) || expected.runtimeInputFileCount < 1 ||
-    expected.runtimeInputFileCount > MAX_RUNTIME_INPUT_FILES ||
-    expected.runtimeInputFileCount > expected.fullTreeFileCount ||
-    !Number.isSafeInteger(expected.runtimeInputContentBytes) || expected.runtimeInputContentBytes < 1 ||
-    !Number.isSafeInteger(expected.runtimeInputSerializedBytes) ||
-    expected.runtimeInputSerializedBytes < expected.runtimeInputContentBytes ||
-    expected.runtimeInputSerializedBytes > MAX_RUNTIME_INPUT_BYTES ||
-    !/^[0-9a-f]{64}$/u.test(expected.runtimeInputSha256) ||
-    process.versions.node !== expected.nodeVersion ||
-    (expected.authoritative && process.versions.electron !== expected.electronVersion) ||
-    (!expected.authoritative && expected.electronVersion !== null) ||
-    digestFile(process.execPath) !== expected.runtimeExecutableSha256
-  ) throw new Error("module linker runtime binding")
+  // Every rejection reason is a fixed code, never a value: the message reaches an
+  // operator through captured runtime output, so it must say which expectation
+  // broke without disclosing paths, digests, or counts.
+  const bindingFailure = ((): string | undefined => {
+    if (typeof SourceTextModule !== "function" || typeof SyntheticModule !== "function") {
+      return "vm_modules_unavailable"
+    }
+    if (!isAbsolute(root) || root !== expected.installedPlugin) return "installed_plugin_path"
+    if (!isAbsolute(expected.candidateEntry) || !inside(expected.candidateEntry)) {
+      return "candidate_entry_path"
+    }
+    if (!Number.isSafeInteger(expected.fullTreeFileCount) || expected.fullTreeFileCount < 1) {
+      return "full_tree_file_count"
+    }
+    if (
+      !Number.isSafeInteger(expected.runtimeInputFileCount) || expected.runtimeInputFileCount < 1 ||
+      expected.runtimeInputFileCount > MAX_RUNTIME_INPUT_FILES ||
+      expected.runtimeInputFileCount > expected.fullTreeFileCount
+    ) return "runtime_input_file_count"
+    if (
+      !Number.isSafeInteger(expected.runtimeInputContentBytes) ||
+      expected.runtimeInputContentBytes < 1
+    ) return "runtime_input_content_bytes"
+    if (
+      !Number.isSafeInteger(expected.runtimeInputSerializedBytes) ||
+      expected.runtimeInputSerializedBytes < expected.runtimeInputContentBytes ||
+      expected.runtimeInputSerializedBytes > MAX_RUNTIME_INPUT_BYTES
+    ) return "runtime_input_serialized_bytes"
+    if (!/^[0-9a-f]{64}$/u.test(expected.runtimeInputSha256)) return "runtime_input_digest_format"
+    if (process.versions.node !== expected.nodeVersion) return "node_version"
+    if (expected.authoritative && process.versions.electron !== expected.electronVersion) {
+      return "electron_version"
+    }
+    if (!expected.authoritative && expected.electronVersion !== null) {
+      return "electron_version_expectation"
+    }
+    if (digestFile(process.execPath) !== expected.runtimeExecutableSha256) {
+      return "runtime_executable_digest"
+    }
+    return undefined
+  })()
+  if (bindingFailure !== undefined) {
+    throw new Error(`module linker runtime binding: ${bindingFailure}`)
+  }
 
   const heldFiles = readHeldFiles(root, expected, canonicalKey, inside)
   const candidate = heldFiles.get(canonicalKey(expected.candidateEntry))

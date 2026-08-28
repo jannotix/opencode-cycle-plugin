@@ -1836,9 +1836,15 @@ export async function verifyDesktopModuleRuntime(
       await childExited.catch(() => undefined)
       throw error
     }
+    // A broken pipe here means the runtime child has already gone. Its own exit
+    // code and captured output are the diagnosis; rethrowing the transport
+    // error would replace a runtime failure with "EPIPE" and hide why the
+    // runtime refused. Keep it, and surface it only if the child was otherwise
+    // healthy, which would make the transfer itself the real fault.
+    let inputTransferFailure: unknown
     const inputTransfer = pipeline(graphInput.createReadStream(), child.stdin!).catch((error) => {
+      inputTransferFailure = error
       child.kill()
-      throw error
     })
     let timedOut = false
     let timeout: ReturnType<typeof setTimeout> | undefined
@@ -1872,6 +1878,9 @@ export async function verifyDesktopModuleRuntime(
         [code, standardOutput, standardError] as const)
     } finally {
       clearTimeout(timeout)
+    }
+    if (inputTransferFailure !== undefined && exitCode === 0 && !timedOut && !outputExceeded) {
+      throw inputTransferFailure
     }
     const execution = {
       exitCode,
@@ -1986,6 +1995,13 @@ export async function validateDesktopModuleRuntimeGuard(
     const errorClass = execution.timedOut
       ? "timeout"
       : execution.outputExceeded ? "output_limit" : "runtime_exit"
+    // The receipt only ever carries the digest. An operator debugging a failing
+    // guard has to opt in to see the raw output, and it goes to the terminal,
+    // never to evidence.
+    if (process.env.CYCLE_CERT_DEBUG_PROFILE === "1") {
+      console.error("Desktop module runtime guard stdout:", execution.stdout.toString())
+      console.error("Desktop module runtime guard stderr:", execution.stderr.toString())
+    }
     throw new Error(
       "Official Desktop module runtime guard failed: class=" + errorClass +
       ", code=" + execution.exitCode + ", output_sha256=" + outputDigest,

@@ -407,12 +407,42 @@ test("official Desktop metadata pins the exact runtime executable and product", 
   })
 })
 
+test("trusted module linker names which runtime binding expectation it rejected", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "cycle-link-binding-"))
+  try {
+    const installedPlugin = join(temporary, "opencode-cycle")
+    const entry = join(installedPlugin, "dist", "index.js")
+    await mkdir(join(installedPlugin, "dist"), { recursive: true })
+    await Promise.all([
+      writeFile(join(installedPlugin, "package.json"), `${JSON.stringify({
+        exports: { ".": "./dist/index.js" },
+        type: "module",
+      })}\n`),
+      writeFile(entry, "export default () => true\n"),
+    ])
+    const execution = await runLinker({
+      entry,
+      installedPlugin,
+      resultFile: join(temporary, "result.json"),
+      runtimeExecutableSha256: "0".repeat(64),
+    })
+    expect(execution.exitCode).not.toBe(0)
+    // The operator learns which expectation broke, and learns nothing else: the
+    // code is a category, never the digest that failed to match.
+    expect(execution.stderr).toContain("module linker runtime binding: runtime_executable_digest")
+    expect(execution.stderr).not.toContain("0".repeat(64))
+  } finally {
+    await rm(temporary, { force: true, recursive: true })
+  }
+}, { timeout: 30_000 })
+
 async function runLinker(input: {
   readonly entry: string
   readonly installedPlugin: string
   readonly resultFile: string
+  readonly runtimeExecutableSha256?: string
 }): Promise<{ readonly exitCode: number; readonly stderr: string; readonly stdout: string }> {
-  const runtimeExecutableSha256 = createHash("sha256")
+  const hostExecutableSha256 = createHash("sha256")
     .update(Buffer.from(await Bun.file(process.execPath).arrayBuffer()))
     .digest("hex")
   const sourceFile = join(input.installedPlugin, "..", `linker-${crypto.randomUUID()}.mjs`)
@@ -434,7 +464,7 @@ async function runLinker(input: {
       runtimeInputFileCount: graphInput.runtimeInputFileCount,
       runtimeInputSerializedBytes: graphInput.runtimeInputSerializedBytes,
       runtimeInputSha256: graphInput.runtimeInputSha256,
-      runtimeExecutableSha256,
+      runtimeExecutableSha256: input.runtimeExecutableSha256 ?? hostExecutableSha256,
       runtimeProductVersion: "system-node-unit-proof",
       verifiedContentTreeSha256: verification.contentTreeSha256,
     }), { flag: "wx", mode: 0o600 })
@@ -446,7 +476,11 @@ async function runLinker(input: {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     })
+    // A linker that rejects its binding exits before draining stdin. The broken
+    // pipe that follows must not outrank the child's own diagnosis; every caller
+    // asserts on exitCode and output, so a genuinely failed transfer still fails.
     const inputTransfer = pipeline(graphInput.createReadStream(), child.stdin!)
+      .catch(() => undefined)
     const exited = new Promise<number>((resolveExit, reject) => {
       child.once("error", reject)
       child.once("exit", (code) => resolveExit(code ?? 1))
