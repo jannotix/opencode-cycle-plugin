@@ -148,9 +148,9 @@ test.skipIf(process.platform !== "win32")(
           // a well-formed SHA-256 bound into the receipt.
           graphSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
           linkedEsmModuleCount: 42,
-          runtimeInputContentBytes: 25_574_535,
+          runtimeInputContentBytes: 25_574_559,
           runtimeInputFileCount: 2_777,
-          runtimeInputSerializedBytes: 25_868_602,
+          runtimeInputSerializedBytes: 25_868_626,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,

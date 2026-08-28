@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { basename, isAbsolute, join, relative, resolve } from "node:path"
+import { basename, isAbsolute, join, relative, resolve, win32 } from "node:path"
 
 import type {
   Browser,
@@ -555,12 +555,14 @@ export function browserCandidates(
   platform: NodeJS.Platform,
   environment: NodeJS.ProcessEnv,
 ): readonly string[] {
+  // The requested platform decides the separator, not the host: a Linux
+  // certification lane asking for the Windows order must get Windows paths.
   if (platform === "win32") {
     return [
-      environment.PROGRAMFILES && join(environment.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
-      environment["PROGRAMFILES(X86)"] && join(environment["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
-      environment.LOCALAPPDATA && join(environment.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
-      environment.PROGRAMFILES && join(environment.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+      environment.PROGRAMFILES && win32.join(environment.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
+      environment["PROGRAMFILES(X86)"] && win32.join(environment["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
+      environment.LOCALAPPDATA && win32.join(environment.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+      environment.PROGRAMFILES && win32.join(environment.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
     ].filter((value): value is string => Boolean(value))
   }
   if (platform === "darwin") {
