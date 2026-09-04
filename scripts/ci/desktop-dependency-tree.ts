@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { constants } from "node:fs"
+import { constants, type BigIntStats } from "node:fs"
 import {
   access,
   lstat,
@@ -14,6 +14,12 @@ import { Readable } from "node:stream"
 
 import { assertNoReparseMaterial, assertStableOpenFile } from "../release/verified-file.js"
 
+// Reading and hashing every dependency file is the dominant cost of a membership
+// capture, and the walk runs three times per verification. One strictly serial
+// open-stat-read-stat chain per file is per-file latency rather than throughput,
+// so the reads run through a bounded pool. The bound stays small enough to keep
+// the open handle count and resident content well inside the tree bounds below.
+const DEPENDENCY_READ_CONCURRENCY = 32
 const MAX_DEPENDENCY_FILES = 50_000
 const MAX_DEPENDENCY_FILE_BYTES = 64 * 1024 * 1024
 const MAX_DEPENDENCY_TREE_BYTES = 512 * 1024 * 1024
@@ -74,6 +80,41 @@ export interface DesktopDependencyLinkerInput {
   readonly runtimeInputFileCount: number
   readonly runtimeInputSerializedBytes: number
   readonly runtimeInputSha256: string
+}
+
+interface MembershipFileResult {
+  readonly contentRecord: string
+  readonly entry?: HeldDependencyFile
+  readonly record: string
+}
+
+/**
+ * Runs the reads through a bounded pool. A failing read must not leave the
+ * successful ones open: every worker is allowed to finish, then any handle a
+ * completed slot is holding is closed before the first failure is rethrown,
+ * because a caller that never receives the snapshot never receives the handles
+ * either and has nothing left to close them with.
+ */
+async function readAllSlots(
+  reads: readonly (() => Promise<void>)[],
+  slots: readonly (MembershipFileResult | undefined)[],
+): Promise<void> {
+  let next = 0
+  const results = await Promise.allSettled(
+    Array.from({ length: Math.min(DEPENDENCY_READ_CONCURRENCY, reads.length) }, async () => {
+      for (;;) {
+        const index = next++
+        if (index >= reads.length) return
+        await reads[index]!()
+      }
+    }),
+  )
+  const failure = results.find((result) => result.status === "rejected")
+  if (failure === undefined) return
+  await Promise.allSettled(
+    slots.map((slot) => slot?.entry?.handle.close() ?? Promise.resolve()),
+  )
+  throw (failure as PromiseRejectedResult).reason
 }
 
 interface HeldDependencyFile {
@@ -299,6 +340,8 @@ async function captureDependencyMembership(
   const records: string[] = []
   const contentRecords: string[] = []
   const paths: string[] = []
+  const slots: (MembershipFileResult | undefined)[] = []
+  const reads: (() => Promise<void>)[] = []
   let files = 0
   let totalBytes = 0
   const visit = async (path: string): Promise<void> => {
@@ -324,6 +367,21 @@ async function captureDependencyMembership(
       files > MAX_DEPENDENCY_FILES || details.size > BigInt(MAX_DEPENDENCY_FILE_BYTES) ||
       totalBytes > MAX_DEPENDENCY_TREE_BYTES
     ) throw new Error("Desktop dependency membership exceeds its bound")
+    // The slot is claimed in discovery order and filled by whichever worker runs
+    // the read, so concurrency never reaches the records, the content tree or the
+    // held handles: they are assembled below in exactly the order a serial walk
+    // produced, and every digest keeps the value it had.
+    const slot = slots.length
+    slots.push(undefined)
+    reads.push(() => readSlot(path, name, details, slot))
+  }
+
+  const readSlot = async (
+    path: string,
+    name: string,
+    details: BigIntStats,
+    slot: number,
+  ): Promise<void> => {
     const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0
     const handle = await open(path, constants.O_RDONLY | noFollow)
     try {
@@ -340,18 +398,28 @@ async function captureDependencyMembership(
       const identity = normalizeDesktopDependencyFileIdentity(after)
       const metadata = identityMetadata(identity)
       const sha256 = createHash("sha256").update(content).digest("hex")
-      records.push(
-        `${name}\0file\0${metadata}\0${sha256}\n`,
-      )
-      contentRecords.push(`${name}\0${content.byteLength}\0${sha256}\n`)
+      slots[slot] = {
+        contentRecord: `${name}\0${content.byteLength}\0${sha256}\n`,
+        record: `${name}\0file\0${metadata}\0${sha256}\n`,
+        ...(held === undefined
+          ? {}
+          : { entry: { content, handle, identity, metadata, path, relativePath: name, sha256 } }),
+      }
       if (held === undefined) await handle.close()
-      else held.push({ content, handle, identity, metadata, path, relativePath: name, sha256 })
     } catch (error) {
       await handle.close().catch(() => undefined)
       throw error
     }
   }
+
   await visit(root)
+  await readAllSlots(reads, slots)
+  for (const result of slots) {
+    if (result === undefined) throw new Error("Desktop dependency membership left a file unread")
+    records.push(result.record)
+    contentRecords.push(result.contentRecord)
+    if (result.entry !== undefined) held?.push(result.entry)
+  }
   for (let index = 0; index < paths.length; index += 512) {
     await assertNoReparseMaterial(paths.slice(index, index + 512))
   }
