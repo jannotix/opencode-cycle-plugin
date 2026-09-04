@@ -2,7 +2,7 @@ import { expect, mock, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, join, resolve } from "node:path"
+import { basename, join, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import {
@@ -1355,7 +1355,13 @@ test("activation evidence is confined to one freshly created certification root"
   const environment = certificationEnvironment(root, "windows-x64", { PATH: "safe-path" })
   const roots = activationScanRoots(join(root, "workflow-data"), join(root, "profile"), environment)
   expect(roots).toEqual([join(root, "workflow-data")])
-  expect(roots.join(" ")).not.toContain(process.env.HOME ?? "owner-home-not-set")
+  // What this refuses is an ambient owner location — the invoking user's data directory, or
+  // /root/.local/share — reached instead of the fresh certification root. Comparing against
+  // process.env.HOME cannot state that: on Windows tmpdir() lives inside the home directory, so a
+  // correct root contains it and the assertion could never hold. Containment is the real property.
+  for (const scanned of roots) {
+    expect(resolve(scanned).startsWith(resolve(root) + sep)).toBe(true)
+  }
   expect(roots).not.toContain(join("/root", ".local", "share", "opencode-cycle"))
 })
 
