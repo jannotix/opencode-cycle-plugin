@@ -181,6 +181,42 @@ credentials, access tokens, sensitive logs, or private configuration here.
 | Task | Commit | Verification command or workflow | Receipt path or URL | Verdict | Date | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 
+### Why this table is empty — audit of 2026-09-05
+
+The table holds no row because no row is admissible, not because rows were
+forgotten. Admission needs two things and T00 through T06 have only one:
+the deterministic work is implemented and its named commands pass, and no task
+records an independent review of that work. T01 and T04 said so themselves
+before this audit; the other six were marked `Completed` while carrying the
+same gap, which is the failure this product exists to refuse — a task closed by
+narrative rather than by evidence. Every status now separates the two.
+
+What was verified deterministically on `242900f`, and what it does not settle:
+
+| Task | Commit | Deterministic check re-run on 2026-09-05 | Result |
+| --- | --- | --- | --- |
+| T00 | `b7e5529` | documentation-only commit, clean tree | holds |
+| T01 | `b4c2463`, `76ce38d` | `bun run check`, `cargo test --workspace --all-features`, `bun test` | pass (447/447) |
+| T02 | `ca68aa3`, `317bdca`, `4797d69` | both macOS packages present, declared as exact-version optional dependencies, capabilities separates certified from compatible | holds |
+| T02a | `869118b` | no `NODE_AUTH_TOKEN`/`secrets.*NPM` assignment in `publish.yml`; no `registry-url` | holds |
+| T03 | `fb732a2` | last proven from a clean clone on its own commit, not re-proven here | stale |
+| T04 | `b57680b` | Bun invariant suites and the three named `workflowd` binaries | pass |
+| T05 | `8fa677a` | receipts on disk at `target/certification/desktop/`, both naming `bce8e8f`, both binding plugin `960b3cd9…` | present, and provisional |
+| T06 | `70732b0` | `CERTIFIED_HOST_VERSIONS` is exactly `1.18.21` | holds |
+
+A passing command is one half of admission. None of these rows may enter the
+ledger until an independent reviewer has approved the same work, which is what
+T06a below exists to obtain.
+
+Two consequences follow and neither is optional:
+
+- **T07 cannot start.** Its precondition requires M0 through M2 to be complete
+  *and independently reviewed*. The second half is not met for any task.
+- **The T05 receipts certify nothing for release.** They name `bce8e8f`, the
+  T06 promotion invalidated them by its own terms, and the head is now
+  `242900f`. They are evidence that the activation path works, not evidence
+  about any candidate.
+
 ## Milestone M0 — Adopt the release contract
 
 ### T00 — Move the approved plan to the execution branch
@@ -208,7 +244,7 @@ git status --short --branch
 git diff --check HEAD^
 ```
 
-**Status:** Completed; the exact commit is the documentation-only commit that
+**Status:** Implemented; independent review open. The exact commit is the documentation-only commit that
 contains this status update.
 
 ---
@@ -246,7 +282,7 @@ cargo test --workspace --all-features
 git status --short
 ```
 
-**Status:** Completed. The R5 hardening landed at `b4c2463` but left the Windows
+**Status:** Implemented; independent review open. The R5 hardening landed at `b4c2463` but left the Windows
 suite red: the module-level eager Windows reparse inspector in
 `scripts/release/verified-file.ts` spawned a persistent PowerShell worker that
 kept every importing process alive, so success-path linker and tool-runtime
@@ -284,7 +320,7 @@ Desktop certification claim.
 bun test packages/opencode-cycle/test/client.test.ts packages/opencode-cycle/test/capabilities.test.ts scripts/packaging/plugin-package.test.ts scripts/release/release-manifest.test.ts scripts/release/publication-plan.test.ts scripts/release/release-workflow.test.ts
 ```
 
-**Status:** Completed. The two macOS native packages are restored as
+**Status:** Implemented; independent review open. The two macOS native packages are restored as
 platform-bound workspace members and declared by the plugin as exact-version
 optional dependencies; the client resolves each supported target through a
 literal specifier so the packaged Desktop linker still verifies the graph
@@ -335,7 +371,7 @@ The second command must complete without throwing. It matches a credential
 *assignment*, not the fail-closed shell assertion that proves the same variable
 is empty; a blanket name search would forbid the guard that enforces the rule.
 
-**Status:** Completed. `publish.yml` authenticates only through trusted
+**Status:** Implemented; independent review open. `publish.yml` authenticates only through trusted
 publishing: the `NODE_AUTH_TOKEN`/`secrets.NPM_TOKEN` step environment is
 removed, `registry-url` is removed so setup-node writes no `_authToken`
 template, and a new pre-publish step fails closed unless the OIDC request
@@ -371,7 +407,7 @@ cargo test --workspace --all-features
 git status --short
 ```
 
-**Status:** Completed. A fresh clone of the execution branch installs with the
+**Status:** Implemented; independent review open. A fresh clone of the execution branch installs with the
 frozen lockfile and passes the static source gate, the Bun suite, and the Rust
 suite. Running the gate from a clone rather than the developer worktree
 surfaced two defects that a warm tree hid, both fixed here rather than waived:
@@ -424,7 +460,7 @@ tests and still exited zero, and in `workflowd` it silently skipped the three
 dedicated verification binaries. A gate that passes without executing anything
 is not evidence.
 
-**Status:** Completed on the current revision. The Bun invariant suites pass
+**Status:** Implemented; independent review open. On the current revision the Bun invariant suites pass
 30 of 30. The corrected Rust commands execute 8 tests in `workflow-store`,
 including `verified_task_closure_is_atomic_payload_bound_and_advances_dependents`,
 and 13 tests across the three `workflowd` verification binaries. The previous
@@ -452,7 +488,7 @@ target host before changing the certified-host policy.
 bun scripts/ci/desktop-certification.ts --platform <windows-x64|linux-x64> --plugin-archive <canonical-plugin.tgz> --plugin-provenance <canonical-plugin.provenance.json> --native-archive <native.tgz> --revision <provisional-sha> --output <provisional-receipt.json>
 ```
 
-**Status:** Both provisional proofs pass. The rejecting check was
+**Status:** Implemented; independent review open. Both provisional proofs pass. The rejecting check was
 `validateDesktopPluginInput`, with the archive binding and the options both
 correct. OpenCode Desktop reports a filesystem root as the worktree when no
 project is open, and the check read any outside-scratch worktree as an escape.
@@ -502,7 +538,7 @@ bun run check
 git status --short
 ```
 
-**Status:** Completed in the commit carrying this status update. Certification
+**Status:** Implemented; independent review open. The work landed in the commit carrying this status update. Certification
 now follows the evidence: `CERTIFIED_HOST_VERSIONS` is exactly `1.18.21`, the
 only host with Desktop receipts on this revision. The compatibility floor is
 unchanged at 1.18.16, so 1.18.16 through 1.18.20 keep running as compatible
@@ -523,6 +559,43 @@ all and gained a test. The packed real-tree byte counts moved by exactly the
 362 bytes that `dist/capabilities.js` grew, measured against a build of the
 previous source rather than assumed.
 
+### T06a — Obtain the independent review M1 and M2 never received
+
+**Goal:** Supply the second half of the task-completion invariant for T00
+through T06, so the receipt ledger can hold rows and T07 can begin.
+
+**Why this task exists:** the audit of 2026-09-05 found eight tasks whose
+deterministic verifiers pass and whose independent review never happened. The
+release contract makes that review a condition of closure, and T07 makes it a
+precondition of the frozen revision. Without it the ledger stays empty and M3
+cannot legitimately start.
+
+**Acceptance criteria:**
+
+- A reviewer who did not implement the work reviews each of T00 through T06
+  against its own acceptance criteria and its named verification commands, on
+  the revision that task landed on.
+- The reviewer re-runs the named commands rather than accepting a recorded
+  result, and states for each task whether it passes, and on which revision.
+- Any task the review rejects returns to M1 or M2 and its status says so.
+- Each accepted task gains one receipt ledger row naming commit, command,
+  receipt path and verdict.
+- The reviewer is recorded. An agent that wrote or modified the work under
+  review is not an independent reviewer of it, and neither is the owner acting
+  as the implementer.
+
+**Verification:**
+
+```text
+bun run check
+bun test
+cargo test --workspace --all-features
+git status --short
+git rev-parse HEAD
+```
+
+**Status:** Not started. Blocks T07.
+
 ---
 
 ## Milestone M3 — Certify one immutable final revision
@@ -533,7 +606,8 @@ previous source rather than assumed.
 artifact.
 
 **Precondition:** M0 through M2 are complete, independently reviewed, committed,
-and clean.
+and clean. As of 2026-09-05 the review half is outstanding for every task in M1
+and M2; T06a obtains it, and until T06a closes this task cannot start.
 
 **Acceptance criteria:**
 
