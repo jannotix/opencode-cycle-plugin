@@ -132,6 +132,49 @@ test("arbiter receives the immutable original request and both finalized reviews
   expect(JSON.stringify(calls[1])).toContain(
     "base_revision, exact file manifest and candidate-integrity evidence are authoritative",
   )
+  // The plane refuses an approval that contradicts a live rejection and routes to repair anyway.
+  // Telling the arbiter so is what makes one dispatch converge instead of producing the same
+  // verdict a second time.
+  expect(JSON.stringify(calls[1])).toContain("A rejection by either reviewer binds")
+  expect(JSON.stringify(calls[1])).toContain("rejecting with a repair target")
+})
+
+test("the binding rule reaches the arbiter only where reviewers exist", async () => {
+  const prompts: string[] = []
+  await runArbiter(
+    {
+      session: {
+        async create() {
+          return { data: { id: "arbiter" } }
+        },
+        async prompt(options: { body: { parts: { text: string }[] } }) {
+          prompts.push(options.body.parts[0]?.text ?? "")
+          return { data: { parts: [{ text: JSON.stringify(output), type: "text" }] } }
+        },
+      },
+    } as never,
+    {
+      candidate: { evidence_ids: [evidenceId] } as never,
+      candidateDigest: "f".repeat(64),
+      directory: "C:/managed-worktree",
+      evidence: [],
+      model: null,
+      mode: "quick" as const,
+      originalRequest: "Request",
+      parentSessionId: "parent",
+      plan: {
+        requirements: [
+          { acceptance_criteria: ["Works."], id: "REQ-1", statement: "Build it." },
+        ],
+      } as never,
+      reviews: [] as never,
+    },
+  )
+
+  // A quick run has no independent reviews, so a rule about what a reviewer's rejection binds
+  // would be describing a role that was never dispatched.
+  expect(prompts[0]).not.toContain("A rejection by either reviewer binds")
+  expect(prompts[0]).toContain("independent reviews are intentionally omitted")
 })
 
 test("arbiter rejects prose and missing evidence identifiers", async () => {
