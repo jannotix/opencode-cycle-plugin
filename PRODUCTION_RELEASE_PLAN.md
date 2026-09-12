@@ -650,6 +650,17 @@ bun test packages/opencode-cycle/test/full-workflow.test.ts
 
 ### N2 — The repair is told what the reviewer objected to
 
+**Status:** Implemented at `eee9f94`; independent review open. Closing N1 had opened
+a second gap in the same place: the run read the arbiter's decision to choose its
+next step, so a refused approval ended it at execution with the repair never driven.
+The route now comes from the state the plane reports. Repair feedback carries the
+findings of every review that rejected, plus the arbiter's own only when it rejected,
+in the orchestrator and in the recovery context alike, with the verdict still the
+fallback when nothing carries a finding. The full-workflow suite gained the scenario
+that only exists after a binding rejection, and keying the route back on the verdict
+fails it; the recovery test asserts the reviewer's summary reaches the repair, and
+emptying the refusals fails it. Bun suite 448 of 448.
+
 **Defect:** repair feedback is the arbiter's verdict alone
 (`packages/opencode-cycle/src/orchestration/full-workflow.ts`, and the recovery
 context in `crates/workflowd/src/control.rs`). After N1 a refused approval carries no
