@@ -38,8 +38,21 @@ mock.module("../src/orchestration/task-verification-windows.js", () => ({
 }))
 const { runFullWorkflow } = await import("../src/orchestration/full-workflow.js")
 
-for (const mode of ["full", "quick"] as const) {
-  test(`${mode} workflow automatically repairs a rejected candidate and reruns required gates`, async () => {
+/**
+ * The third scenario is the one a reviewer's rejection creates: the arbiter approves, the plane
+ * records that approval, refuses it and routes to repair. The run has to follow the state the plane
+ * reports rather than the decision the arbiter wrote — reading the verdict here ended the run at
+ * execution with the repair never driven, and nothing saying why.
+ */
+for (const scenario of [
+  { boundApproval: false, mode: "full" },
+  { boundApproval: false, mode: "quick" },
+  { boundApproval: true, mode: "full" },
+] as const) {
+  const { boundApproval, mode } = scenario
+  test(`${mode} workflow automatically repairs a ${
+    boundApproval ? "bound approval" : "rejected candidate"
+  } and reruns required gates`, async () => {
   const repository = await createRepository()
   const baseRevision = await git(repository, ["rev-parse", "HEAD"])
   let evidenceId = crypto.randomUUID()
@@ -220,7 +233,7 @@ for (const mode of ["full", "quick"] as const) {
     async submitArchitecture() {},
     async submitArbitration() {
       return {
-        decision: arbiterRuns === 1 ? "rejected" : "approved",
+        decision: arbiterRuns === 1 && !boundApproval ? "rejected" : "approved",
         receipt: {},
         receiptDigest: "9".repeat(64),
         workflowState: arbiterRuns === 1 ? "execution" : "delivery",

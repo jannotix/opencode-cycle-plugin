@@ -16,6 +16,8 @@ use workflow_ledger::CheckpointKey;
 use workflow_store::Store;
 
 const PROJECT: &str = "arbitration-project";
+/// `early_recovery` rejects a base revision that is not a full hexadecimal object name.
+const BASE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 
 struct Fixture {
     candidate: CandidateManifest,
@@ -23,6 +25,7 @@ struct Fixture {
     evidence_id: EvidenceId,
     store: Store,
     workflow_id: WorkflowId,
+    worktrees: std::path::PathBuf,
     _temporary: tempfile::TempDir,
 }
 
@@ -90,7 +93,7 @@ fn arbitration_ready() -> Fixture {
     let evidence_id = EvidenceId::new();
     let candidate = CandidateManifest::new(
         candidate_id,
-        Some("base".to_owned()),
+        Some(BASE_REVISION.to_owned()),
         vec![],
         CandidateDigests {
             configuration: ContentDigest::of(b"configuration"),
@@ -158,12 +161,32 @@ fn arbitration_ready() -> Fixture {
         )
         .unwrap();
 
+    // The recovery path pairs a base revision with a worktree that exists, and refuses the two
+    // disagreeing. Creating it here keeps that check meaningful rather than worked around.
+    let worktrees = temporary.path().join("worktrees");
+    let worktree = worktrees
+        .join(project_id.to_string())
+        .join(workflow_id.to_string());
+    std::fs::create_dir_all(&worktree).unwrap();
+    store
+        .save_worktree_binding_once(
+            &workflow_store::WorktreeBinding {
+                base_revision: BASE_REVISION.to_owned(),
+                path: worktree.to_string_lossy().into_owned(),
+                project_id,
+                workflow_id,
+            },
+            timestamp,
+        )
+        .unwrap();
+
     Fixture {
         candidate,
         candidate_id,
         evidence_id,
         store,
         workflow_id,
+        worktrees,
         _temporary: temporary,
     }
 }
@@ -379,5 +402,48 @@ fn an_approval_both_reviewers_support_still_approves() {
         actions(&fixture)
             .iter()
             .any(|(action, _)| action == "arbitration_approved")
+    );
+}
+
+/// After a rejection binds, the repair is resumed against the reviewer's findings. The verdict on
+/// record is an approval carrying none, so reporting it alone sent the executor back with nothing
+/// to answer.
+#[test]
+fn the_repair_context_carries_the_rejecting_reviewer_findings() {
+    let mut fixture = arbitration_ready();
+    reviews(
+        &mut fixture,
+        ReviewDecision::Rejected,
+        Some(RepairTarget::Execution),
+    );
+    let verdict = approval(&fixture);
+    assert_eq!(arbitrate(&mut fixture, &verdict).unwrap(), "execution");
+
+    let recovery = workflowd::control::execute(
+        &mut fixture.store,
+        &CheckpointKey::generate().unwrap(),
+        &fixture.worktrees,
+        PROJECT,
+        Some(fixture.workflow_id),
+        workflow_ipc::ControlOperation::Recovery,
+        workflow_core::ReceiptId::new(),
+    )
+    .unwrap();
+
+    assert_eq!(recovery["state"], "execution");
+    let feedback: serde_json::Value =
+        serde_json::from_str(recovery["repairFeedback"].as_str().unwrap()).unwrap();
+    assert_eq!(feedback[0]["from"], "security_architecture_reviewer");
+    assert_eq!(
+        feedback[0]["findings"][0]["summary"],
+        "Equal names are not ordered deterministically.",
+    );
+    // The arbiter approved. It asked for nothing to be fixed, so it contributes nothing here.
+    assert!(
+        feedback
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|refusal| refusal["from"] != "arbiter")
     );
 }

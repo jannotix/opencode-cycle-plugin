@@ -328,7 +328,39 @@ fn early_recovery(
             if owner != workflow_id {
                 return Err("workflow arbitration ownership is invalid".to_owned());
             }
-            Some(serde_json::to_string(&verdict).map_err(|error| error.to_string())?)
+            // What the repair has to answer, not merely what the arbiter decided. A rejection by
+            // either reviewer binds, and the verdict recorded against a refused approval carries no
+            // finding at all — sending that alone resumed the executor against an objection it had
+            // to rediscover, when the reviewer had already written down what was wrong.
+            //
+            // The arbiter's own findings count only when it rejected: an approval, refused or not,
+            // asked for nothing to be fixed. The verdict stays the fallback when nothing carries a
+            // finding, so this never reports less than it did before.
+            let mut refusals = store
+                .load_reviews(candidate.manifest.candidate_id())
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|review| review.decision == workflow_core::ReviewDecision::Rejected)
+                .map(|review| {
+                    json!({ "findings": review.findings, "from": review_role(review.role) })
+                })
+                .collect::<Vec<_>>();
+            if verdict.decision == workflow_core::ArbiterDecision::Rejected {
+                refusals.push(json!({ "findings": verdict.findings, "from": "arbiter" }));
+            }
+            let carrying = refusals.iter().any(|refusal| {
+                refusal["findings"]
+                    .as_array()
+                    .is_some_and(|f| !f.is_empty())
+            });
+            Some(
+                serde_json::to_string(&if carrying {
+                    json!(refusals)
+                } else {
+                    json!(verdict)
+                })
+                .map_err(|error| error.to_string())?,
+            )
         } else {
             let failed = store
                 .load_candidate_evidence(candidate.manifest.candidate_id())
@@ -368,4 +400,17 @@ fn doctor(store: &Store, checkpoint_key: &CheckpointKey) -> Result<Value, String
         "status": "PASS",
         "storeMode": format!("{:?}", store.mode()),
     }))
+}
+
+/// The reviewer's name as the record uses it, so the repair reads the same label the chain does.
+const fn review_role(role: workflow_core::WorkflowRole) -> &'static str {
+    match role {
+        workflow_core::WorkflowRole::FunctionalReviewer => "functional_reviewer",
+        workflow_core::WorkflowRole::SecurityArchitectureReviewer => {
+            "security_architecture_reviewer"
+        }
+        workflow_core::WorkflowRole::Architect
+        | workflow_core::WorkflowRole::Executor
+        | workflow_core::WorkflowRole::Arbiter => "reviewer",
+    }
 }

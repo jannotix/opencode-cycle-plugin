@@ -6,11 +6,11 @@ import { digest, observation } from "../audit-events.js"
 import type { ManagedBrowserAttestationInput } from "../client.js"
 import { LocalControlPlane } from "../control-plane.js"
 import type { WorkflowRole } from "../permissions.js"
-import { runArbiter } from "./arbiter.js"
+import { runArbiter, type ArbiterVerdictInput } from "./arbiter.js"
 import { ArchitectOutputError, runArchitect } from "./architect.js"
 import { assertGitRepository } from "../git-repository.js"
 import { runExecutionPlan, type SubmittedTaskExecutionResult, type TaskExecutionResult } from "./executor.js"
-import { runIndependentReviews } from "./reviewers.js"
+import { runIndependentReviews, type ReviewVerdictInput } from "./reviewers.js"
 import { runTaskReview } from "./task-review.js"
 import { runTaskVerification } from "./task-verification.js"
 
@@ -313,8 +313,11 @@ export async function runFullWorkflow(
         { receipt_digest: result.receiptDigest, workflow_state: result.workflowState },
       ),
     )
-    if (result.decision === "approved") {
-      if (result.workflowState !== "delivery") return { state: result.workflowState }
+    // The plane decides where the run goes; the verdict only says what the arbiter wrote. An
+    // approval that contradicts a reviewer's rejection is recorded and routed to repair, so a
+    // branch keyed on the decision would end the run at execution with the repair never driven
+    // and nothing saying why.
+    if (result.workflowState === "delivery") {
       const promotion = await controlPlane.promoteCandidate(
         input.projectKey,
         input.workflowId,
@@ -338,10 +341,41 @@ export async function runFullWorkflow(
     if (result.workflowState === "blocked") {
       return { state: result.workflowState }
     }
-    repairFeedback = JSON.stringify(arbitration.verdict)
+    repairFeedback = repairFeedbackFor(
+      reviews.map((review) => review.verdict),
+      arbitration.verdict,
+    )
     if (result.workflowState === "architecture") plan = undefined
     else if (result.workflowState !== "execution") return { state: result.workflowState }
   }
+}
+
+/**
+ * What the repair has to answer: the findings of every review that rejected, and the arbiter's own
+ * only when the arbiter rejected.
+ *
+ * An approval asked for nothing to be fixed, and after a reviewer's rejection binds, the verdict on
+ * record is an approval with no findings at all. Sending that alone put the executor back to work
+ * against an objection it had to rediscover — the reviewer had already written down exactly what
+ * was wrong.
+ *
+ * The verdict is still the fallback when nothing carries a finding, so this never sends less than
+ * it did before.
+ */
+function repairFeedbackFor(
+  reviews: readonly ReviewVerdictInput[],
+  verdict: ArbiterVerdictInput,
+): string {
+  const refusals: { readonly findings: unknown; readonly from: string }[] = reviews
+    .filter((review) => review.decision === "rejected")
+    .map((review) => ({ findings: review.findings, from: review.role }))
+  if (verdict.decision === "rejected") {
+    refusals.push({ findings: verdict.findings, from: "arbiter" })
+  }
+  const carrying = refusals.filter(
+    (refusal) => Array.isArray(refusal.findings) && refusal.findings.length > 0,
+  )
+  return JSON.stringify(carrying.length > 0 ? carrying : verdict)
 }
 
 async function finalizeSubmittedTask(
