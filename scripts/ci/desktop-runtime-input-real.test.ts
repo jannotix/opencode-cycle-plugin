@@ -81,6 +81,20 @@ test.skipIf(process.platform !== "win32")(
         expect(parseDesktopDependencyTreeManifest(dependencyManifest).files)
           .toHaveLength(input.fullTreeFileCount)
 
+        // The bytes this repository ships, which is the only part of the tree it can promise.
+        // Everything under node_modules is resolved from the registry at install time — the packed
+        // package carries no lockfile, and puppeteer-core declares two of its dependencies as caret
+        // ranges over packages that ship JavaScript — so a total over the whole tree moves when a
+        // third party publishes, not when anything here changes. It did: between 2026-09-04 and
+        // 2026-09-12 the totals moved by 36,268 bytes with no shipped file touched.
+        //
+        // This is the same distinction the graph digest already carries below. Drift detection for
+        // our own code belongs on our own code; the third-party share stays bounded by the limits
+        // above rather than pinned to whatever the registry returned on the day it was measured.
+        const shippedBytes = verification.contentManifest
+          .filter((file) => file.path.startsWith("dist/"))
+          .reduce((total, file) => total + Number(file.identity.size), 0)
+
         const entry = join(installedPlugin, "dist", "index.js")
         const resultFile = join(temporary, "result.json")
         const linker = join(temporary, "linker.mjs")
@@ -129,28 +143,23 @@ test.skipIf(process.platform !== "win32")(
           graphFileCount: result.graphFileCount,
           graphSha256: result.graphSha256,
           linkedEsmModuleCount: result.linkedEsmModuleCount,
-          runtimeInputContentBytes: input.runtimeInputContentBytes,
           runtimeInputFileCount: input.runtimeInputFileCount,
-          runtimeInputSerializedBytes: input.runtimeInputSerializedBytes,
+          shippedBytes,
         }).toEqual({
           fullTreeFileCount: 5_934,
           graphFileCount: 44,
-          // These byte totals are measured, and they drift with any change to
-          // shipped code. Update them only from a manifest diff that names the
-          // files responsible: the previous values were set from a measurement
-          // that later failed to reproduce, and the discrepancy was found only
-          // because the arithmetic was made to close file by file.
-          // The graph digest covers the native binary as a verified asset, and
-          // an optimized Rust build is not byte-reproducible across build
-          // directories, so its exact value is environment-bound and cannot be
-          // pinned here. Drift detection lives in the counts and module kinds
-          // below, which are reproducible; the digest is still required to be
-          // a well-formed SHA-256 bound into the receipt.
+          // Environment-bound values are asserted for shape, not value. The graph digest covers
+          // the native binary as a verified asset, and an optimized Rust build is not
+          // byte-reproducible across build directories. The runtime-input byte totals cover
+          // third-party JavaScript resolved from the registry, for the reason given above. Drift
+          // detection lives in the counts, the module kinds, and `shippedBytes` — all of which are
+          // properties of this repository rather than of the day the test ran.
           graphSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
           linkedEsmModuleCount: 42,
-          runtimeInputContentBytes: 25_574_559,
           runtimeInputFileCount: 2_777,
-          runtimeInputSerializedBytes: 25_868_626,
+          // Measured. It moves when the shipped JavaScript changes, which is the point; update it
+          // from a manifest diff that names the files responsible.
+          shippedBytes: 2_303_378,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,
