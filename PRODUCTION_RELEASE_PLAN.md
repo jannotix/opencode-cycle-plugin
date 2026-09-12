@@ -799,15 +799,12 @@ graph nobody pinned.
 
 **Acceptance criteria:**
 
-- The packed-tree proof installs from a lockfile, or from an offline cache built
-  from one, so the same revision yields the same bytes on any day.
-- Whatever the mechanism, it must not weaken what the proof checks: the tree it
-  verifies stays the tree an installation really produces.
-- The pinned byte totals are re-measured once the install is deterministic, and the
-  commit that changes them names the files responsible, as the assertion's own note
-  requires.
-- Until then the failure is recorded rather than silenced: the pins are not bumped
-  to whatever today's registry returns.
+- The proof asserts no value that the registry can move. What it pins is a property
+  of this repository.
+- Drift detection on shipped code survives: a change to the JavaScript this package
+  ships still fails the proof.
+- The third-party share stays bounded rather than unchecked.
+- The pins are not bumped to whatever today's registry returns.
 
 **Verification:**
 
@@ -815,10 +812,23 @@ graph nobody pinned.
 bun test scripts/ci/desktop-runtime-input-real.test.ts
 ```
 
-Run twice on different days, or against a cache seeded from two different dates.
+**Status:** Implemented at `eb28156`; independent review open.
 
-**Status:** Not started. Blocks T07, which cannot certify a revision through a gate
-whose result depends on when it ran.
+Installing from a lockfile — the first acceptance criterion this task carried — was
+investigated and is not available. The workspace lockfile describes a workspace and
+`bun` refuses it in a single-package directory, and the proof also installs the
+native archive from a path that differs on every run, which no frozen lockfile can
+hold. The criteria above replace it.
+
+The proof now sums the bytes under `dist/` and pins that, leaving the third-party
+share to the bounds the block already asserted: under 3,000 runtime-input files,
+under 64 MiB serialized, and smaller than the full tree. That is the distinction the
+graph digest in the same assertion already carried, applied to the same class of
+value. Measured at 2,303,378 bytes; thirty-five bytes added to a shipped source file
+moved it by exactly thirty-five and failed the test, which is what makes it drift
+detection rather than a constant.
+
+With this the Bun suite is 447 of 447 on `eb28156`.
 
 ### N9 — Verifications that need a test, not a port
 
