@@ -613,6 +613,15 @@ port. A Rust change here is written once and carried there in the same round.
 
 ### N1 — A reviewer's rejection binds, and a contradicting approval is recorded
 
+**Status:** Implemented at `4176221`; independent review open. The verdict is saved
+verbatim, the chain records `arbitration_refused` with the rejecting role and the
+target, and the run is routed to repair there. Four tests in
+`crates/workflowd/tests/arbitration.rs` cover it, including the property that makes
+recording an Approved verdict safe: a refused approval reaches neither the delivery
+state nor holds the candidate, so promotion is impossible. Removing the binding
+fails three of them, and fails closed. The Zcode copy of the function is unchanged
+and still carries the defect.
+
 **Defect:** `submit_arbitration` returns `Err("approval requirements have not passed")`
 when the arbiter approves over a rejecting review, before `save_arbitration_once` runs.
 No arbitration row, no audit event, and the orchestrator re-dispatches the arbiter with
@@ -768,6 +777,48 @@ sessions is one this build denies, `doctor` warns when it is not, and a test ask
 delegation under every known name.
 
 **Status:** Not started
+
+### N10 — The packed-tree gate resolves dependencies without a lockfile
+
+**Defect found on 2026-09-12 while closing N1.** `desktop-runtime-input-real.test.ts`
+extracts the packed plugin and runs `bun install` inside it. The extracted package
+carries `dist`, `LICENSE`, `NOTICE` and its manifest — no lockfile — so every
+dependency is resolved fresh. `puppeteer-core@25.6.0` declares `ws` as `^8.21.1`
+and `typed-query-selector` as `^2.12.2`, and both ship JavaScript, which is exactly
+what `runtimeInputContentBytes` counts.
+
+The pinned totals therefore drift with the registry rather than with this
+repository. They moved from 25,574,559 to 25,610,827 between 2026-09-04 and
+2026-09-12 with no change to any shipped file: removing the whole of N1 from the
+worktree reproduces the new number exactly, which is how it was isolated.
+
+This matters beyond one assertion. The release contract requires clean-clone gates
+with locked dependencies, and this gate is time-dependent: it can fail on a
+revision that was green yesterday, and it can pass on a candidate whose dependency
+graph nobody pinned.
+
+**Acceptance criteria:**
+
+- The packed-tree proof installs from a lockfile, or from an offline cache built
+  from one, so the same revision yields the same bytes on any day.
+- Whatever the mechanism, it must not weaken what the proof checks: the tree it
+  verifies stays the tree an installation really produces.
+- The pinned byte totals are re-measured once the install is deterministic, and the
+  commit that changes them names the files responsible, as the assertion's own note
+  requires.
+- Until then the failure is recorded rather than silenced: the pins are not bumped
+  to whatever today's registry returns.
+
+**Verification:**
+
+```text
+bun test scripts/ci/desktop-runtime-input-real.test.ts
+```
+
+Run twice on different days, or against a cache seeded from two different dates.
+
+**Status:** Not started. Blocks T07, which cannot certify a revision through a gate
+whose result depends on when it ran.
 
 ### N9 — Verifications that need a test, not a port
 
