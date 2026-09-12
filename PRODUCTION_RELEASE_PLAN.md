@@ -794,7 +794,10 @@ bun run check:commands
 **Acceptance criteria:** the bound is read from status; `5` applies only when the
 field did not arrive, and the effective bound is logged.
 
-**Status:** Not started
+**Status:** Implemented at `bfc5dd7`; independent review open. `waitForRunnable`
+already asks the plane for status on every pass and now returns the budget it
+reports. Three cases are covered — a budget of two, of seven, and none reported —
+and restoring the literal fails the first two.
 
 ### N8 — The delegation deny does not hang on one host permission key
 
@@ -806,7 +809,13 @@ boundary stopped enforcing anything in 1.0.17.
 sessions is one this build denies, `doctor` warns when it is not, and a test asks for
 delegation under every known name.
 
-**Status:** Not started
+**Status:** Implemented at `1f1a7e3`; independent review open. Every role refuses
+`agent`, `subagent` and `task`, and `delegationBoundaryGap` reports a host that offers
+child sessions and names none of them, surfaced by the doctor. Restoring the single
+key fails two tests. Bun suite 453 of 453.
+
+With N7 and N8 the small independent tasks of this milestone are done. N4 and N5
+remain, then N6 and N9.
 
 ### N10 — The packed-tree gate resolves dependencies without a lockfile
 
