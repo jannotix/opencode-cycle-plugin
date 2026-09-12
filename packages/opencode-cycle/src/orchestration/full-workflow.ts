@@ -38,6 +38,9 @@ interface FullWorkflowInput {
   readonly workflowId: string
 }
 
+/** What this script bounds architecture attempts with until the plane reports its own budget. */
+const DEFAULT_REPAIR_BUDGET = 5
+
 export interface FullWorkflowResult {
   readonly state: string
 }
@@ -52,12 +55,15 @@ export async function runFullWorkflow(
   let worktree = input.initialWorktree
   let repairFeedback = input.repairFeedback
   let architectureAttempts = 0
+  // Until the plane reports its own. Five is this product's default, so an install that never
+  // configured one behaves exactly as before.
+  let architectureBound = DEFAULT_REPAIR_BUDGET
 
   for (;;) {
-    await waitForRunnable(controlPlane, input)
+    architectureBound = (await waitForRunnable(controlPlane, input)).repairBudget ?? architectureBound
     if (plan === undefined) {
       architectureAttempts += 1
-      if (architectureAttempts > 5) {
+      if (architectureAttempts > architectureBound) {
         return { state: await controlPlane.reportExecution(input.projectKey, input.workflowId, "blocked") }
       }
       let architecture: Awaited<ReturnType<typeof runArchitect>>
@@ -504,10 +510,18 @@ function boundedError(error: unknown): string {
   return message.slice(0, 1_024)
 }
 
+/**
+ * Waits until the plane will accept work, and reports the repair budget it is holding.
+ *
+ * The budget is the plane's to spend: it blocks when it is exhausted. The bound this script keeps
+ * is only a stop for a loop nobody is driving, so it has to be the same number — a literal one
+ * meant a user who configured ten got five, with the script giving up while the plane was still
+ * willing to repair.
+ */
 async function waitForRunnable(
   controlPlane: LocalControlPlane,
   input: Pick<FullWorkflowInput, "projectKey" | "signal" | "workflowId">,
-): Promise<void> {
+): Promise<{ readonly repairBudget: number | undefined }> {
   for (;;) {
     input.signal?.throwIfAborted()
     const status = await controlPlane.control(input.projectKey, "status", input.workflowId)
@@ -522,7 +536,11 @@ async function waitForRunnable(
     if (state === "cancelled" || state === "blocked") {
       throw new Error(`Workflow stopped in ${state} state`)
     }
-    return
+    const reported = (status as { maximumRepairCycles?: unknown }).maximumRepairCycles
+    return {
+      repairBudget:
+        Number.isInteger(reported) && (reported as number) > 0 ? (reported as number) : undefined,
+    }
   }
 }
 

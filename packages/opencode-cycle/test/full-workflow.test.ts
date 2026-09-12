@@ -440,6 +440,68 @@ function response(value: unknown) {
   return { data: { parts: [{ text: JSON.stringify(value), type: "text" }] } }
 }
 
+/**
+ * The plane owns the repair budget and blocks when it is spent; the bound this script keeps is only
+ * a stop for a loop nobody is driving. A literal five meant a user who configured ten got five, the
+ * script giving up while the plane was still willing to repair.
+ */
+for (const [reported, expected] of [
+  [2, 2],
+  [7, 7],
+  // Nothing reported: the relay lost it, and the product default applies.
+  [undefined, 5],
+] as const) {
+  test(`the architect attempt bound is ${expected} when the plane reports ${reported ?? "nothing"}`, async () => {
+    const repository = await createRepository()
+    let architectRuns = 0
+    let reported_status = "execution"
+    const result = await runFullWorkflow(
+      {
+        session: {
+          async create() {
+            return { data: { id: `architect-${architectRuns}` } }
+          },
+          async prompt() {
+            architectRuns += 1
+            // Never valid, so every attempt is spent and the bound is what stops the loop.
+            return { data: { parts: [{ text: "not an architecture", type: "text" }] } }
+          },
+        },
+      } as never,
+      {
+        async control() {
+          return reported === undefined
+            ? { state: reported_status }
+            : { maximumRepairCycles: reported, state: reported_status }
+        },
+        async reportExecution(_project: string, _workflow: string, status: string) {
+          reported_status = status
+          return status
+        },
+      } as never,
+      {
+        activeModel: null,
+        activeVariant: null,
+        browserAttestations: async () => [],
+        models: {},
+        variants: {},
+        mode: "full",
+        originalRequest: "Build the requested feature exactly.",
+        parentSessionId: "parent",
+        projectKey: "project",
+        registerSession: () => undefined,
+        requestDigest: "a".repeat(64),
+        sourceDirectory: repository,
+        workflowId: crypto.randomUUID(),
+      } as never,
+    )
+
+    expect(result.state).toBe("blocked")
+    expect(architectRuns).toBe(expected)
+    await rm(repository, { force: true, recursive: true })
+  })
+}
+
 async function createRepository(): Promise<string> {
   const repository = await mkdtemp(join(tmpdir(), "opencode-cycle-loop-"))
   for (const argumentsList of [
