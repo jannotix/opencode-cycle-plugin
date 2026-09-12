@@ -50,7 +50,7 @@ import { resolveHostVersion } from "./host-version.js"
 import { runFullWorkflow } from "./orchestration/full-workflow.js"
 import { recoverWorkflowRetry } from "./orchestration/retry-recovery.js"
 import { RoleConsultations } from "./orchestration/role-consultation.js"
-import type { WorkflowRole } from "./permissions.js"
+import { delegationBoundaryGap, type WorkflowRole } from "./permissions.js"
 import {
   activeWorkflowForSession,
   RequestRouter,
@@ -400,6 +400,9 @@ const OpenCodeCycle: Plugin = async (input, options) => {
     return started
   }
 
+  // Set when the host offers child sessions and names no delegation key this build denies.
+  let delegationGap: string | undefined
+
   const setupInspector = {
     async inspect(sessionId: string) {
       const response = await input.client.config.providers({ query: { directory: input.directory } })
@@ -410,6 +413,7 @@ const OpenCodeCycle: Plugin = async (input, options) => {
         activeVariants.get(sessionId) ?? null,
         effectiveRoleModels(),
         effectiveRoleVariants(),
+        delegationGap,
       )
     },
     inspectLimits() {
@@ -716,6 +720,12 @@ const OpenCodeCycle: Plugin = async (input, options) => {
         )
         const candidateRoleModels = effectiveRoleModels(candidateNativeRoleModels)
         const candidateInjectedRoleModels = injectedModelsForRegistration(candidateNativeRoleModels)
+        // Recorded while the host's own policy is in hand: the doctor has no other view of it, and
+        // a boundary nobody can confirm should be visible rather than merely computed.
+        delegationGap = delegationBoundaryGap(
+          report.capabilities.includes("child-sessions"),
+          (next as { permission?: unknown }).permission as Parameters<typeof delegationBoundaryGap>[1] ?? {},
+        )
         registerCycleAgent(next, { models: candidateRoleModels, permissionPreset })
         registerCycleCommand(next)
         if (next.agent === undefined || next.command === undefined) {

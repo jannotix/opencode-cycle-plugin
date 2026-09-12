@@ -72,15 +72,20 @@ describe("Cycle agent registration", () => {
     expect(Object.values(ROLE_AGENT_NAMES).every((name) => agents[name]?.hidden === true)).toBe(true)
     expect(agents[ROLE_AGENT_NAMES.arbiter]?.model).toBe("independent/arbiter")
     expect(agents[ROLE_AGENT_NAMES.architect]?.model).toBeUndefined()
+    // Delegation is refused under every name a host may give it, not only the one this host uses.
     expect(agents[ROLE_AGENT_NAMES.executor]?.permission).toEqual({
+      agent: "deny",
       doom_loop: "ask",
       external_directory: "deny",
+      subagent: "deny",
       task: "deny",
     })
     expect(agents[ROLE_AGENT_NAMES.functional_reviewer]?.permission).toEqual({
+      agent: "deny",
       doom_loop: "ask",
       edit: "deny",
       external_directory: "deny",
+      subagent: "deny",
       task: "deny",
     })
   })

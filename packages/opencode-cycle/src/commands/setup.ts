@@ -17,6 +17,8 @@ export interface SetupReport {
   readonly activeModel: string | null
   readonly activeVariant: string | null
   readonly correlationWarning: string | null
+  /** Set when the delegation deny cannot be confirmed to reach this host. Null when it can. */
+  readonly delegationWarning: string | null
   readonly permissionPreset: "balanced"
   readonly providers: ProviderInventory["providers"]
   readonly roleModels: Readonly<Record<WorkflowRole, string | null>>
@@ -63,6 +65,7 @@ export function setupReport(
   activeVariant: string | null,
   configured: Partial<Readonly<Record<WorkflowRole, string>>>,
   variants: Partial<Readonly<Record<WorkflowRole, string>>>,
+  delegationWarning?: string,
 ): SetupReport {
   const roles: readonly WorkflowRole[] = [
     "architect",
@@ -87,6 +90,7 @@ export function setupReport(
     activeModel,
     activeVariant,
     correlationWarning,
+    delegationWarning: delegationWarning ?? null,
     permissionPreset: "balanced",
     providers: inventory.providers,
     roleModels,

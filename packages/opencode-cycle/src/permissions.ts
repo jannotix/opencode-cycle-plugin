@@ -9,6 +9,40 @@ export type WorkflowRole =
   | "security_reviewer"
   | "arbiter"
 
+/**
+ * Every name a host may use for the permission that lets a session delegate work to another one.
+ *
+ * Denying one name is a boundary that expires the day the host renames it, and it expires in
+ * silence: nothing fails, the rule simply stops matching. The Claude Code port lost its subagent
+ * boundary exactly that way when `Task` became `Agent`, and the other layers held so there was no
+ * symptom. All of these are refused, and `delegationBoundaryGap` reports a host whose policy names
+ * none of them.
+ */
+export const DELEGATION_KEYS = ["agent", "subagent", "task"] as const
+
+/**
+ * Whether this build's delegation deny can reach the host at all: the host offers child sessions
+ * and its permission policy carries none of the names this build refuses. An absent finding means
+ * a key was matched, not that delegation is impossible — it is the difference between a boundary
+ * that was checked and one that was assumed.
+ */
+export function delegationBoundaryGap(
+  offersChildSessions: boolean,
+  nativePolicy: PermissionPolicy,
+): string | undefined {
+  if (!offersChildSessions) return undefined
+  const known = Object.keys(nativePolicy).filter((key) =>
+    (DELEGATION_KEYS as readonly string[]).includes(key),
+  )
+  if (known.length > 0) return undefined
+  return (
+    "This host offers child sessions and its permission policy names none of " +
+    `${DELEGATION_KEYS.join(", ")}. Cycle still denies all of those for every role, and the ` +
+    "other two separation layers are unaffected, but the permission layer cannot be confirmed to " +
+    "apply. Report the key this host uses for delegation."
+  )
+}
+
 const rank: Readonly<Record<PermissionDecision, number>> = { deny: 0, ask: 1, allow: 2 }
 const readOnlyRoles: readonly WorkflowRole[] = [
   "architect",
@@ -72,7 +106,7 @@ export function effectiveRolePermissions(
   } else {
     result.external_directory = "deny"
   }
-  result.task = "deny"
+  for (const key of DELEGATION_KEYS) result[key] = "deny"
 
   return result
 }

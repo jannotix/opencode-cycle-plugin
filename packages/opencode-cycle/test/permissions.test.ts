@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test"
 
-import { effectiveRolePermissions } from "../src/permissions.js"
+import {
+  DELEGATION_KEYS,
+  delegationBoundaryGap,
+  effectiveRolePermissions,
+} from "../src/permissions.js"
 
 describe("permission presets", () => {
   test("Safe restricts native allows but preserves native denies", () => {
@@ -20,7 +24,12 @@ describe("permission presets", () => {
       "autonomous",
       "executor",
     )
-    expect(policy).toEqual({ external_directory: "deny", task: "deny" })
+    expect(policy).toEqual({
+      agent: "deny",
+      external_directory: "deny",
+      subagent: "deny",
+      task: "deny",
+    })
   })
 
   test("non-writing roles always deny edits and external directories", () => {
@@ -32,7 +41,7 @@ describe("permission presets", () => {
     }
   })
 
-  test("every role denies unmanaged subagent delegation", () => {
+  test("every role denies unmanaged subagent delegation under every name it may carry", () => {
     for (const role of [
       "architect",
       "executor",
@@ -40,8 +49,23 @@ describe("permission presets", () => {
       "security_reviewer",
       "arbiter",
     ] as const) {
-      expect(effectiveRolePermissions({}, "balanced", role).task).toBe("deny")
+      const policy = effectiveRolePermissions({}, "balanced", role)
+      // Naming one is a boundary that expires silently the day the host renames it.
+      for (const key of DELEGATION_KEYS) expect(policy[key]).toBe("deny")
     }
+  })
+
+  test("a host that names no delegation key it recognises is reported, not assumed safe", () => {
+    // The host offers child sessions and calls the permission something else entirely.
+    expect(delegationBoundaryGap(true, { bash: "allow", spawn_session: "allow" })).toContain(
+      "cannot be confirmed to apply",
+    )
+    // One it does recognise, under any of the names.
+    for (const key of DELEGATION_KEYS) {
+      expect(delegationBoundaryGap(true, { [key]: "allow" })).toBeUndefined()
+    }
+    // A host with no child sessions at all has nothing to delegate through.
+    expect(delegationBoundaryGap(false, { bash: "allow" })).toBeUndefined()
   })
 
   test("granular native rules remain equally or more restrictive", () => {

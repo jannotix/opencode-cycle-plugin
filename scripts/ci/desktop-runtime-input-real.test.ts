@@ -159,11 +159,14 @@ test.skipIf(process.platform !== "win32")(
           runtimeInputFileCount: 2_777,
           // Measured. It moves when the shipped JavaScript changes, which is the point; update it
           // from a manifest diff that names the files responsible.
-          // Each step names the shipped file it moved. 2,303,378 until the repair feedback learned
+          // Each step names the shipped files it moved. 2,303,378 until the repair feedback learned
           // to carry the rejecting reviewer's findings, which grew
           // `dist/orchestration/full-workflow.js` by 1,373; then 2,304,751 until the arbiter prompt
-          // stated the binding rule, which grew `dist/orchestration/arbiter.js` by 405.
-          shippedBytes: 2_305_156,
+          // stated the binding rule, which grew `dist/orchestration/arbiter.js` by 405; then
+          // 2,305,156 until the repair bound came from the plane and the delegation deny stopped
+          // hanging on one key, which grew `full-workflow.js`, `permissions.js`, `index.js` and
+          // `commands/setup.js` by 3,175 between them.
+          shippedBytes: 2_308_331,
         })
         expect(result).toMatchObject({
           isolatedRuntimeBoundaryCount: 1,
