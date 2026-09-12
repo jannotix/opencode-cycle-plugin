@@ -600,6 +600,16 @@ git rev-parse HEAD
 
 ## Milestone M2b — Integrate what the Claude Code port learned in 1.0.18 through 1.0.24
 
+**Observed while working this milestone, 2026-09-12.** The Bun suite is not
+deterministic under load on this machine. Three consecutive runs of the same revision
+gave 448 of 448, then ten timeout failures, then sixty-four failures whose common
+cause was the Windows reparse worker refusing to spawn — every one of which passed
+when its file was run alone. The timing-bound assertions sit on five-second budgets
+that a loaded machine exceeds. A red suite here is therefore not evidence of a defect
+until it reproduces on an idle machine, and a green one is only evidence when nothing
+else was running. T07 asks for clean-clone gates, and this is the reason the ask
+matters rather than a formality.
+
 **Why this milestone exists:** between 2026-09-06 and 2026-09-08 the Claude Code port
 shipped seven releases. Three fix defects in the governed cycle that were found by
 running a real certification, not by reading code, and the first of them is present
@@ -684,6 +694,15 @@ bun test packages/opencode-cycle/test/full-workflow.test.ts packages/opencode-cy
 **Status:** Not started
 
 ### N3 — The arbiter prompt states the binding rule
+
+**Status:** Implemented at `21913e6`; independent review open. Full mode states the
+rule and what enforces it; quick mode is unchanged and dispatches no reviewers for a
+rule about them to describe. Moving the rule to the mode without reviewers fails both
+tests, one asserting its presence and one its absence. Bun suite 449 of 449.
+
+With N1, N2 and N3 the P0 group of this milestone is implemented. What the arbiter is
+told, what the plane does when it disagrees, and what the repair is handed afterwards
+now describe the same rule.
 
 **Acceptance criteria:** the full-mode arbiter prompt says that a rejection by either
 reviewer binds, and that disagreeing means rejecting with a repair target and the
