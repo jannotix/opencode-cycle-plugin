@@ -598,6 +598,196 @@ git rev-parse HEAD
 
 ---
 
+## Milestone M2b — Integrate what the Claude Code port learned in 1.0.18 through 1.0.24
+
+**Why this milestone exists:** between 2026-09-06 and 2026-09-08 the Claude Code port
+shipped seven releases. Three fix defects in the governed cycle that were found by
+running a real certification, not by reading code, and the first of them is present
+byte for byte in this repository's `crates/workflowd/src/lifecycle.rs`. Every task
+below changes source, so all of it lands before T07 freezes the revision. Nothing is
+frozen yet, so no receipt is invalidated; T06a reviews this milestone together with
+M1 and M2, once.
+
+`workflowd`, `workflow-code-intel` and `workflow-store` are shared with the Zcode
+port. A Rust change here is written once and carried there in the same round.
+
+### N1 — A reviewer's rejection binds, and a contradicting approval is recorded
+
+**Defect:** `submit_arbitration` returns `Err("approval requirements have not passed")`
+when the arbiter approves over a rejecting review, before `save_arbitration_once` runs.
+No arbitration row, no audit event, and the orchestrator re-dispatches the arbiter with
+the same prompt, which yields the same verdict. This is the defect Claude Code 1.0.20
+describes as "twice, twenty-one agents, and no trace in the record".
+
+**Acceptance criteria:**
+
+- An approval that contradicts a live rejection is saved verbatim, refused by name in
+  the audit chain (`arbitration_refused`, naming the rejecting role or roles), and
+  routed to repair toward the target the rejecting review asked for: `architecture`
+  if either review asked for it, otherwise `execution`.
+- An approval over a failing mandatory gate keeps its current handling.
+- One dispatch converges: the orchestrator does not re-run the arbiter on the same
+  candidate.
+- The same change is applied to the Zcode copy of `lifecycle.rs`.
+
+**Verification:**
+
+```text
+cargo test -p workflowd --test lifecycle
+bun test packages/opencode-cycle/test/full-workflow.test.ts
+```
+
+**Status:** Not started
+
+### N2 — The repair is told what the reviewer objected to
+
+**Defect:** repair feedback is the arbiter's verdict alone
+(`packages/opencode-cycle/src/orchestration/full-workflow.ts`, and the recovery
+context in `crates/workflowd/src/control.rs`). After N1 a refused approval carries no
+finding of its own, so the executor is sent into repair against an objection it has
+to rediscover.
+
+**Acceptance criteria:**
+
+- Repair feedback is the findings of every review that rejected, plus the arbiter's
+  findings only when the arbiter rejected.
+- The recovery context reports the same feedback for a workflow resumed at repair.
+- The 64 KiB recovery limit on repair feedback is unchanged.
+
+**Verification:**
+
+```text
+cargo test -p workflowd --test control
+bun test packages/opencode-cycle/test/full-workflow.test.ts packages/opencode-cycle/test/retry-recovery.test.ts
+```
+
+**Status:** Not started
+
+### N3 — The arbiter prompt states the binding rule
+
+**Acceptance criteria:** the full-mode arbiter prompt says that a rejection by either
+reviewer binds, and that disagreeing means rejecting with a repair target and the
+reasoning on record. Quick mode is unchanged.
+
+**Verification:**
+
+```text
+bun test packages/opencode-cycle/test/arbiter.test.ts
+```
+
+**Status:** Not started
+
+### N4 — Required-missing gates key on the candidate's changed files
+
+**Defect:** `crates/workflowd/src/verification/plan.rs` matches the layer rules
+against the architect's declared `write_scopes`. A scope of `src/` covers
+`src/db/migrations/x.sql` without inserting the database gate. This predates the
+Claude Code comparison; that port matched on changed files from the start.
+
+**Acceptance criteria:**
+
+- The rules are matched against the union of the declared scopes and the paths in the
+  frozen candidate manifest. Adding paths can only insert gates.
+- A candidate touching a `.sql` file under a non-database scope receives
+  `database:real-integration`.
+
+**Verification:**
+
+```text
+cargo test -p workflowd --test verification_contract
+```
+
+**Status:** Not started
+
+### N5 — Reach: the rules also match what a change reaches
+
+**Acceptance criteria:**
+
+- Given the changed paths, the verification stage computes the files the change
+  reaches through `workflow_code_intel::query::impact` (incoming, depth 2, node ceiling
+  the larger of 200 and ten percent of indexed files) and adds them to the set of N4.
+- Files in a language the graph has no grammar for are reported as outside the model,
+  not as unresolved.
+- A project that was never indexed, or a changed file the index does not hold, yields
+  `impact:unresolved` naming the reason and `/cycle index` as the remedy. That record
+  is mandatory only under `strict` strictness.
+- A reach past the ceiling yields `impact:high-fan-in` as a warning naming the touched
+  symbols with the most consumers, and inserts no gate.
+- A resolved reach records `impact:unresolved` as passed with the reached count.
+
+**Verification:**
+
+```text
+cargo test -p workflow-code-intel
+cargo test -p workflowd --test verification_contract --test verification_runner
+```
+
+**Status:** Not started. Depends on N4.
+
+### N6 — Retention: report and prune retained candidate bytes
+
+**Acceptance criteria:**
+
+- `limits usage` reports retained payload bytes and files, the prunable subset
+  belonging to workflows in `cancelled` or `completed`, and record counts.
+- `limits prune` without `confirm` reports what it would free and changes nothing;
+  with `confirm` it nulls the payload of those candidates' files and nothing else.
+  Rows, digests, evidence and history are untouched, and `history verify` stays green.
+- A workflow in any non-terminal state is never pruned.
+- `docs/commands/reference.md` and the user manual describe both operations, and
+  `bun run check:commands` passes.
+
+**Verification:**
+
+```text
+cargo test -p workflow-store
+cargo test -p workflowd --test control
+bun run check:commands
+```
+
+**Status:** Not started
+
+### N7 — The repair-attempt bound comes from the control plane
+
+**Defect:** `full-workflow.ts` bounds architecture attempts with a literal `5` while
+`status` already reports `maximumRepairCycles`.
+
+**Acceptance criteria:** the bound is read from status; `5` applies only when the
+field did not arrive, and the effective bound is logged.
+
+**Status:** Not started
+
+### N8 — The delegation deny does not hang on one host permission key
+
+**Defect:** `permissions.ts` sets `result.task = "deny"`. If the host renames that
+key the deny stops applying silently, which is how the Claude Code port's subagent
+boundary stopped enforcing anything in 1.0.17.
+
+**Acceptance criteria:** capability negotiation checks that the key governing child
+sessions is one this build denies, `doctor` warns when it is not, and a test asks for
+delegation under every known name.
+
+**Status:** Not started
+
+### N9 — Verifications that need a test, not a port
+
+- Recovery from `delivery`: a promotion that never began is finished; one that ran and
+  aborted is rolled back and left to a person. Test both in `retry-recovery.test.ts`.
+- A failed inventory leaves the previous graph partition readable. Confirm the
+  existing test or add one.
+- The entrypoint session cannot call `edit`. Confirm the existing test or add one.
+- State in `docs/guides/operations-and-recovery.md` that delivery promotes exact bytes
+  and never commits, so nobody looks for a commit message.
+
+**Status:** Not started
+
+Not carried over, by design: the "commit rests on N gates" fix (this product does not
+commit), the indexer fallback removal (one ignore policy already), the run-by-hand
+refusal (the entrypoint has no editing tools), and the ZIP timestamp fix (tgz, packed
+twice and compared, built once on the Linux lane).
+
+---
+
 ## Milestone M3 — Certify one immutable final revision
 
 ### T07 — Freeze the revision and run clean-clone product gates
@@ -607,7 +797,9 @@ artifact.
 
 **Precondition:** M0 through M2 are complete, independently reviewed, committed,
 and clean. As of 2026-09-05 the review half is outstanding for every task in M1
-and M2; T06a obtains it, and until T06a closes this task cannot start.
+and M2; T06a obtains it, and until T06a closes this task cannot start. As of
+2026-09-12 M2b must also be complete first: every task in it changes source, and a
+source change after the freeze creates a new candidate.
 
 **Acceptance criteria:**
 
