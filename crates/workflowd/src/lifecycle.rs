@@ -1842,7 +1842,13 @@ fn task_state(state: workflow_core::TaskState) -> Result<String, String> {
         .ok_or_else(|| "task state serialization failed".to_owned())
 }
 
-fn submit_arbitration(
+/// Records one arbiter verdict against a frozen candidate and moves the workflow.
+///
+/// Public so the binding-rejection contract can be exercised directly: the property that an
+/// approval contradicting a reviewer is recorded and routed rather than thrown away is the kind
+/// that stops holding silently, and a test that drives it through the transport would not say
+/// which layer refused.
+pub fn submit_arbitration(
     store: &mut Store,
     checkpoint_key: &CheckpointKey,
     project_key: &str,
@@ -1942,11 +1948,45 @@ fn submit_arbitration(
         }
         None => return Err("workflow does not have a routing mode".to_owned()),
     };
+    // A rejection by either independent reviewer binds. The arbiter judges against the original
+    // request, not over the reviewers, so an approval that contradicts a live rejection cannot
+    // become a delivery — but refusing it with an error, before anything was recorded, left no
+    // arbitration row, no audit event and nothing for the repair to read, and the orchestrator then
+    // re-dispatched the arbiter with the same prompt and received the same verdict.
+    //
+    // It is recorded instead: the verdict is saved verbatim, the chain names the refusal and who
+    // caused it, and the run is routed to repair toward the target the rejecting reviewer asked
+    // for. One dispatch converges even when the arbiter is wrong, and the record says what happened.
+    //
+    // Delivery stays impossible by state, not by this branch: promotion requires the workflow to be
+    // in Delivery or Completed with this candidate current, and routing to repair leaves it in
+    // neither. The saved Approved verdict cannot reach the repository on its own.
+    let bound_by =
+        if verdict.decision == workflow_core::ArbiterDecision::Approved && !reviews_approved {
+            let rejecting: Vec<_> = reviews
+                .iter()
+                .filter(|review| review.decision == workflow_core::ReviewDecision::Rejected)
+                .collect();
+            let target = if rejecting.iter().any(|review| {
+                review.repair_target == Some(workflow_core::RepairTarget::Architecture)
+            }) {
+                workflow_core::RepairTarget::Architecture
+            } else {
+                workflow_core::RepairTarget::Execution
+            };
+            let who = rejecting
+                .iter()
+                .map(|review| review_role_name(review.role))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(" and ");
+            Some((target, who))
+        } else {
+            None
+        };
     if verdict.decision == workflow_core::ArbiterDecision::Approved
-        && (!reviews_approved
-            || evidence.iter().any(|(record, _, mandatory)| {
-                *mandatory && record.status != workflow_core::EvidenceStatus::Passed
-            }))
+        && evidence.iter().any(|(record, _, mandatory)| {
+            *mandatory && record.status != workflow_core::EvidenceStatus::Passed
+        })
     {
         return Err("approval requirements have not passed".to_owned());
     }
@@ -1967,18 +2007,51 @@ fn submit_arbitration(
         .save_arbitration_once(workflow_id, candidate_id, verdict, &receipt, timestamp)
         .map_err(|error| error.to_string())?;
     let next_state = match verdict.decision {
-        workflow_core::ArbiterDecision::Approved => store
-            .apply_workflow_command(
+        // A bound approval is routed exactly where the rejecting reviewer pointed, not approved.
+        workflow_core::ArbiterDecision::Approved if bound_by.is_some() => {
+            crate::repair::route(
+                store,
                 workflow_id,
-                &format!("{workflow_id}:{candidate_id}:approved"),
-                workflow_core::WorkflowCommand::Approve {
-                    mandatory_gates_passed: true,
+                candidate_id,
+                match bound_by
+                    .as_ref()
+                    .expect("bound approval carries a target")
+                    .0
+                {
+                    workflow_core::RepairTarget::Architecture => {
+                        crate::repair::RepairCause::PlanDefect
+                    }
+                    workflow_core::RepairTarget::Execution => {
+                        crate::repair::RepairCause::ImplementationFinding
+                    }
                 },
                 timestamp,
             )
             .map_err(|error| error.to_string())?
             .state
-            .state(),
+        }
+        workflow_core::ArbiterDecision::Approved => {
+            // Unreachable while `bound_by` is computed from the same condition, and kept because
+            // the arm above is the only thing standing between a rejected candidate and delivery.
+            // Before this branch existed the contradiction was refused by an error, so a defect
+            // here failed closed; routing to repair instead is what a defect would now skip. This
+            // restores that direction: approval requires the reviews, whatever decided the routing.
+            if !reviews_approved {
+                return Err("approval requirements have not passed".to_owned());
+            }
+            store
+                .apply_workflow_command(
+                    workflow_id,
+                    &format!("{workflow_id}:{candidate_id}:approved"),
+                    workflow_core::WorkflowCommand::Approve {
+                        mandatory_gates_passed: true,
+                    },
+                    timestamp,
+                )
+                .map_err(|error| error.to_string())?
+                .state
+                .state()
+        }
         workflow_core::ArbiterDecision::Rejected => {
             crate::repair::route(
                 store,
@@ -2006,9 +2079,12 @@ fn submit_arbitration(
             actor_id: "workflowd".to_owned(),
             candidate_id: Some(candidate_id),
             data: workflow_ipc::audit::AuditData::Workflow {
-                action: match verdict.decision {
-                    workflow_core::ArbiterDecision::Approved => "arbitration_approved",
-                    workflow_core::ArbiterDecision::Rejected => "arbitration_rejected",
+                action: match (verdict.decision, bound_by.is_some()) {
+                    // Named apart from an ordinary rejection: the arbiter approved, and the plane
+                    // refused it. A reader of the chain must be able to tell those two apart.
+                    (workflow_core::ArbiterDecision::Approved, true) => "arbitration_refused",
+                    (workflow_core::ArbiterDecision::Approved, false) => "arbitration_approved",
+                    (workflow_core::ArbiterDecision::Rejected, _) => "arbitration_rejected",
                 }
                 .to_owned(),
             },
@@ -2019,10 +2095,33 @@ fn submit_arbitration(
                 .iter()
                 .map(|file| file.path.clone())
                 .collect(),
-            metadata: std::collections::BTreeMap::from([(
-                "receipt_digest".to_owned(),
-                receipt.digest().to_string(),
-            )]),
+            metadata: {
+                let mut metadata = std::collections::BTreeMap::from([(
+                    "receipt_digest".to_owned(),
+                    receipt.digest().to_string(),
+                )]);
+                // The refusal names itself and its cause in the chain, so the repair that follows
+                // is told what to answer instead of having to rediscover the objection.
+                if let Some((target, who)) = bound_by.as_ref() {
+                    metadata.insert(
+                        "refusal".to_owned(),
+                        format!(
+                            "arbitration cannot approve while a reviewer rejected the candidate: \
+                             {who} rejected it, and that rejection stands until a repair answers it"
+                        ),
+                    );
+                    metadata.insert("refused_by".to_owned(), who.clone());
+                    metadata.insert(
+                        "repair_target".to_owned(),
+                        match target {
+                            workflow_core::RepairTarget::Architecture => "architecture",
+                            workflow_core::RepairTarget::Execution => "execution",
+                        }
+                        .to_owned(),
+                    );
+                }
+                metadata
+            },
             model: None,
             project_key: project_key.to_owned(),
             role: Some(workflow_core::WorkflowRole::Arbiter),
