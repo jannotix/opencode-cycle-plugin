@@ -607,7 +607,12 @@ cause was the Windows reparse worker refusing to spawn — every one of which pa
 when its file was run alone. The timing-bound assertions sit on five-second budgets
 that a loaded machine exceeds. A red suite here is therefore not evidence of a defect
 until it reproduces on an idle machine, and a green one is only evidence when nothing
-else was running. T07 asks for clean-clone gates, and this is the reason the ask
+else was running.
+
+The measured cause is free memory. At 4 GB free the suite runs green in about 340
+seconds; at 1.5 GB the daemon fails to start; at 879 MB the Windows reparse worker
+fails to spawn and roughly sixty tests fail together, including in isolation. Check
+free memory before believing a red run. T07 asks for clean-clone gates, and this is the reason the ask
 matters rather than a formality.
 
 **Why this milestone exists:** between 2026-09-06 and 2026-09-08 the Claude Code port
@@ -736,7 +741,19 @@ Claude Code comparison; that port matched on changed files from the start.
 cargo test -p workflowd --test verification_contract
 ```
 
-**Status:** Not started
+**Status:** Implemented at `f9a1a51`; independent review open. The rules are matched
+against the union of the declared scopes and the paths the worktree changes, read by
+`candidate::changed_paths` from the same diff the freeze reads. The paths cannot come
+from the manifest: the plan is built first and its evidence identifiers are bound into
+it, so a gate the change requires must be inserted while there is still no candidate. A
+workflow with no worktree binding is refused rather than read as "nothing changed".
+Removing the union fails the new test on the database gate.
+
+Verified on the Rust side, which is all this task changes: `cargo test --workspace
+--all-features` exits 0 across 91 suites, and `bun run check` exits 0. The Bun suite
+could not be run green on this machine at the time — see the milestone note above; free
+memory was measured at 879 MB of 14,259 with 576 processes, and the failures were the
+reparse-worker cluster, none of which this task touches.
 
 ### N5 — Reach: the rules also match what a change reaches
 
