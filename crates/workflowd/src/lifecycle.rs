@@ -2269,8 +2269,24 @@ async fn plan_verification(
     let path = worktrees
         .join(project_id.to_string())
         .join(workflow_id.to_string());
+    // What the executor actually changed, so the layer rules see the paths and not only the scopes
+    // the architect declared. The binding exists by this point — execution cannot have run without
+    // a worktree — and its absence is refused rather than read as "nothing changed", which would
+    // silently plan the weaker set of gates.
+    let base_revision = {
+        let store = store.lock().await;
+        store
+            .load_worktree_binding(workflow_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "workflow has no worktree binding to plan verification against".to_owned()
+            })?
+            .base_revision
+    };
     let plan = tokio::task::spawn_blocking(move || {
-        crate::verification::discover_for(&path, &architecture, plan_id)
+        let changed = crate::candidate::changed_paths(&path, &base_revision)
+            .map_err(|error| error.to_string())?;
+        crate::verification::discover_for(&path, &architecture, plan_id, &changed)
             .map_err(|error| error.to_string())
     })
     .await

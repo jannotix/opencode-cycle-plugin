@@ -72,6 +72,7 @@ async fn commands_capture_normalized_evidence_and_candidate_integrity() {
     let plan = discover(
         &repository.path,
         &architecture(vec!["candidate.txt".to_owned()]),
+        &[],
     )
     .unwrap();
     let frozen = freeze(
@@ -117,6 +118,7 @@ async fn unavailable_mandatory_gates_and_seeded_secrets_fail_honestly() {
     let plan = discover(
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
+        &[],
     )
     .unwrap();
     let frozen = freeze(
@@ -154,6 +156,7 @@ async fn managed_browser_receipt_satisfies_only_bound_ui_gates() {
     let plan = discover(
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
+        &[],
     )
     .unwrap();
     let frozen = freeze(
@@ -201,6 +204,7 @@ async fn incomplete_or_wrong_candidate_browser_receipts_fail_closed() {
     let plan = discover(
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
+        &[],
     )
     .unwrap();
     let frozen = freeze(

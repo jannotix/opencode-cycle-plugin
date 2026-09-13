@@ -101,14 +101,24 @@ impl std::error::Error for VerificationPlanError {}
 pub fn discover(
     repository: &Path,
     architecture: &ArchitecturePlan,
+    changed: &[String],
 ) -> Result<VerificationPlan, VerificationPlanError> {
-    discover_for(repository, architecture, VerificationPlanId::new())
+    discover_for(repository, architecture, VerificationPlanId::new(), changed)
 }
 
+/// `changed` carries the paths the worktree actually modifies, matched by the layer rules below
+/// alongside the scopes the architect declared.
+///
+/// A declared scope is a permission, not a description: `src/` authorises writing
+/// `src/db/migrations/001.sql` and says nothing about a database. Matching the declaration alone
+/// let a migration ship with no database gate, because the rule never saw a `.sql` path. Adding
+/// paths can only insert gates, never remove one, so this widens the proof surface and cannot
+/// narrow it.
 pub fn discover_for(
     repository: &Path,
     architecture: &ArchitecturePlan,
     plan_id: VerificationPlanId,
+    changed: &[String],
 ) -> Result<VerificationPlan, VerificationPlanError> {
     let mut gates = Vec::new();
     let mut invocations = BTreeSet::new();
@@ -146,6 +156,7 @@ pub fn discover_for(
         .tasks
         .iter()
         .flat_map(|task| task.write_scopes.iter())
+        .chain(changed.iter())
         .map(|scope| scope.to_ascii_lowercase().replace('\\', "/"))
         .collect();
     if scopes.iter().any(|scope| database_scope(scope))

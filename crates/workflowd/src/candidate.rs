@@ -286,6 +286,33 @@ pub fn freeze(
     })
 }
 
+/// The paths this worktree changes against its base.
+///
+/// Read from the same diff the freeze reads, so the verification plan and the candidate it will be
+/// matched against cannot disagree about what changed. The evidence policy needs this before the
+/// freeze: the plan is built first and its evidence identifiers are bound into the manifest, so a
+/// gate that the changed files require has to be inserted while there is still no candidate.
+pub fn changed_paths(
+    repository: &Path,
+    base_revision: &str,
+) -> Result<Vec<String>, CandidateFreezeError> {
+    let repository = repository.canonicalize()?;
+    let changes = git(
+        &repository,
+        [
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_revision,
+            "HEAD",
+            "--",
+        ],
+    )?
+    .stdout;
+    nul_fields(&changes)
+}
+
 pub fn verify_frozen(
     repository: &Path,
     manifest: &CandidateManifest,
