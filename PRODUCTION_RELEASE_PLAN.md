@@ -774,11 +774,45 @@ reparse-worker cluster, none of which this task touches.
 **Verification:**
 
 ```text
-cargo test -p workflow-code-intel
-cargo test -p workflowd --test verification_contract --test verification_runner
+cargo test -p workflowd --test reach --test verification_contract --test verification_runner
+cargo test --workspace --all-features
+bun run check
 ```
 
-**Status:** Not started. Depends on N4.
+**Status:** Implemented; independent review open. Reach lives in
+`crates/workflowd/src/verification/reach.rs` and is computed by `plan_verification`
+in the same blocking step that computes the changed paths, then unioned into the
+set N4 introduced. Two facts about this repository shaped the implementation and
+neither was visible from the Claude Code port:
+
+- The graph is partitioned by directory scope while edges cross partitions
+  freely, so a per-partition traversal would stop at the first directory
+  boundary. `merge_partitions` folds every partition of the project into one
+  graph before traversing, and drops edges whose endpoint no partition supplied.
+- The code graph and the control plane share one SQLite file, and the
+  control-plane store owns the migrations. A graph that cannot be opened yields
+  an unresolved reach rather than a refusal to plan, so a project that was never
+  indexed can still complete a cycle.
+
+Proven by six tests in `crates/workflowd/tests/reach.rs`, each mutation-tested:
+removing the union, neutralising the truncation guard, and removing the
+unknown-file check each fail exactly one test and no others. The union proof has
+a paired control asserting that the same change without reach plans no
+user-interface gate, so the gate cannot appear for an unrelated reason.
+
+**Two acceptance criteria above are not met as written, both for the same
+reason — they were drafted from the Claude Code model:**
+
+- *"mandatory only under `strict` strictness"*: OpenCode has no strictness
+  setting. `impact:unresolved` is therefore recorded but not mandatory. Making it
+  mandatory unconditionally would fail every cycle in a project that has never
+  been indexed, which is a larger behavioural change than this task authorises.
+  Closing this properly needs a strictness surface, which is an owner decision.
+- *"records `impact:unresolved` as passed"*: no executor could record a passing
+  informational fact — `Unavailable` yields `Skipped`. This task adds
+  `VerificationExecutor::Note`, which records a deterministic fact as passing
+  evidence, and a resolved reach now uses it. This criterion is met; it is listed
+  here because meeting it widened the executor enum, which the review should see.
 
 ### N6 — Retention: report and prune retained candidate bytes
 
