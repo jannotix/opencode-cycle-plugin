@@ -7,7 +7,7 @@ use workflow_core::{
 use workflow_ipc::ManagedBrowserAttestation;
 use workflowd::{
     candidate::freeze,
-    verification::{discover, run, run_with_attestations},
+    verification::{Reach, discover, run, run_with_attestations},
 };
 
 struct Repository {
@@ -73,6 +73,7 @@ async fn commands_capture_normalized_evidence_and_candidate_integrity() {
         &repository.path,
         &architecture(vec!["candidate.txt".to_owned()]),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let frozen = freeze(
@@ -119,6 +120,7 @@ async fn unavailable_mandatory_gates_and_seeded_secrets_fail_honestly() {
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let frozen = freeze(
@@ -157,6 +159,7 @@ async fn managed_browser_receipt_satisfies_only_bound_ui_gates() {
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let frozen = freeze(
@@ -205,6 +208,7 @@ async fn incomplete_or_wrong_candidate_browser_receipts_fail_closed() {
         &repository.path,
         &architecture(vec!["ui/page.tsx".to_owned()]),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let frozen = freeze(

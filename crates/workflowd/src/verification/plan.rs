@@ -3,6 +3,8 @@ use std::{collections::BTreeSet, path::Path};
 use serde::{Deserialize, Serialize};
 use workflow_core::{ArchitecturePlan, EvidenceId, EvidenceKind, VerificationPlanId};
 
+use super::reach::{Reach, ReachNote};
+
 const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -19,6 +21,13 @@ pub enum VerificationExecutor {
     Command {
         arguments: Vec<String>,
         program: String,
+    },
+    /// A deterministic fact the control plane already knows, recorded as passing evidence.
+    ///
+    /// Distinct from `Unavailable`, which records that something could *not* be checked and is
+    /// skipped. A note is the positive half: proof that a computation ran and what it concluded.
+    Note {
+        detail: String,
     },
     SecretScan,
     Unavailable {
@@ -102,8 +111,15 @@ pub fn discover(
     repository: &Path,
     architecture: &ArchitecturePlan,
     changed: &[String],
+    reach: &Reach,
 ) -> Result<VerificationPlan, VerificationPlanError> {
-    discover_for(repository, architecture, VerificationPlanId::new(), changed)
+    discover_for(
+        repository,
+        architecture,
+        VerificationPlanId::new(),
+        changed,
+        reach,
+    )
 }
 
 /// `changed` carries the paths the worktree actually modifies, matched by the layer rules below
@@ -119,6 +135,7 @@ pub fn discover_for(
     architecture: &ArchitecturePlan,
     plan_id: VerificationPlanId,
     changed: &[String],
+    reach: &Reach,
 ) -> Result<VerificationPlan, VerificationPlanError> {
     let mut gates = Vec::new();
     let mut invocations = BTreeSet::new();
@@ -152,11 +169,54 @@ pub fn discover_for(
         timeout_seconds: 120,
     });
 
+    // What the change reaches could not be stated exactly. This is recorded rather than enforced:
+    // Claude Code gates the same record on a "strict" strictness level, and OpenCode has no such
+    // setting, so making it mandatory here would fail every cycle in a project that has never been
+    // indexed. The reached paths that *were* resolved still insert real gates above.
+    if let Some(note) = reach.note.as_ref() {
+        let (name, reason) = match note {
+            ReachNote::HighFanIn(hubs) => (
+                "impact:high-fan-in",
+                format!(
+                    "The change touches widely consumed files ({}), so the reached set was                      truncated and no gate was inferred from it.",
+                    hubs.join(", ")
+                ),
+            ),
+            ReachNote::Resolved(count) => (
+                "impact:unresolved",
+                format!(
+                    "The change reaches {count} other indexed files, and the layer rules were matched against them."
+                ),
+            ),
+            ReachNote::Unresolved(reason) => ("impact:unresolved", reason.clone()),
+        };
+        let executor = if matches!(note, ReachNote::Resolved(_)) {
+            VerificationExecutor::Note {
+                detail: reason.clone(),
+            }
+        } else {
+            VerificationExecutor::Unavailable {
+                reason: reason.clone(),
+            }
+        };
+        gates.push(VerificationGate {
+            executor,
+            id: EvidenceId::new(),
+            kind: EvidenceKind::Inspection,
+            mandatory: false,
+            name: name.to_owned(),
+            precondition: reason,
+            risk: VerificationRisk::InternalInspection,
+            timeout_seconds: 1,
+        });
+    }
+
     let scopes: Vec<_> = architecture
         .tasks
         .iter()
         .flat_map(|task| task.write_scopes.iter())
         .chain(changed.iter())
+        .chain(reach.reached.iter())
         .map(|scope| scope.to_ascii_lowercase().replace('\\', "/"))
         .collect();
     if scopes.iter().any(|scope| database_scope(scope))

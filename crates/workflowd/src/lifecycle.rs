@@ -744,6 +744,7 @@ where
                 let result = plan_verification(
                     Arc::clone(&store),
                     Arc::clone(&worktrees),
+                    Arc::clone(&database),
                     plan_id,
                     project_key,
                     workflow_id,
@@ -2234,6 +2235,7 @@ fn review_role_name(role: workflow_core::WorkflowRole) -> Result<&'static str, S
 async fn plan_verification(
     store: Arc<tokio::sync::Mutex<Store>>,
     worktrees: Arc<PathBuf>,
+    database: Arc<PathBuf>,
     plan_id: workflow_core::VerificationPlanId,
     project_key: String,
     workflow_id: workflow_core::WorkflowId,
@@ -2286,7 +2288,16 @@ async fn plan_verification(
     let plan = tokio::task::spawn_blocking(move || {
         let changed = crate::candidate::changed_paths(&path, &base_revision)
             .map_err(|error| error.to_string())?;
-        crate::verification::discover_for(&path, &architecture, plan_id, &changed)
+        // What the change reaches through the code graph, unioned into the same match. A graph
+        // that cannot be opened yields an unresolved reach, not a refusal: an unindexed project
+        // must still be able to plan a verification.
+        let reach = match workflow_code_intel::graph::GraphStore::open(&*database) {
+            Ok(graph) => crate::verification::compute_reach(&graph, project_id, &changed),
+            Err(error) => crate::verification::Reach::unresolved(format!(
+                "the project graph could not be opened ({error}), so what this change reaches is                  unknown"
+            )),
+        };
+        crate::verification::discover_for(&path, &architecture, plan_id, &changed, &reach)
             .map_err(|error| error.to_string())
     })
     .await

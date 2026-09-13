@@ -323,6 +323,15 @@ async fn run_gate(
                     env!("CARGO_PKG_VERSION").to_owned(),
                 )
             }
+            VerificationExecutor::Note { detail } => (
+                Some(0),
+                detail.clone(),
+                ContentDigest::of(detail.as_bytes()),
+                EvidenceStatus::Passed,
+                None,
+                "workflow-note".to_owned(),
+                env!("CARGO_PKG_VERSION").to_owned(),
+            ),
             VerificationExecutor::Unavailable { reason } => (
                 None,
                 reason.clone(),
@@ -579,8 +588,10 @@ fn invocation(gate: &VerificationGate) -> String {
             .chain(arguments.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" "),
+        VerificationExecutor::Note { .. } | VerificationExecutor::Unavailable { .. } => {
+            gate.name.clone()
+        }
         VerificationExecutor::SecretScan => "changed-content-secret-scan".to_owned(),
-        VerificationExecutor::Unavailable { .. } => gate.name.clone(),
     }
 }
 

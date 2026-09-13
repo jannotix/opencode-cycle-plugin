@@ -3,7 +3,7 @@ use std::fs;
 use workflow_core::{
     ArchitecturePlan, ContentDigest, EvidenceKind, PlannedTask, Requirement, TaskId,
 };
-use workflowd::verification::{VerificationExecutor, VerificationPlan, discover};
+use workflowd::verification::{Reach, VerificationExecutor, VerificationPlan, discover};
 
 fn architecture(scopes: Vec<String>, commands: Vec<String>) -> ArchitecturePlan {
     ArchitecturePlan::validate(
@@ -46,6 +46,7 @@ fn adapters_declare_commands_preconditions_risk_timeout_and_mandatory_status() {
             vec!["bun test".to_owned()],
         ),
         &[],
+        &Reach::none(),
     )
     .unwrap();
 
@@ -83,6 +84,7 @@ fn missing_mandatory_database_and_browser_capabilities_block_explicitly() {
             vec!["project-test".to_owned()],
         ),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let unavailable: Vec<_> = plan
@@ -103,6 +105,7 @@ fn unsafe_commands_are_rejected_without_a_shell() {
                 directory.path(),
                 &architecture(vec!["src".to_owned()], vec![command.to_owned()]),
                 &[],
+                &Reach::none(),
             )
             .is_err()
         );
@@ -113,6 +116,7 @@ fn unsafe_commands_are_rejected_without_a_shell() {
             directory.path(),
             &architecture(vec!["src".to_owned()], vec!["bun test".to_owned()]),
             &[],
+            &Reach::none(),
         )
         .unwrap(),
     )
@@ -140,6 +144,7 @@ fn conventional_project_adapters_cover_database_browser_accessibility_security_a
             vec!["rustc --version".to_owned()],
         ),
         &[],
+        &Reach::none(),
     )
     .unwrap();
 
@@ -179,6 +184,7 @@ fn dependency_and_packaging_changes_block_without_required_project_adapters() {
             vec!["rustc --version".to_owned()],
         ),
         &[],
+        &Reach::none(),
     )
     .unwrap();
     let unavailable: Vec<_> = plan
@@ -204,6 +210,7 @@ fn a_change_outside_what_its_scope_describes_still_pulls_in_the_gate_its_layer_r
             directory.path(),
             &architecture(vec!["src".to_owned()], vec!["project-test".to_owned()]),
             changed,
+            &Reach::none(),
         )
         .unwrap()
     };
